@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["corylus-core"]
+
+[workspace.dependencies]
+tokio = { version = "1.44.1", features = ["rt-multi-thread"] }
+raft = "0.7.0"
+anyhow = "1.0.97"
+thiserror = "2.0.12"
+ipnetwork = "0.21.1"
+protobuf = "2"
+tonic = "*"
+prost = "0.13"
+bincode = "2.0.1"
+
