@@ -1,0 +1,9 @@
+[package]
+name = "corylus-grpc-network"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+corylus-core = { version = "0.1.0", path = "../corylus-core" }
+raft = { workspace = true }
+anyhow = { workspace = true }

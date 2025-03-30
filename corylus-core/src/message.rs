@@ -4,6 +4,10 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use protobuf::Message as ProtobufMessage;
 use raft::eraftpb::Message;
 
+pub trait MessageServer: Send + 'static {
+    fn start(self, tx: SyncSender<AwaitableMessage>) -> impl Future<Output=anyhow::Result<()>> + Send;
+}
+
 pub struct RemoteMessage {
     type_: MessageType,
     data: Vec<u8>,
@@ -49,7 +53,7 @@ impl AwaitableMessage {
         &self.notifier
     }
 
-    pub fn new(message: RemoteMessage, notifier: SyncSender<bool>) -> (Self, Receiver<bool>) {
+    pub fn new(message: RemoteMessage) -> (Self, Receiver<bool>) {
         let (tx, rx) = mpsc::sync_channel(0);
         let self_ = Self { message, notifier: tx };
         (self_, rx)

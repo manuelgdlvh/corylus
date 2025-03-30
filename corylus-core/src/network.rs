@@ -1,11 +1,8 @@
-use std::sync::mpsc::SyncSender;
+use crate::message::RemoteMessage;
 
-use crate::message::{AwaitableMessage, RemoteMessage};
-
-pub trait NetworkHandle {
-    async fn start_server(&self, tx: SyncSender<AwaitableMessage>) -> anyhow::Result<()>;
+pub trait NetworkClient {
     async fn discover_leader(&self) -> anyhow::Result<ClusterJoint>;
-    async fn send(&self, node_id: u64, request: RemoteMessage) -> anyhow::Result<()>;
+    async fn send(&self, node_id: u64, message: RemoteMessage) -> anyhow::Result<()>;
 }
 
 

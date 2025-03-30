@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["corylus-core"]
+members = ["corylus-core", "corylus-grpc-network", "corylus-memory-log"]
 
 [workspace.dependencies]
 tokio = { version = "1.44.1", features = ["rt-multi-thread"] }

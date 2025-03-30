@@ -6,78 +6,89 @@ use std::time::{Duration, Instant};
 use protobuf::Message as ProtobufMessage;
 use raft::{RawNode, StateRole};
 use raft::eraftpb::{ConfChangeV2, Entry, EntryType, Message, Snapshot};
-use raft::storage::MemStorage;
 
-use crate::message::{AwaitableMessage, MessageType, RemoteMessage};
-use crate::network::NetworkHandle;
+use crate::message::{AwaitableMessage, MessageServer, MessageType, RemoteMessage};
+use crate::network::NetworkClient;
+use crate::raft_log::RaftLog;
+use crate::state_machine::StateMachine;
 
-pub struct Node<N>
+pub struct Node<NC, RL, SM>
 where
-    N: NetworkHandle,
+    NC: NetworkClient,
+    RL: RaftLog,
+    SM: StateMachine,
 {
-    raft_group: RawNode<MemStorage>,
-    network_handle: N,
+    raft_group: RawNode<RL>,
+    network_client: NC,
+    state_machine: SM,
     message_channel: Receiver<AwaitableMessage>,
 }
 
-impl<N> Node<N>
+impl<NC, RL, SM> Node<NC, RL, SM>
 where
-    N: NetworkHandle,
+    NC: NetworkClient,
+    RL: RaftLog,
+    SM: StateMachine,
 {
-    fn build_leader(network_handle: N, message_channel: Receiver<AwaitableMessage>) -> Self {
+    fn build_leader(network_client: NC, mut raft_log: RL, state_machine: SM, message_channel: Receiver<AwaitableMessage>) -> Self {
         let mut s = Snapshot::default();
         s.mut_metadata().index = 1;
         s.mut_metadata().term = 1;
         s.mut_metadata().mut_conf_state().voters = vec![1];
 
-        let storage = MemStorage::new();
-        storage.wl().apply_snapshot(s).unwrap();
+        raft_log.apply_snapshot(s).unwrap();
 
         let mut raft_config: raft::Config = raft::Config::default();
         raft_config.id = 1;
-        let raft_group = RawNode::with_default_logger(&raft_config, storage).expect("Raft node built successfully");
+
+        let raft_group = RawNode::with_default_logger(&raft_config, raft_log).expect("Raft node built successfully");
 
         Self {
-            network_handle,
+            network_client,
             raft_group,
             message_channel,
+            state_machine,
         }
     }
 
-    fn build_follower(node_id: u64, network_handle: N, message_channel: Receiver<AwaitableMessage>) -> Self {
-        let storage = MemStorage::new();
+    fn build_follower(node_id: u64, network_client: NC, raft_log: RL, state_machine: SM, message_channel: Receiver<AwaitableMessage>) -> Self {
         let mut raft_config: raft::Config = raft::Config::default();
         raft_config.id = node_id;
-        let raft_group = RawNode::with_default_logger(&raft_config, storage).expect("Raft node built successfully");
+        let raft_group = RawNode::with_default_logger(&raft_config, raft_log).expect("Raft node built successfully");
 
         Self {
-            network_handle,
+            network_client,
             raft_group,
             message_channel,
+            state_machine,
         }
     }
 
-    pub async fn build(network_handle: N) -> anyhow::Result<Self> {
+    pub async fn build<MS: MessageServer>(network_client: NC, message_server: MS, raft_log: RL, state_machine: SM) -> anyhow::Result<Self> {
         let tick_timeout = Duration::from_millis(100);
         let (msg_tx, msg_rx) = mpsc::sync_channel::<AwaitableMessage>(1024);
 
-        network_handle.start_server(msg_tx).await?;
-        let cluster_joint = network_handle.discover_leader().await?;
+        tokio::spawn(async move {
+            let _ = message_server.start(msg_tx).await;
+            // Add signaling if stopped
+        });
+
+        let cluster_joint = network_client.discover_leader().await?;
         let node = match cluster_joint.own_node_id() {
             None => {
-                let mut node = Self::build_leader(network_handle, msg_rx);
+                let mut node = Self::build_leader(network_client, raft_log, state_machine, msg_rx);
                 node.await_become_leader(tick_timeout).await;
                 node
             }
             Some(node_id) => {
-                Self::build_follower(node_id, network_handle, msg_rx)
+                Self::build_follower(node_id, network_client, raft_log, state_machine, msg_rx)
             }
         };
 
         Ok(node)
     }
 
-    pub async fn start(mut self) {
+    pub async fn start(mut self) -> anyhow::Result<()> {
         let mut tick_timeout = Duration::from_millis(100);
         // Callbacks
         loop {
@@ -94,7 +105,6 @@ where
             } else {
                 tick_timeout = Duration::from_millis(100);
                 self.raft_group.tick();
-                println!("I am {:?}", self.raft_group.raft.state);
             }
         }
     }
@@ -122,6 +132,7 @@ where
             }
         };
 
+        // async
         msg.notifier().send(result).unwrap();
     }
 
@@ -133,9 +144,7 @@ where
         let mut ready = self.raft_group.ready();
         self.handle_messages(ready.take_messages()).await;
         if !ready.snapshot().is_empty() {
-            self.raft_group.store().wl()
-                .apply_snapshot(ready.snapshot().clone())
-                .unwrap();
+            self.raft_group.store().apply_snapshot(ready.snapshot().clone()).unwrap();
         }
 
         // To be persisted in store machine because were commited
@@ -143,11 +152,11 @@ where
 
         // New entries to be appended to the log
         if !ready.entries().is_empty() {
-            self.raft_group.store().wl().append(ready.entries()).unwrap();
+            self.raft_group.store().append(ready.entries()).unwrap();
         }
 
         if let Some(hs) = ready.hs() {
-            self.raft_group.store().wl().set_hardstate(hs.clone());
+            self.raft_group.store().set_hard_state(hs.clone());
         }
 
         self.handle_messages(ready.take_persisted_messages()).await;
@@ -156,17 +165,14 @@ where
         self.handle_messages(light_rd.take_messages()).await;
         self.handle_entries(light_rd.take_committed_entries());
         self.raft_group.advance_apply();
+
+        // Check signals
     }
 
     async fn await_become_leader(&mut self, tick_timeout: Duration) {
-        loop {
+        while self.raft_group.raft.state != StateRole::Leader {
             self.process().await;
             self.raft_group.tick();
-            if self.raft_group.raft.state == StateRole::Leader {
-                println!("Node became leader!");
-                break;
-            }
-
             thread::park_timeout(tick_timeout);
         }
     }
@@ -188,7 +194,7 @@ where
                     let mut cc = ConfChangeV2::default();
                     cc.merge_from_bytes(&entry.data).unwrap();
                     let cs = self.raft_group.apply_conf_change(&cc).unwrap();
-                    self.raft_group.store().wl().set_conf_state(cs);
+                    self.raft_group.store().set_conf_state(cs);
                 }
                 _ => {}
             };
@@ -199,7 +205,7 @@ where
         println!("Messages: {messages:?}");
 
         for msg in messages {
-            let result = self.network_handle.send(msg.to, RemoteMessage::raw_message(msg)).await;
+            let result = self.network_client.send(msg.to, RemoteMessage::raw_message(msg)).await;
             if result.is_err() {
                 // Do stuff
             }
