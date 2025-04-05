@@ -1,5 +1,5 @@
-use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::Storage;
+use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 
 pub trait RaftLog: Storage {
     fn append(&self, entries: &[Entry]) -> anyhow::Result<()>;

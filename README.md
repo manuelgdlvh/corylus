@@ -21,3 +21,8 @@ plied to Raft, but we leave this to future work.
 
 State Machine component
 Log component
+
+Decouple strategy of leader discovery of network client
+Add signaling
+Add metrics (number of election timeouts, etc)
+Reread raft paper

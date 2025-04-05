@@ -5,5 +5,15 @@ edition = "2024"
 
 [dependencies]
 corylus-core = { version = "0.1.0", path = "../corylus-core" }
+tokio = { workspace = true }
 raft = { workspace = true }
 anyhow = { workspace = true }
+ipnetwork = { workspace = true }
+
+
+
+axum = { workspace = true }
+serde = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+
