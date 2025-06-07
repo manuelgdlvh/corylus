@@ -1,3 +1,108 @@
+use crate::handle::{AwaitableWriteOp, RaftNodeHandle, ReadOpFn};
+use crate::state_machine::StateMachine;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+struct RaftNode<S>
+where
+    S: StateMachine,
+{
+    r_rx: mpsc::Receiver<ReadOpFn<S>>,
+    w_rx: mpsc::Receiver<AwaitableWriteOp<S>>,
+    handle: Option<RaftNodeHandle<S>>,
+    state: S,
+}
+
+impl<S> RaftNode<S>
+where
+    S: StateMachine,
+{
+    fn new(state: S) -> Self {
+        let (r_tx, r_rx) = mpsc::channel();
+        let (w_tx, w_rx) = mpsc::channel();
+        let handle = Some(RaftNodeHandle::new(r_tx, w_tx));
+
+        Self {
+            r_rx,
+            w_rx,
+            handle,
+            state,
+        }
+    }
+
+    fn start(mut self) -> RaftNodeHandle<S> {
+        let handle = self.handle.take().unwrap();
+        thread::spawn(move || {
+            let timeout = Duration::from_millis(100);
+            loop {
+                // Use tokio select! to wait in two channels.
+                if let Ok(r_op) = self.r_rx.recv_timeout(timeout) {
+                    r_op(&self.state);
+                    while let Ok(r_op) = self.r_rx.try_recv() {
+                        r_op(&self.state);
+                    }
+                }
+
+                if let Ok(w_op) = self.w_rx.recv_timeout(timeout) {
+                    w_op.op.execute(&mut self.state);
+                    w_op.notifier.send(()).ok();
+                    while let Ok(w_op) = self.w_rx.try_recv() {
+                        w_op.op.execute(&mut self.state);
+                        w_op.notifier.send(()).ok();
+                    }
+                }
+            }
+        });
+        handle
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::node::RaftNode;
+    use crate::operation::{ReadOperation, WriteOperation};
+    use crate::state_machine::StateMachine;
+
+    #[derive(Default)]
+    struct ReadOp;
+    impl ReadOperation<InMemoryStateMachine> for ReadOp {
+        type Output = u64;
+        fn execute(&self, state: &InMemoryStateMachine) -> Option<Self::Output> {
+            Some(state.value)
+        }
+    }
+
+    #[derive(Default)]
+    struct IncrementOp;
+    impl WriteOperation<InMemoryStateMachine> for IncrementOp {
+        fn execute(&self, state: &mut InMemoryStateMachine) {
+            state.value += 1;
+        }
+    }
+
+    #[derive(Default)]
+    struct InMemoryStateMachine {
+        value: u64,
+    }
+    impl StateMachine for InMemoryStateMachine {}
+
+    #[test]
+    fn test() {
+        let sm = InMemoryStateMachine::default();
+        let node = RaftNode::new(sm);
+        let handle = node.start();
+
+        (0..99).for_each(|_| {
+            handle.write(IncrementOp::default());
+        });
+        handle.write(IncrementOp::default()).recv().unwrap();
+
+        assert_eq!(Some(100), handle.read(ReadOp::default()).recv().unwrap());
+    }
+}
+
+/*
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::thread;
@@ -252,3 +357,6 @@ where
         }
     }
 }
+
+
+ */

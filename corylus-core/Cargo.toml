@@ -4,8 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { workspace = true }
-raft = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-protobuf =  { workspace = true }
+
