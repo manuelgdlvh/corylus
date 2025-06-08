@@ -11,6 +11,7 @@ where
 
     // Add tuple in RaftNodeHandle with the notifier
     fn execute(&self, state: &S) -> Option<Self::Output>;
+    fn serialize(&self) -> Vec<u8>;
 }
 
 pub trait WriteOperation<S>: Send
@@ -24,18 +25,6 @@ where
     fn serialize(&self) -> Vec<u8>;
 }
 
-pub trait OpDeSerializer<S>
-where
-    S: StateMachine,
-{
-    type Output: WriteOperation<S>;
-
-    // Deserialize useful when travelling to network and to write in raft log
-    fn serialize(&self) -> Vec<u8>;
-
-    // Deserialize useful when travelling to network
-    fn deserialize(data: Vec<u8>) -> Self::Output;
-}
 
 #[cfg(test)]
 mod tests {
@@ -62,6 +51,10 @@ mod tests {
 
         fn execute(&self, state: &InMemoryStateMachine) -> Option<Self::Output> {
             Some(state.value)
+        }
+
+        fn serialize(&self) -> Vec<u8> {
+            todo!()
         }
     }
     #[derive(Default)]

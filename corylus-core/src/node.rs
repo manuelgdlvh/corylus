@@ -1,11 +1,12 @@
 use crate::callback::CallbackHolder;
 use crate::handle::{AwaitableWriteOp, RaftNodeHandle, ReadOpFn};
+use crate::leader_proxy::RaftLeaderProxy;
 use crate::raft_log::RaftLog;
 use crate::state_machine::StateMachine;
 use futures::future::join_all;
 use protobuf::Message as ProtobufMessage;
 use raft::prelude::{ConfChangeV2, Entry, EntryType, Message};
-use raft::{Config, Raft, RawNode, StateRole, Storage};
+use raft::{Config, RawNode, StateRole, Storage};
 use std::error::Error;
 use std::thread;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use tokio::time;
 
 pub type GenericError = Box<dyn Error + Send + Sync>;
 
-struct OperationChannel<S>
+struct OpChannel<S>
 where
     S: StateMachine,
 {
@@ -25,7 +26,7 @@ where
     handle: Option<RaftNodeHandle<S>>,
 }
 
-impl<S> OperationChannel<S>
+impl<S> OpChannel<S>
 where
     S: StateMachine,
 {
@@ -47,7 +48,7 @@ where
     ) {
         (&mut self.r_rx, &mut self.w_rx)
     }
-    
+
     fn try_recv_write_op(&mut self) -> Result<AwaitableWriteOp<S>, TryRecvError> {
         self.w_rx.try_recv()
     }
@@ -66,34 +67,47 @@ where
     }
 }
 
-pub struct RaftNode<S, L>
+pub struct RaftNode<S, L, P>
 where
     S: StateMachine,
     L: RaftLog,
+    P: RaftLeaderProxy<S>,
 {
-    // Move this to operation channel handler
     group: RawNode<L>,
-    op_channel: OperationChannel<S>,
+    op_channel: OpChannel<S>,
     state: S,
+    leader_proxy: P,
     callbacks: CallbackHolder<S>,
 }
 
-impl<S, L> Drop for RaftNode<S, L>
+impl<S, L, P> Drop for RaftNode<S, L, P>
 where
     S: StateMachine,
     L: RaftLog,
+    P: RaftLeaderProxy<S>,
 {
     fn drop(&mut self) {
         self.op_channel.stop();
     }
 }
 
-impl<S, L> RaftNode<S, L>
+impl<S, L, P> RaftNode<S, L, P>
 where
     S: StateMachine,
     L: RaftLog,
+    P: RaftLeaderProxy<S>,
 {
-    pub fn new(state: S, storage: L) -> Result<Self, GenericError> {
+    pub fn new(state: S, storage: L, leader_proxy: P) -> Result<Self, GenericError> {
+        Self::with_config(state, storage, leader_proxy, Default::default())
+    }
+
+    pub fn with_config(
+        state: S,
+        storage: L,
+        leader_proxy: P,
+        mut config: Config,
+    ) -> Result<Self, GenericError> {
+        config.id = 1;
         let group = RawNode::with_default_logger(
             &Config {
                 id: 1,
@@ -104,8 +118,9 @@ where
 
         let self_ = Self {
             group,
-            op_channel: OperationChannel::new(),
+            op_channel: OpChannel::new(),
             state,
+            leader_proxy,
             callbacks: CallbackHolder::new(),
         };
 
@@ -113,14 +128,13 @@ where
     }
 
     pub fn start(mut self) -> RaftNodeHandle<S> {
-        
         let runtime = Builder::new_current_thread()
             .thread_name("raft-worker")
             .enable_all()
             .build()
             .unwrap();
         let handle = self.op_channel.handle.take().unwrap();
-        
+
         thread::spawn(move || {
             if let Err(err) = self.group.campaign() {
                 panic!("{}", err);
@@ -143,7 +157,7 @@ where
                     }
 
                     self.on_read(r_buffer).await;
-                    self.on_local_write(&mut w_buffer).await;
+                    self.on_write(&mut w_buffer).await;
                     self.tick().await;
                 }
             });
@@ -246,28 +260,34 @@ where
         }
     }
 
-    async fn on_local_write(&mut self, w_buffer: &mut Vec<AwaitableWriteOp<S>>) {
+    async fn on_write(&mut self, w_buffer: &mut Vec<AwaitableWriteOp<S>>) {
         for w_op in w_buffer.drain(..) {
-            if self.group.raft.state != StateRole::Leader {
-                println!(
-                    "Message ignored because node is not leader. Must to be sent over the network"
-                );
-
-                // Notify to not stuck tests
-                let _ = w_op.notifier.send(Ok(())).await;
-                continue;
-            }
-
             let op_buffer = w_op.op.serialize();
-            let message_id = self.callbacks.next();
-            if let Err(err) = self
-                .group
-                .propose(message_id.to_be_bytes().to_vec(), op_buffer)
-            {
-                // Add log
-                let _ = w_op.notifier.send(Err(err.into())).await;
+            if self.group.raft.state != StateRole::Leader {
+                println!("Node is not leader. Sending over the network");
+
+                // Must return message id.
+                // Allow batching.
+                // Track Rejections to remove dirty callbacks.
+                match self.leader_proxy.write(op_buffer.as_slice()).await {
+                    Ok(message_id) => {
+                        self.callbacks.add(message_id, w_op);
+                    }
+                    Err(err) => {
+                        let _ = w_op.notifier.send(Err(err.into())).await;
+                    }
+                };
             } else {
-                self.callbacks.add(message_id, w_op);
+                let message_id = self.callbacks.next();
+                if let Err(err) = self
+                    .group
+                    .propose(message_id.to_be_bytes().to_vec(), op_buffer)
+                {
+                    // Add log
+                    let _ = w_op.notifier.send(Err(err.into())).await;
+                } else {
+                    self.callbacks.add(message_id, w_op);
+                }
             }
         }
     }
@@ -314,6 +334,7 @@ where
 
 #[cfg(test)]
 mod test {
+    use crate::leader_proxy::NoOpRaftLeaderProxy;
     use crate::node::RaftNode;
     use crate::operation::{ReadOperation, WriteOperation};
     use crate::raft_log::InMemoryRaftLog;
@@ -325,6 +346,10 @@ mod test {
         type Output = u64;
         fn execute(&self, state: &InMemoryStateMachine) -> Option<Self::Output> {
             Some(state.value)
+        }
+
+        fn serialize(&self) -> Vec<u8> {
+            todo!()
         }
     }
 
@@ -350,7 +375,9 @@ mod test {
     async fn test() {
         let sm = InMemoryStateMachine::default();
         let rl = InMemoryRaftLog::new();
-        let node = RaftNode::new(sm, rl).unwrap();
+        let l_proxy = NoOpRaftLeaderProxy::default();
+
+        let node = RaftNode::new(sm, rl, l_proxy).unwrap();
         let handle = node.start();
 
         (0..99).for_each(|_| {

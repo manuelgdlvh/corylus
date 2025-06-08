@@ -112,6 +112,10 @@ mod tests {
         fn execute(&self, state: &InMemoryStateMachine) -> Option<Self::Output> {
             Some(state.value)
         }
+
+        fn serialize(&self) -> Vec<u8> {
+            todo!()
+        }
     }
 
     #[derive(Default)]

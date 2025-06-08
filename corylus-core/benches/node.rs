@@ -1,3 +1,4 @@
+use corylus_core::leader_proxy::NoOpRaftLeaderProxy;
 use corylus_core::node::RaftNode;
 use corylus_core::operation::ReadOperation;
 use corylus_core::raft_log::InMemoryRaftLog;
@@ -14,6 +15,10 @@ impl ReadOperation<InMemoryStateMachine> for ReadOp {
     fn execute(&self, state: &InMemoryStateMachine) -> Option<Self::Output> {
         let result = state.values.get("test")?;
         Some(result.to_string())
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        todo!()
     }
 }
 
@@ -43,7 +48,9 @@ fn node_benches(c: &mut Criterion) {
             |b, &num_reads| {
                 let sm = InMemoryStateMachine::default();
                 let rl = InMemoryRaftLog::new();
-                let node = RaftNode::new(sm, rl).unwrap();
+                let l_proxy = NoOpRaftLeaderProxy::default();
+
+                let node = RaftNode::new(sm, rl, l_proxy).unwrap();
                 let handle = node.start();
 
                 b.iter(|| {
