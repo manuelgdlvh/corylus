@@ -4,4 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { workspace = true }
+raft = { workspace = true }
+futures = { workspace = true }
+protobuf = { workspace = true }
+
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+
+[[bench]]
+name = "node"
+path = "benches/node.rs"
+harness = false
 

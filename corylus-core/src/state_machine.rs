@@ -1,4 +1,1 @@
-pub trait StateMachine: Send + 'static {
-    
-    
-}
+pub trait StateMachine: Send + Sync + 'static {}

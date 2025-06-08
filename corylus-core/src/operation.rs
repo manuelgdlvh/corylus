@@ -2,7 +2,7 @@ use crate::state_machine::StateMachine;
 
 // Read operation is distinct of write, does not must be persisted in log and returns result.
 // Read operations must be linearized with writes to avoid locks in write's (Raft single threaded, for more parallelism use MultiRaft).
-pub trait ReadOperation<S>: Send
+pub trait ReadOperation<S>: Send + Sync
 where
     S: StateMachine,
 {
@@ -19,6 +19,9 @@ where
 {
     // Instead block, use notifier primitive to allow block or not.
     fn execute(&self, state: &mut S);
+
+    // Zero copy serialization is allowed here for scoped in which buffer are used
+    fn serialize(&self) -> Vec<u8>;
 }
 
 pub trait OpDeSerializer<S>
@@ -27,8 +30,10 @@ where
 {
     type Output: WriteOperation<S>;
 
-    // Should be serialized for network travelling
-    fn serialize(self) -> Vec<u8>;
+    // Deserialize useful when travelling to network and to write in raft log
+    fn serialize(&self) -> Vec<u8>;
+
+    // Deserialize useful when travelling to network
     fn deserialize(data: Vec<u8>) -> Self::Output;
 }
 
@@ -43,6 +48,10 @@ mod tests {
     impl WriteOperation<InMemoryStateMachine> for SumOp {
         fn execute(&self, state: &mut InMemoryStateMachine) {
             state.value += self.value;
+        }
+
+        fn serialize(&self) -> Vec<u8> {
+            todo!()
         }
     }
 
