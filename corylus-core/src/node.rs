@@ -7,14 +7,64 @@ use protobuf::Message as ProtobufMessage;
 use raft::prelude::{ConfChangeV2, Entry, EntryType, Message};
 use raft::{Config, Raft, RawNode, StateRole, Storage};
 use std::error::Error;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time;
 
 pub type GenericError = Box<dyn Error + Send + Sync>;
+
+struct OperationChannel<S>
+where
+    S: StateMachine,
+{
+    r_rx: mpsc::UnboundedReceiver<ReadOpFn<S>>,
+    w_rx: mpsc::UnboundedReceiver<AwaitableWriteOp<S>>,
+    handle: Option<RaftNodeHandle<S>>,
+}
+
+impl<S> OperationChannel<S>
+where
+    S: StateMachine,
+{
+    fn new() -> Self {
+        let (r_tx, r_rx) = mpsc::unbounded_channel();
+        let (w_tx, w_rx) = mpsc::unbounded_channel();
+        Self {
+            r_rx,
+            w_rx,
+            handle: Some(RaftNodeHandle::new(r_tx, w_tx)),
+        }
+    }
+
+    fn as_mut(
+        &mut self,
+    ) -> (
+        &mut mpsc::UnboundedReceiver<ReadOpFn<S>>,
+        &mut mpsc::UnboundedReceiver<AwaitableWriteOp<S>>,
+    ) {
+        (&mut self.r_rx, &mut self.w_rx)
+    }
+    
+    fn try_recv_write_op(&mut self) -> Result<AwaitableWriteOp<S>, TryRecvError> {
+        self.w_rx.try_recv()
+    }
+
+    fn try_recv_read_op(&mut self) -> Result<ReadOpFn<S>, TryRecvError> {
+        self.r_rx.try_recv()
+    }
+
+    fn stop(&mut self) {
+        self.r_rx.close();
+        self.w_rx.close();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.r_rx.is_closed() || self.w_rx.is_closed()
+    }
+}
 
 pub struct RaftNode<S, L>
 where
@@ -22,9 +72,8 @@ where
     L: RaftLog,
 {
     // Move this to operation channel handler
-    r_rx: mpsc::UnboundedReceiver<ReadOpFn<S>>,
-    w_rx: mpsc::UnboundedReceiver<AwaitableWriteOp<S>>,
     group: RawNode<L>,
+    op_channel: OperationChannel<S>,
     state: S,
     callbacks: CallbackHolder<S>,
 }
@@ -35,8 +84,7 @@ where
     L: RaftLog,
 {
     fn drop(&mut self) {
-        self.r_rx.close();
-        self.w_rx.close();
+        self.op_channel.stop();
     }
 }
 
@@ -45,11 +93,7 @@ where
     S: StateMachine,
     L: RaftLog,
 {
-    pub fn new(state: S, storage: L) -> Result<(Self, Arc<RaftNodeHandle<S>>), GenericError> {
-        let (r_tx, r_rx) = mpsc::unbounded_channel();
-        let (w_tx, w_rx) = mpsc::unbounded_channel();
-        let handle = Arc::new(RaftNodeHandle::new(r_tx, w_tx));
-
+    pub fn new(state: S, storage: L) -> Result<Self, GenericError> {
         let group = RawNode::with_default_logger(
             &Config {
                 id: 1,
@@ -59,22 +103,24 @@ where
         )?;
 
         let self_ = Self {
-            r_rx,
-            w_rx,
             group,
+            op_channel: OperationChannel::new(),
             state,
             callbacks: CallbackHolder::new(),
         };
 
-        Ok((self_, handle))
+        Ok(self_)
     }
 
-    pub fn start(mut self) {
+    pub fn start(mut self) -> RaftNodeHandle<S> {
+        
         let runtime = Builder::new_current_thread()
             .thread_name("raft-worker")
             .enable_all()
             .build()
             .unwrap();
+        let handle = self.op_channel.handle.take().unwrap();
+        
         thread::spawn(move || {
             if let Err(err) = self.group.campaign() {
                 panic!("{}", err);
@@ -84,12 +130,13 @@ where
                 let mut w_buffer = Vec::new();
 
                 loop {
+                    if self.op_channel.is_stopped() {
+                        break;
+                    }
+
                     let mut r_buffer = Vec::new();
                     match self.drain_ops(w_buffer, r_buffer, timeout).await {
-                        (new_w_buffer, new_r_buffer, stop_signal) => {
-                            if stop_signal {
-                                break;
-                            }
+                        (new_w_buffer, new_r_buffer) => {
                             w_buffer = new_w_buffer;
                             r_buffer = new_r_buffer;
                         }
@@ -101,8 +148,9 @@ where
                 }
             });
             runtime.shutdown_background();
-            println!("shutting down");
         });
+
+        handle
     }
 
     // API must be well defined for Remote Server messages
@@ -230,38 +278,37 @@ where
         mut w_buffer: Vec<AwaitableWriteOp<S>>,
         mut r_buffer: Vec<ReadOpFn<S>>,
         timeout: Duration,
-    ) -> (Vec<AwaitableWriteOp<S>>, Vec<ReadOpFn<S>>, bool) {
+    ) -> (Vec<AwaitableWriteOp<S>>, Vec<ReadOpFn<S>>) {
+        let (read_mut, write_mut) = self.op_channel.as_mut();
         tokio::select! {
             biased;
             _ = time::sleep(timeout) => {
-                // Add this flag as Channel closed's and return unavailable as error. If no operation channels open, stop the runtime.
-                return (w_buffer, r_buffer, false);
+                return (w_buffer, r_buffer);
             }
-
             // Read operation received
-            Some(r_op) = self.r_rx.recv() => {
+            Some(r_op) = read_mut.recv() => {
                 r_buffer.push(r_op);
             }
 
             // Write operation received
-            Some(w_op) = self.w_rx.recv() => {
+            Some(w_op) = write_mut.recv() => {
                 w_buffer.push(w_op);
             }
             // Both channels closed
             else => {
-                return (w_buffer, r_buffer, true);
+                return (w_buffer, r_buffer);
             }
         }
 
-        while let Ok(r_op) = self.r_rx.try_recv() {
+        while let Ok(r_op) = self.op_channel.try_recv_read_op() {
             r_buffer.push(r_op);
         }
 
-        while let Ok(w_op) = self.w_rx.try_recv() {
+        while let Ok(w_op) = self.op_channel.try_recv_write_op() {
             w_buffer.push(w_op);
         }
 
-        (w_buffer, r_buffer, false)
+        (w_buffer, r_buffer)
     }
 }
 
@@ -303,8 +350,8 @@ mod test {
     async fn test() {
         let sm = InMemoryStateMachine::default();
         let rl = InMemoryRaftLog::new();
-        let (node, handle) = RaftNode::new(sm, rl).unwrap();
-        node.start();
+        let node = RaftNode::new(sm, rl).unwrap();
+        let handle = node.start();
 
         (0..99).for_each(|_| {
             handle.write(IncrementOp::default());

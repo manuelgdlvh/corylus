@@ -43,8 +43,8 @@ fn node_benches(c: &mut Criterion) {
             |b, &num_reads| {
                 let sm = InMemoryStateMachine::default();
                 let rl = InMemoryRaftLog::new();
-                let (node, handle) = RaftNode::new(sm, rl).unwrap();
-                node.start();
+                let node = RaftNode::new(sm, rl).unwrap();
+                let handle = node.start();
 
                 b.iter(|| {
                     handle.read(ReadOp::default()).blocking_recv().expect("");
