@@ -1,0 +1,13 @@
+[package]
+name = "corylus-http-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+actix-web = { workspace = true }
+corylus-core = { path = "../corylus-core" }
+reqwest = { workspace = true }
+protobuf = { workspace = true }
+serde = { version = "1.0.219", features = ["derive"] }
+raft = { workspace = true }

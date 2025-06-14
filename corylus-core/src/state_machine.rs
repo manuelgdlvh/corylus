@@ -1,1 +1,1 @@
-pub trait StateMachine: Send + Sync + 'static {}
+pub trait RaftStateMachine: Send + Sync + 'static {}

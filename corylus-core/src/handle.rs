@@ -1,8 +1,12 @@
 use crate::node::GenericError;
-use crate::operation::{ReadOperation, WriteOperation};
-use crate::state_machine::StateMachine;
+use crate::operation::{
+    AwaitableRaftCommand, RaftCommand, RaftCommandResult, ReadOperation, WriteOperation,
+};
+use crate::peer::MessageId;
+use crate::state_machine::RaftStateMachine;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::mpsc::Receiver;
 use tokio::sync::mpsc;
 // type ReadOpFn<S> = for<'a> fn(&'a S);
 // This won't work because function pointers (fn) cannot capture environment variables.
@@ -24,20 +28,20 @@ pub(crate) type ReadOpFn<S> =
 // Instead of erased type with heap allocation, using typed struct with operation erased guarantying fast access to notifier avoiding one more heap indirection.
 pub struct AwaitableWriteOp<S>
 where
-    S: StateMachine,
+    S: RaftStateMachine,
 {
     pub op: Box<dyn WriteOperation<S>>,
-    pub notifier: mpsc::Sender<Result<(), GenericError>>,
+    pub notifier: mpsc::Sender<Result<MessageId, GenericError>>,
     _phantom_sm: PhantomData<S>,
 }
 
 impl<S> AwaitableWriteOp<S>
 where
-    S: StateMachine,
+    S: RaftStateMachine,
 {
     fn new<Op: WriteOperation<S> + 'static>(
         op: Op,
-    ) -> (Self, mpsc::Receiver<Result<(), GenericError>>) {
+    ) -> (Self, mpsc::Receiver<Result<MessageId, GenericError>>) {
         let (tx, rx) = mpsc::channel(1);
         let self_ = Self {
             op: Box::new(op),
@@ -51,23 +55,26 @@ where
 
 pub struct RaftNodeHandle<S>
 where
-    S: StateMachine,
+    S: RaftStateMachine,
 {
     read_channel: mpsc::UnboundedSender<ReadOpFn<S>>,
     write_channel: mpsc::UnboundedSender<AwaitableWriteOp<S>>,
+    raft_msg_channel: mpsc::UnboundedSender<AwaitableRaftCommand>,
 }
 
 impl<S> RaftNodeHandle<S>
 where
-    S: StateMachine,
+    S: RaftStateMachine,
 {
     pub(crate) fn new(
         read_channel: mpsc::UnboundedSender<ReadOpFn<S>>,
         write_channel: mpsc::UnboundedSender<AwaitableWriteOp<S>>,
+        raft_msg_channel: mpsc::UnboundedSender<AwaitableRaftCommand>,
     ) -> Self {
         Self {
             read_channel,
             write_channel,
+            raft_msg_channel,
         }
     }
 
@@ -91,82 +98,21 @@ where
     pub fn write<W: WriteOperation<S> + 'static>(
         &self,
         op: W,
-    ) -> mpsc::Receiver<Result<(), GenericError>> {
+    ) -> mpsc::Receiver<Result<MessageId, GenericError>> {
         let (awaitable_op, rx) = AwaitableWriteOp::new(op);
         self.write_channel.send(awaitable_op).unwrap();
+        rx
+    }
+
+    pub fn raft_command(
+        &self,
+        command: RaftCommand,
+    ) -> Receiver<Result<RaftCommandResult, GenericError>> {
+        let (awaitable_command, rx) = AwaitableRaftCommand::new(command);
+        self.raft_msg_channel.send(awaitable_command).unwrap();
         rx
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::handle::RaftNodeHandle;
-    use crate::operation::{ReadOperation, WriteOperation};
-    use crate::state_machine::StateMachine;
-    use std::sync::mpsc;
-
-    #[derive(Default)]
-    struct ReadOp;
-    impl ReadOperation<InMemoryStateMachine> for ReadOp {
-        type Output = u64;
-        fn execute(&self, state: &InMemoryStateMachine) -> Option<Self::Output> {
-            Some(state.value)
-        }
-
-        fn serialize(&self) -> Vec<u8> {
-            todo!()
-        }
-    }
-
-    #[derive(Default)]
-    struct IncrementOp;
-    impl WriteOperation<InMemoryStateMachine> for IncrementOp {
-        fn execute(&self, state: &mut InMemoryStateMachine) {
-            state.value += 1;
-        }
-
-        fn serialize(&self) -> Vec<u8> {
-            todo!()
-        }
-    }
-
-    #[derive(Default)]
-    struct InMemoryStateMachine {
-        value: u64,
-    }
-    impl StateMachine for InMemoryStateMachine {}
-
-    /*
-        #[test]
-    fn should_read_successfully() {
-        let (r_tx, r_rx) = mpsc::channel();
-        let (w_tx, _) = mpsc::channel();
-
-        let handle = RaftNodeHandle::<InMemoryStateMachine>::new(r_tx, w_tx);
-
-        let result = handle.read(ReadOp::default());
-
-        let sm = InMemoryStateMachine { value: 7 };
-        let read_op = r_rx.recv().unwrap();
-        read_op(&sm);
-
-        assert_eq!(Some(7), result.recv().unwrap());
-    }
-
-    #[test]
-    fn should_write_successfully() {
-        let (r_tx, _) = mpsc::channel();
-        let (w_tx, w_rx) = mpsc::channel();
-
-        let handle = RaftNodeHandle::<InMemoryStateMachine>::new(r_tx, w_tx);
-
-        let _ = handle.write(IncrementOp::default());
-
-        let mut sm = InMemoryStateMachine { value: 0 };
-        let write_op = w_rx.recv().unwrap();
-        write_op.op.execute(&mut sm);
-
-        assert_eq!(1, sm.value);
-    }
-     */
-}
+mod tests {}

@@ -1,18 +1,16 @@
-use corylus_core::leader_proxy::NoOpRaftLeaderProxy;
-use corylus_core::node::RaftNode;
 use corylus_core::operation::ReadOperation;
-use corylus_core::raft_log::InMemoryRaftLog;
-use corylus_core::state_machine::StateMachine;
+use corylus_core::state_machine::RaftStateMachine;
 use criterion::{
     BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Default)]
 struct ReadOp;
-impl ReadOperation<InMemoryStateMachine> for ReadOp {
+impl ReadOperation<InMemoryRaftStateMachine> for ReadOp {
     type Output = String;
-    fn execute(&self, state: &InMemoryStateMachine) -> Option<Self::Output> {
+    fn execute(&self, state: &InMemoryRaftStateMachine) -> Option<Self::Output> {
         let result = state.values.get("test")?;
         Some(result.to_string())
     }
@@ -23,39 +21,45 @@ impl ReadOperation<InMemoryStateMachine> for ReadOp {
 }
 
 #[derive(Default)]
-struct InMemoryStateMachine {
+struct InMemoryRaftStateMachine {
     values: HashMap<String, String>,
 }
-impl StateMachine for InMemoryStateMachine {}
+impl RaftStateMachine for InMemoryRaftStateMachine {}
 
 fn node_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("node_suite_test");
 
-    let num_reads_list = [100, 1000, 10000, 100000];
+    let num_reads_list = [1000, 10000, 100000, 1000000];
     for num_reads in num_reads_list {
         let input = num_reads;
         let parameter = format!("Sequential Reads: {}", num_reads);
 
         let group_ref = group
             .sample_size(10)
+            .measurement_time(Duration::from_secs(30))
             .noise_threshold(0.05)
             .sampling_mode(SamplingMode::Flat)
             .throughput(Throughput::Elements(num_reads));
 
         group_ref.bench_with_input(
-            BenchmarkId::new("reads", parameter.as_str()),
+            BenchmarkId::new("sequential_reads", parameter.as_str()),
             &input,
             |b, &num_reads| {
-                let sm = InMemoryStateMachine::default();
+
+                /*
+                let sm = InMemoryRaftStateMachine::default();
                 let rl = InMemoryRaftLog::new();
-                let l_proxy = NoOpRaftLeaderProxy::default();
+                let l_proxy = NoOpRaftPeerProxy::default();
 
                 let node = RaftNode::new(sm, rl, l_proxy).unwrap();
                 let handle = node.start();
 
                 b.iter(|| {
-                    handle.read(ReadOp::default()).blocking_recv().expect("");
+                    (0..num_reads).for_each(|_| {
+                        handle.read(ReadOp::default()).blocking_recv().expect("");
+                    })
                 });
+                 */
             },
         );
     }

@@ -12,7 +12,12 @@ protobuf = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+corylus-http-proxy = { path = "../corylus-http-proxy" }
 
+
+[[test]]
+name = "node"
+path = "tests/node.rs"
 
 [[bench]]
 name = "node"

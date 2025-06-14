@@ -1,38 +1,50 @@
 use crate::handle::AwaitableWriteOp;
-use crate::state_machine::StateMachine;
+use crate::state_machine::RaftStateMachine;
 use std::collections::HashMap;
-
-
+use crate::peer::MessageId;
 
 pub struct CallbackHolder<S>
 where
-    S: StateMachine,
+    S: RaftStateMachine,
 {
-    callbacks: HashMap<u128, AwaitableWriteOp<S>>,
-    next: u128,
+    // Use Min Binary Heap to remove fast dirty callbacks
+    callbacks: HashMap<MessageId, AwaitableWriteOp<S>>,
+    next: MessageId,
+    last_applied: MessageId,
 }
 
 impl<S> CallbackHolder<S>
 where
-    S: StateMachine,
+    S: RaftStateMachine,
 {
     pub fn new() -> Self {
         Self {
             callbacks: Default::default(),
             next: 0,
+            last_applied: 0,
         }
     }
 
     // Could be modelled using erased type like Runnable to allow more than on Callback type
-    pub fn add(&mut self, id: u128, op: AwaitableWriteOp<S>) {
+    pub fn add(&mut self, id: MessageId, op: AwaitableWriteOp<S>) {
         self.callbacks.insert(id, op);
     }
 
-    pub fn remove(&mut self, id: u128) -> Option<AwaitableWriteOp<S>> {
-        self.callbacks.remove(&id)
+    pub fn update_next(&mut self, message_id: MessageId) {
+        self.next = message_id;
     }
 
-    pub fn next(&mut self) -> u128 {
+    // Last applied to remove dirty callbacks
+    pub fn remove(&mut self, id: MessageId) -> Option<AwaitableWriteOp<S>> {
+        let result = self.callbacks.remove(&id);
+        if result.is_some() {
+            self.last_applied = id;
+        }
+
+        result
+    }
+
+    pub fn next(&mut self) -> MessageId {
         self.next += 1;
         self.next
     }

@@ -1,13 +1,18 @@
 use crate::callback::CallbackHolder;
 use crate::handle::{AwaitableWriteOp, RaftNodeHandle, ReadOpFn};
-use crate::leader_proxy::RaftLeaderProxy;
+use crate::operation::{AwaitableRaftCommand, RaftCommand, RaftCommandResult, WriteOperation};
+use crate::peer::{MessageId, OpDeserializer, RaftPeerClientProxy, RaftPeerServerProxy};
 use crate::raft_log::RaftLog;
-use crate::state_machine::StateMachine;
+use crate::state_machine::RaftStateMachine;
 use futures::future::join_all;
-use protobuf::Message as ProtobufMessage;
+use protobuf::{Message as ProtobufMessage, RepeatedField};
+use raft::eraftpb::{ConfChangeSingle, ConfChangeType};
 use raft::prelude::{ConfChangeV2, Entry, EntryType, Message};
 use raft::{Config, RawNode, StateRole, Storage};
+use std::collections::HashMap;
 use std::error::Error;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Builder;
@@ -17,26 +22,34 @@ use tokio::time;
 
 pub type GenericError = Box<dyn Error + Send + Sync>;
 
-struct OpChannel<S>
+struct OperationHandler<S, D>
 where
-    S: StateMachine,
+    S: RaftStateMachine,
+    D: OpDeserializer<S>,
 {
     r_rx: mpsc::UnboundedReceiver<ReadOpFn<S>>,
     w_rx: mpsc::UnboundedReceiver<AwaitableWriteOp<S>>,
+    raft_msg_rx: mpsc::UnboundedReceiver<AwaitableRaftCommand>,
+    deserializer: D,
     handle: Option<RaftNodeHandle<S>>,
 }
 
-impl<S> OpChannel<S>
+impl<S, D> OperationHandler<S, D>
 where
-    S: StateMachine,
+    S: RaftStateMachine,
+    D: OpDeserializer<S>,
 {
-    fn new() -> Self {
+    fn new(deserializer: D) -> Self {
         let (r_tx, r_rx) = mpsc::unbounded_channel();
         let (w_tx, w_rx) = mpsc::unbounded_channel();
+        let (raft_msg_tx, raft_msg_rx) = mpsc::unbounded_channel();
+
         Self {
             r_rx,
             w_rx,
-            handle: Some(RaftNodeHandle::new(r_tx, w_tx)),
+            raft_msg_rx,
+            deserializer,
+            handle: Some(RaftNodeHandle::new(r_tx, w_tx, raft_msg_tx)),
         }
     }
 
@@ -45,8 +58,9 @@ where
     ) -> (
         &mut mpsc::UnboundedReceiver<ReadOpFn<S>>,
         &mut mpsc::UnboundedReceiver<AwaitableWriteOp<S>>,
+        &mut mpsc::UnboundedReceiver<AwaitableRaftCommand>,
     ) {
-        (&mut self.r_rx, &mut self.w_rx)
+        (&mut self.r_rx, &mut self.w_rx, &mut self.raft_msg_rx)
     }
 
     fn try_recv_write_op(&mut self) -> Result<AwaitableWriteOp<S>, TryRecvError> {
@@ -55,6 +69,10 @@ where
 
     fn try_recv_read_op(&mut self) -> Result<ReadOpFn<S>, TryRecvError> {
         self.r_rx.try_recv()
+    }
+
+    fn try_recv_raft_msg(&mut self) -> Result<AwaitableRaftCommand, TryRecvError> {
+        self.raft_msg_rx.try_recv()
     }
 
     fn stop(&mut self) {
@@ -67,44 +85,61 @@ where
     }
 }
 
-pub struct RaftNode<S, L, P>
+pub struct RaftNode<SM, D, L, C>
 where
-    S: StateMachine,
+    SM: RaftStateMachine,
+    D: OpDeserializer<SM>,
     L: RaftLog,
-    P: RaftLeaderProxy<S>,
+    C: RaftPeerClientProxy<SM>,
 {
+    // Wrap peer id generator / updater to proxy
+    next_peer_id: u64,
     group: RawNode<L>,
-    op_channel: OpChannel<S>,
-    state: S,
-    leader_proxy: P,
-    callbacks: CallbackHolder<S>,
+    op_handler: OperationHandler<SM, D>,
+    state: SM,
+    client_peer_proxy: C,
+    callbacks: CallbackHolder<SM>,
 }
 
-impl<S, L, P> Drop for RaftNode<S, L, P>
+impl<SM, D, L, C> Drop for RaftNode<SM, D, L, C>
 where
-    S: StateMachine,
+    SM: RaftStateMachine,
+    D: OpDeserializer<SM>,
     L: RaftLog,
-    P: RaftLeaderProxy<S>,
+    C: RaftPeerClientProxy<SM>,
 {
     fn drop(&mut self) {
-        self.op_channel.stop();
+        self.op_handler.stop();
     }
 }
 
-impl<S, L, P> RaftNode<S, L, P>
+impl<SM, D, L, C> RaftNode<SM, D, L, C>
 where
-    S: StateMachine,
+    SM: RaftStateMachine,
+    D: OpDeserializer<SM>,
     L: RaftLog,
-    P: RaftLeaderProxy<S>,
+    C: RaftPeerClientProxy<SM>,
 {
-    pub fn new(state: S, storage: L, leader_proxy: P) -> Result<Self, GenericError> {
-        Self::with_config(state, storage, leader_proxy, Default::default())
+    pub fn new(
+        state: SM,
+        deserializer: D,
+        storage: L,
+        client_peer_proxy: C,
+    ) -> Result<Self, GenericError> {
+        Self::with_config(
+            state,
+            deserializer,
+            storage,
+            client_peer_proxy,
+            Default::default(),
+        )
     }
 
     pub fn with_config(
-        state: S,
+        state: SM,
+        deserializer: D,
         storage: L,
-        leader_proxy: P,
+        client_peer_proxy: C,
         mut config: Config,
     ) -> Result<Self, GenericError> {
         config.id = 1;
@@ -117,54 +152,72 @@ where
         )?;
 
         let self_ = Self {
+            next_peer_id: 1,
             group,
-            op_channel: OpChannel::new(),
+            op_handler: OperationHandler::new(deserializer),
             state,
-            leader_proxy,
+            client_peer_proxy,
             callbacks: CallbackHolder::new(),
         };
 
         Ok(self_)
     }
 
-    pub fn start(mut self) -> RaftNodeHandle<S> {
+    pub fn start<S>(mut self, server_proxy: S) -> Result<Arc<RaftNodeHandle<SM>>, GenericError>
+    where
+        S: RaftPeerServerProxy<SM>,
+    {
         let runtime = Builder::new_current_thread()
             .thread_name("raft-worker")
             .enable_all()
             .build()
             .unwrap();
-        let handle = self.op_channel.handle.take().unwrap();
-
-        thread::spawn(move || {
-            if let Err(err) = self.group.campaign() {
-                panic!("{}", err);
-            }
-            runtime.block_on(async move {
-                let timeout = Duration::from_millis(100);
-                let mut w_buffer = Vec::new();
-
-                loop {
-                    if self.op_channel.is_stopped() {
-                        break;
+        let handle = Arc::new(self.op_handler.handle.take().unwrap());
+        let (start_signal_tx, start_signal_rx) =
+            std::sync::mpsc::sync_channel::<Result<(), GenericError>>(1);
+        {
+            let handle = Arc::clone(&handle);
+            thread::spawn(move || {
+                let handle = Arc::clone(&handle);
+                runtime.block_on(async move {
+                    if let Err(err) = self.on_init(handle, server_proxy).await {
+                        start_signal_tx.send(Err(err)).unwrap();
+                        return;
+                    } else {
+                        start_signal_tx.send(Ok(())).unwrap();
                     }
 
-                    let mut r_buffer = Vec::new();
-                    match self.drain_ops(w_buffer, r_buffer, timeout).await {
-                        (new_w_buffer, new_r_buffer) => {
-                            w_buffer = new_w_buffer;
-                            r_buffer = new_r_buffer;
+                    let timeout = Duration::from_millis(100);
+                    let mut w_buffer = Vec::new();
+                    let mut raft_command_buffer = Vec::new();
+
+                    loop {
+                        if self.op_handler.is_stopped() {
+                            break;
                         }
+
+                        let mut r_buffer = Vec::new();
+                        let (new_w_buffer, new_r_buffer, new_raft_command_buffer) = self
+                            .drain_ops(w_buffer, r_buffer, raft_command_buffer, timeout)
+                            .await;
+
+                        w_buffer = new_w_buffer;
+                        r_buffer = new_r_buffer;
+                        raft_command_buffer = new_raft_command_buffer;
+
+                        self.on_read(r_buffer).await;
+                        self.on_raft_command(&mut raft_command_buffer).await;
+                        self.on_write(&mut w_buffer).await;
+                        self.tick().await;
                     }
-
-                    self.on_read(r_buffer).await;
-                    self.on_write(&mut w_buffer).await;
-                    self.tick().await;
-                }
+                });
             });
-            runtime.shutdown_background();
-        });
+        }
 
-        handle
+        match start_signal_rx.recv().unwrap() {
+            Ok(_) => Ok(handle),
+            Err(err) => Err(err),
+        }
     }
 
     // API must be well defined for Remote Server messages
@@ -204,7 +257,9 @@ where
     }
 
     async fn handle_entries(&mut self, entries: Vec<Entry>) {
-        println!("Entries: {entries:?}");
+        if entries.is_empty() {
+            return;
+        }
 
         let mut _last_apply_index = 0;
         for entry in entries {
@@ -223,15 +278,18 @@ where
                     }
                     let buffer: [u8; 16] =
                         buffer.try_into().expect("Slice should be exactly 16 bytes");
-                    let message_id = u128::from_be_bytes(buffer);
-                    match self.callbacks.remove(message_id) {
-                        None => {
-                            println!("Ignoring entry with unknown message id: {}", message_id);
-                        }
-                        Some(w_op) => {
-                            w_op.op.execute(&mut self.state);
-                            let _ = w_op.notifier.send(Ok(())).await;
-                        }
+                    let message_id = MessageId::from_be_bytes(buffer);
+
+                    // Callbacks to notify that execution was end to the caller. If not exists messages must be rebuilt from serialized form.
+
+                    if let Some(callback) = self.callbacks.remove(message_id) {
+                        callback.op.execute(&mut self.state);
+                        let _ = callback.notifier.send(Ok(message_id)).await;
+                    } else {
+                        let op_buffer = entry.data.as_ref();
+                        let op: Box<dyn WriteOperation<SM>> =
+                            self.op_handler.deserializer.deserialize(op_buffer);
+                        op.execute(&mut self.state);
                     }
                 }
                 EntryType::EntryConfChangeV2 => {
@@ -239,28 +297,146 @@ where
                     cc.merge_from_bytes(&entry.data).unwrap();
                     let cs = self.group.apply_conf_change(&cc).unwrap();
                     self.group.store().set_conf_state(cs);
+
+                    // At the moment only add command
+                    let peer_node_id = cc.changes[0].node_id;
+                    self.next_peer_id = peer_node_id;
+
+                    let context = cc.context.as_ref();
+
+                    let addr: SocketAddr = String::from_utf8_lossy(context)
+                        .as_ref()
+                        .parse()
+                        .expect("Invalid socket address");
+                    self.client_peer_proxy
+                        .upsert_peer(peer_node_id, addr, false);
+
+                    println!("Adding {} node id with {} addr", peer_node_id, addr);
+
+                    // Get SocketAddr from context
+
+                    // Notify event to message proxy to add or remove node.
+                    // Update next peer Id to node_id received.
+                    // Need to distinct if is add or removal.
                 }
                 _ => {}
             };
         }
     }
 
-    async fn handle_messages(&self, messages: Vec<Message>) {
-        println!("Messages: {messages:?}");
+    async fn handle_messages(&mut self, messages: Vec<Message>) {
+        if messages.is_empty() {
+            return;
+        }
 
-        // Send to peers
-        for msg in messages {}
+        let mut pushable_messages = HashMap::new();
+        for msg in messages {
+            // My Own node id
+            if msg.to == self.group.raft.id {
+                if let Err(err) = self.group.step(msg) {
+                    println!("Error: {err}");
+                }
+            } else if msg.from == self.group.raft.id {
+                if !pushable_messages.contains_key(&msg.to) {
+                    pushable_messages.insert(msg.to, Vec::new());
+                }
+
+                pushable_messages.get_mut(&msg.to).unwrap().push(msg);
+            }
+        }
+
+        if !pushable_messages.is_empty() {
+            if let Err(err) = self.client_peer_proxy.message(pushable_messages).await {
+                println!("Error: {err}");
+            }
+        }
+    }
+
+    async fn on_init<S>(
+        &mut self,
+        handle: Arc<RaftNodeHandle<SM>>,
+        server_proxy: S,
+    ) -> Result<(), GenericError>
+    where
+        S: RaftPeerServerProxy<SM>,
+    {
+        let socket_addr = server_proxy.listen(handle)?;
+        let result = self.client_peer_proxy.join(socket_addr).await?;
+
+        if let Some(RaftCommandResult::ClusterJoin(node_id)) = result {
+            self.group.raft.id = node_id;
+
+            // Check this must to be returned by the leader
+            self.client_peer_proxy.upsert_peer(
+                1,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080)),
+                true,
+            );
+
+            println!("Successfully joined with {} id", node_id);
+        }
+
+        self.group.campaign()?;
+        println!("Successfully joined as master");
+        Ok(())
     }
 
     // Add if no Leader depends on configuration, read from master or not (Proxied)
-    async fn on_read(&self, r_buffer: Vec<ReadOpFn<S>>) {
+    async fn on_read(&self, r_buffer: Vec<ReadOpFn<SM>>) {
         if !r_buffer.is_empty() {
             let futures = r_buffer.into_iter().map(|op| op(&self.state));
             join_all(futures).await;
         }
     }
 
-    async fn on_write(&mut self, w_buffer: &mut Vec<AwaitableWriteOp<S>>) {
+    // Internal Raft Commands, return when enqueued. Must return response
+    async fn on_raft_command(&mut self, r_buffer: &mut Vec<AwaitableRaftCommand>) {
+        for command in r_buffer.drain(..) {
+            match command.command {
+                // Received joint consensus over the network. If not leader reject.
+                RaftCommand::ClusterJoin(addr) => {
+                    if self.group.raft.state != StateRole::Leader {
+                        // Error not leader
+                        let _ = command.notifier.send(Ok(RaftCommandResult::None));
+                    } else {
+                        // When removed?
+                        // Assign next nodeId
+                        self.next_peer_id += 1;
+
+                        let mut cc = ConfChangeV2::default();
+                        let mut change = ConfChangeSingle::new();
+                        change.change_type = ConfChangeType::AddNode;
+                        change.node_id = self.next_peer_id;
+                        cc.changes = RepeatedField::from_vec(vec![change]);
+                        // Check this
+                        cc.context = addr.to_string().into();
+
+                        // Notify event to message proxy to add or remove node will be done in handle_entries.
+                        // message() method deprecated by this method. Raft Commands.
+                        if let Err(err) = self.group.propose_conf_change(vec![], cc) {
+                            let _ = command.notifier.send(Err(err.into()));
+                        } else {
+                            // Add log
+                            let _ = command
+                                .notifier
+                                .send(Ok(RaftCommandResult::ClusterJoin(self.next_peer_id)));
+                        }
+                    }
+                }
+
+                // Received message over the network. Notify?
+                RaftCommand::Raw(msg) => {
+                    if let Err(err) = self.group.step(msg) {
+                        let _ = command.notifier.send(Err(err.into()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Generalize this to handle other operations like EntryConfChange?. propose_conf_change. Two more channels for messaging and conf change. Wrap this two in one channel.
+    // Idempotence must to be handle at implementation level.
+    async fn on_write(&mut self, w_buffer: &mut Vec<AwaitableWriteOp<SM>>) {
         for w_op in w_buffer.drain(..) {
             let op_buffer = w_op.op.serialize();
             if self.group.raft.state != StateRole::Leader {
@@ -269,8 +445,9 @@ where
                 // Must return message id.
                 // Allow batching.
                 // Track Rejections to remove dirty callbacks.
-                match self.leader_proxy.write(op_buffer.as_slice()).await {
+                match self.client_peer_proxy.write(op_buffer.as_slice()).await {
                     Ok(message_id) => {
+                        self.callbacks.update_next(message_id);
                         self.callbacks.add(message_id, w_op);
                     }
                     Err(err) => {
@@ -279,11 +456,10 @@ where
                 };
             } else {
                 let message_id = self.callbacks.next();
-                if let Err(err) = self
-                    .group
-                    .propose(message_id.to_be_bytes().to_vec(), op_buffer)
-                {
+                let context = message_id.to_be_bytes().to_vec();
+                if let Err(err) = self.group.propose(context, op_buffer) {
                     // Add log
+                    println!("Error: {err}");
                     let _ = w_op.notifier.send(Err(err.into())).await;
                 } else {
                     self.callbacks.add(message_id, w_op);
@@ -295,19 +471,29 @@ where
     // Limit batch size of op's
     async fn drain_ops<'a>(
         &mut self,
-        mut w_buffer: Vec<AwaitableWriteOp<S>>,
-        mut r_buffer: Vec<ReadOpFn<S>>,
+        mut w_buffer: Vec<AwaitableWriteOp<SM>>,
+        mut r_buffer: Vec<ReadOpFn<SM>>,
+        mut raft_msg_buffer: Vec<AwaitableRaftCommand>,
         timeout: Duration,
-    ) -> (Vec<AwaitableWriteOp<S>>, Vec<ReadOpFn<S>>) {
-        let (read_mut, write_mut) = self.op_channel.as_mut();
+    ) -> (
+        Vec<AwaitableWriteOp<SM>>,
+        Vec<ReadOpFn<SM>>,
+        Vec<AwaitableRaftCommand>,
+    ) {
+        let max_drain = 512;
+        let (read_mut, write_mut, raft_msg_mut) = self.op_handler.as_mut();
         tokio::select! {
             biased;
             _ = time::sleep(timeout) => {
-                return (w_buffer, r_buffer);
+                return (w_buffer, r_buffer, raft_msg_buffer);
             }
             // Read operation received
             Some(r_op) = read_mut.recv() => {
                 r_buffer.push(r_op);
+            }
+
+            Some(raft_msg) = raft_msg_mut.recv() => {
+                raft_msg_buffer.push(raft_msg);
             }
 
             // Write operation received
@@ -316,78 +502,30 @@ where
             }
             // Both channels closed
             else => {
-                return (w_buffer, r_buffer);
+                return (w_buffer, r_buffer, raft_msg_buffer);
             }
         }
 
-        while let Ok(r_op) = self.op_channel.try_recv_read_op() {
-            r_buffer.push(r_op);
+        for _ in 0..max_drain {
+            match self.op_handler.try_recv_read_op() {
+                Ok(r_op) => r_buffer.push(r_op),
+                Err(_) => break,
+            }
         }
 
-        while let Ok(w_op) = self.op_channel.try_recv_write_op() {
-            w_buffer.push(w_op);
+        for _ in 0..max_drain {
+            match self.op_handler.try_recv_write_op() {
+                Ok(w_op) => w_buffer.push(w_op),
+                Err(_) => break,
+            }
         }
 
-        (w_buffer, r_buffer)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::leader_proxy::NoOpRaftLeaderProxy;
-    use crate::node::RaftNode;
-    use crate::operation::{ReadOperation, WriteOperation};
-    use crate::raft_log::InMemoryRaftLog;
-    use crate::state_machine::StateMachine;
-
-    #[derive(Default)]
-    struct ReadOp;
-    impl ReadOperation<InMemoryStateMachine> for ReadOp {
-        type Output = u64;
-        fn execute(&self, state: &InMemoryStateMachine) -> Option<Self::Output> {
-            Some(state.value)
+        for _ in 0..max_drain {
+            match self.op_handler.try_recv_raft_msg() {
+                Ok(raft_msg) => raft_msg_buffer.push(raft_msg),
+                Err(_) => break,
+            }
         }
-
-        fn serialize(&self) -> Vec<u8> {
-            todo!()
-        }
-    }
-
-    #[derive(Default)]
-    struct IncrementOp;
-    impl WriteOperation<InMemoryStateMachine> for IncrementOp {
-        fn execute(&self, state: &mut InMemoryStateMachine) {
-            state.value += 1;
-        }
-
-        fn serialize(&self) -> Vec<u8> {
-            "INCREMENT".bytes().collect()
-        }
-    }
-
-    #[derive(Default)]
-    struct InMemoryStateMachine {
-        value: u64,
-    }
-    impl StateMachine for InMemoryStateMachine {}
-
-    #[tokio::test]
-    async fn test() {
-        let sm = InMemoryStateMachine::default();
-        let rl = InMemoryRaftLog::new();
-        let l_proxy = NoOpRaftLeaderProxy::default();
-
-        let node = RaftNode::new(sm, rl, l_proxy).unwrap();
-        let handle = node.start();
-
-        (0..99).for_each(|_| {
-            handle.write(IncrementOp::default());
-        });
-        let _ = handle.write(IncrementOp::default()).recv().await;
-
-        assert_eq!(
-            Some(100),
-            handle.read(ReadOp::default()).recv().await.unwrap()
-        );
+        (w_buffer, r_buffer, raft_msg_buffer)
     }
 }
