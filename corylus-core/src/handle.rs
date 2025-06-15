@@ -32,6 +32,7 @@ where
 {
     pub op: Box<dyn WriteOperation<S>>,
     pub notifier: mpsc::Sender<Result<MessageId, GenericError>>,
+    pub remote: bool,
     _phantom_sm: PhantomData<S>,
 }
 
@@ -46,6 +47,21 @@ where
         let self_ = Self {
             op: Box::new(op),
             notifier: tx,
+            remote: false,
+            _phantom_sm: Default::default(),
+        };
+
+        (self_, rx)
+    }
+
+    fn new_boxed(
+        op: Box<dyn WriteOperation<S>>,
+    ) -> (Self, mpsc::Receiver<Result<MessageId, GenericError>>) {
+        let (tx, rx) = mpsc::channel(1);
+        let self_ = Self {
+            op,
+            notifier: tx,
+            remote: true,
             _phantom_sm: Default::default(),
         };
 
@@ -100,6 +116,15 @@ where
         op: W,
     ) -> mpsc::Receiver<Result<MessageId, GenericError>> {
         let (awaitable_op, rx) = AwaitableWriteOp::new(op);
+        self.write_channel.send(awaitable_op).unwrap();
+        rx
+    }
+
+    pub fn write_boxed(
+        &self,
+        op: Box<dyn WriteOperation<S>>,
+    ) -> mpsc::Receiver<Result<MessageId, GenericError>> {
+        let (awaitable_op, rx) = AwaitableWriteOp::new_boxed(op);
         self.write_channel.send(awaitable_op).unwrap();
         rx
     }

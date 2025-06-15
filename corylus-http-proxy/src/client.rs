@@ -1,4 +1,5 @@
-use crate::server::{ClusterJoinRequest, ClusterJoinResponse, MessagesRequest};
+use crate::request::{ClusterJoinRequest, MessagesRequest, WritesRequest};
+use crate::response::{ClusterJoinResponse, WritesResponse};
 use corylus_core::node::GenericError;
 use corylus_core::operation::{RaftCommand, RaftCommandResult};
 use corylus_core::peer::{MessageId, PeerId, RaftPeerClientProxy};
@@ -60,7 +61,7 @@ where
             if socket_addr.port() == port {
                 continue;
             }
-            
+
             let url = format!("http://localhost:{port}/join");
 
             let response = match client.post(&url).json(&join_request).send().await {
@@ -79,20 +80,38 @@ where
                 Err(_) => continue,
             }
         }
-
-        println!("end");
-
         Ok(None)
     }
 
-    async fn write(&mut self, data: &[u8]) -> Result<MessageId, GenericError> {
-        todo!()
+    async fn write(&mut self, writes: Vec<Vec<u8>>) -> Result<Vec<MessageId>, GenericError> {
+        if let Some(addr) = self.peers.get(&self.leader_peer_id) {
+            let client = Client::new();
+            let url = format!("http://{addr}/write");
+
+            let request = WritesRequest { data: writes };
+            let response = client.post(&url).json(&request).send().await?;
+
+            if !response.status().is_success() {
+                return Err("response is not success".into());
+            }
+
+            match response.json::<WritesResponse>().await {
+                Ok(result) => {
+                    Ok(result.message_ids)
+                }
+                Err(err) => Err(err.into()),
+            }
+        } else {
+            println!("Leader Peer not found in map");
+            Err("Leader peer does not exist".into())
+        }
     }
 
     // Decouple this peer handling for client proxy implementation. Always must be the same. PeerHandler
     fn upsert_peer(&mut self, node_id: u64, addr: SocketAddr, is_leader: bool) {
         self.peers.insert(node_id, addr);
-        if is_leader {
+        // Change this
+        if node_id == 1 {
             self.leader_peer_id = node_id;
         }
     }

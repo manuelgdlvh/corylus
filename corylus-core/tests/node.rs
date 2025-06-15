@@ -1,13 +1,13 @@
 use corylus_core::handle::RaftNodeHandle;
 use corylus_core::node::RaftNode;
-use corylus_core::operation::{ReadOperation, WriteOperation};
+use corylus_core::operation::{RaftCommand, ReadOperation, WriteOperation};
 use corylus_core::peer::OpDeserializer;
 use corylus_core::raft_log::InMemoryRaftLog;
 use corylus_core::state_machine::RaftStateMachine;
 use corylus_http_proxy::client::ReqwestHttpClient;
 use corylus_http_proxy::server::ActixHttpServer;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 #[derive(Default, Clone, Copy)]
@@ -47,7 +47,7 @@ impl WriteOperation<InMemoryRaftStateMachine> for DecrementOp {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct CustomDeserializer {}
 
 impl OpDeserializer<InMemoryRaftStateMachine> for CustomDeserializer {
@@ -67,8 +67,12 @@ struct InMemoryRaftStateMachine {
 }
 impl RaftStateMachine for InMemoryRaftStateMachine {}
 
+static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 #[tokio::test]
 async fn should_replicate_operation_successfully() {
+    let result = TEST_LOCK.lock().expect("ASDASD");
+
     let handle_1 = start_raft_node(8080);
     let handle_2 = start_raft_node(8081);
     let handle_3 = start_raft_node(8082);
@@ -90,6 +94,63 @@ async fn should_replicate_operation_successfully() {
         Some(0),
         handle_1.read(ReadOp::default()).recv().await.unwrap()
     );
+
+    let _ = handle_1.raft_command(RaftCommand::Stop).recv();
+    let _ = handle_2.raft_command(RaftCommand::Stop).recv();
+    let _ = handle_3.raft_command(RaftCommand::Stop).recv();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+}
+
+// Write Blocking event loop. Write / Commands asynchronous?
+#[tokio::test]
+async fn should_forward_write_to_leader_successfully() {
+    let result = TEST_LOCK.lock().expect("ASDASD");
+
+    let handle_1 = start_raft_node(8080);
+    let handle_2 = start_raft_node(8081);
+    let handle_3 = start_raft_node(8082);
+
+    // To avoid deadlock in write. Peer not found
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let num_of_messages = 10000;
+
+    send_write_op(
+        handle_2.clone(),
+        num_of_messages / 2,
+        IncrementOp::default(),
+    )
+    .await;
+    send_write_op(
+        handle_3.clone(),
+        num_of_messages / 2,
+        IncrementOp::default(),
+    )
+    .await;
+    await_until_full_replicated(handle_1.clone(), ReadOp::default(), num_of_messages).await;
+    await_until_full_replicated(handle_2.clone(), ReadOp::default(), num_of_messages).await;
+    await_until_full_replicated(handle_3.clone(), ReadOp::default(), num_of_messages).await;
+
+    send_write_op(
+        handle_2.clone(),
+        num_of_messages / 2,
+        DecrementOp::default(),
+    )
+    .await;
+    send_write_op(
+        handle_3.clone(),
+        num_of_messages / 2,
+        DecrementOp::default(),
+    )
+    .await;
+    await_until_full_replicated(handle_1.clone(), ReadOp::default(), 0).await;
+    await_until_full_replicated(handle_2.clone(), ReadOp::default(), 0).await;
+    await_until_full_replicated(handle_3.clone(), ReadOp::default(), 0).await;
+
+    let _ = handle_1.raft_command(RaftCommand::Stop).recv();
+    let _ = handle_2.raft_command(RaftCommand::Stop).recv();
+    let _ = handle_3.raft_command(RaftCommand::Stop).recv();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
 }
 
 async fn send_write_op(
@@ -140,5 +201,5 @@ fn start_raft_node(port: u16) -> Arc<RaftNodeHandle<InMemoryRaftStateMachine>> {
     let deserializer = CustomDeserializer::default();
 
     let node = RaftNode::new(sm, deserializer, rl, client_proxy).unwrap();
-    node.start(server_proxy).unwrap()
+    node.start(server_proxy, deserializer).unwrap()
 }

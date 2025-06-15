@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
 use crate::node::GenericError;
 use crate::state_machine::RaftStateMachine;
 use raft::prelude::{ConfChangeV2, Message};
+use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 
 // Read operation is distinct of write, does not must be persisted in log and returns result.
@@ -31,6 +31,7 @@ where
 
 // Add serializer, deserializer trait for this to use the caller want.
 pub enum RaftCommand {
+    Stop,
     ClusterJoin(SocketAddr),
     Raw(Message),
 }
@@ -59,7 +60,7 @@ impl AwaitableRaftCommand {
 
 #[cfg(test)]
 mod tests {
-    use crate::operation::{ReadOperation, RaftStateMachine, WriteOperation};
+    use crate::operation::{RaftStateMachine, ReadOperation, WriteOperation};
 
     #[derive(Default)]
     struct SumOp {

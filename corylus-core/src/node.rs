@@ -1,7 +1,9 @@
 use crate::callback::CallbackHolder;
 use crate::handle::{AwaitableWriteOp, RaftNodeHandle, ReadOpFn};
 use crate::operation::{AwaitableRaftCommand, RaftCommand, RaftCommandResult, WriteOperation};
-use crate::peer::{MessageId, OpDeserializer, RaftPeerClientProxy, RaftPeerServerProxy};
+use crate::peer::{
+    MessageId, OpDeserializer, RaftPeerClientProxy, RaftPeerServerProxy, ServerHandle,
+};
 use crate::raft_log::RaftLog;
 use crate::state_machine::RaftStateMachine;
 use futures::future::join_all;
@@ -21,7 +23,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time;
 
 pub type GenericError = Box<dyn Error + Send + Sync>;
-
+// As trait
 struct OperationHandler<S, D>
 where
     S: RaftStateMachine,
@@ -163,9 +165,14 @@ where
         Ok(self_)
     }
 
-    pub fn start<S>(mut self, server_proxy: S) -> Result<Arc<RaftNodeHandle<SM>>, GenericError>
+    pub fn start<S, H>(
+        mut self,
+        server_proxy: S,
+        deserializer: D,
+    ) -> Result<Arc<RaftNodeHandle<SM>>, GenericError>
     where
-        S: RaftPeerServerProxy<SM>,
+        H: ServerHandle,
+        S: RaftPeerServerProxy<SM, D, H>,
     {
         let runtime = Builder::new_current_thread()
             .thread_name("raft-worker")
@@ -180,22 +187,23 @@ where
             thread::spawn(move || {
                 let handle = Arc::clone(&handle);
                 runtime.block_on(async move {
-                    if let Err(err) = self.on_init(handle, server_proxy).await {
-                        start_signal_tx.send(Err(err)).unwrap();
-                        return;
-                    } else {
-                        start_signal_tx.send(Ok(())).unwrap();
-                    }
+                    let server_handle = match self.on_init(handle, deserializer, server_proxy).await
+                    {
+                        Ok(server_handle) => {
+                            start_signal_tx.send(Ok(())).unwrap();
+                            server_handle
+                        }
+                        Err(err) => {
+                            start_signal_tx.send(Err(err)).unwrap();
+                            return;
+                        }
+                    };
 
                     let timeout = Duration::from_millis(100);
                     let mut w_buffer = Vec::new();
                     let mut raft_command_buffer = Vec::new();
 
                     loop {
-                        if self.op_handler.is_stopped() {
-                            break;
-                        }
-
                         let mut r_buffer = Vec::new();
                         let (new_w_buffer, new_r_buffer, new_raft_command_buffer) = self
                             .drain_ops(w_buffer, r_buffer, raft_command_buffer, timeout)
@@ -205,8 +213,13 @@ where
                         r_buffer = new_r_buffer;
                         raft_command_buffer = new_raft_command_buffer;
 
-                        self.on_read(r_buffer).await;
                         self.on_raft_command(&mut raft_command_buffer).await;
+                        if self.op_handler.is_stopped() {
+                            server_handle.stop().await;
+                            break;
+                        }
+
+                        self.on_read(r_buffer).await;
                         self.on_write(&mut w_buffer).await;
                         self.tick().await;
                     }
@@ -284,7 +297,10 @@ where
 
                     if let Some(callback) = self.callbacks.remove(message_id) {
                         callback.op.execute(&mut self.state);
-                        let _ = callback.notifier.send(Ok(message_id)).await;
+                        // If write remote we let a callback to avoid deserialization, but not must to be notified because was notified in proposing step
+                        if !callback.remote {
+                            let _ = callback.notifier.send(Ok(message_id)).await;
+                        }
                     } else {
                         let op_buffer = entry.data.as_ref();
                         let op: Box<dyn WriteOperation<SM>> =
@@ -352,16 +368,21 @@ where
         }
     }
 
-    async fn on_init<S>(
+    async fn on_init<S, H>(
         &mut self,
         handle: Arc<RaftNodeHandle<SM>>,
+        deserializer: D,
         server_proxy: S,
-    ) -> Result<(), GenericError>
+    ) -> Result<H, GenericError>
     where
-        S: RaftPeerServerProxy<SM>,
+        H: ServerHandle,
+        S: RaftPeerServerProxy<SM, D, H>,
     {
-        let socket_addr = server_proxy.listen(handle)?;
-        let result = self.client_peer_proxy.join(socket_addr).await?;
+        let server_handle = server_proxy.listen(handle, deserializer)?;
+        let result = self
+            .client_peer_proxy
+            .join(server_handle.socket_addr())
+            .await?;
 
         if let Some(RaftCommandResult::ClusterJoin(node_id)) = result {
             self.group.raft.id = node_id;
@@ -378,7 +399,7 @@ where
 
         self.group.campaign()?;
         println!("Successfully joined as master");
-        Ok(())
+        Ok(server_handle)
     }
 
     // Add if no Leader depends on configuration, read from master or not (Proxied)
@@ -423,12 +444,14 @@ where
                         }
                     }
                 }
-
                 // Received message over the network. Notify?
                 RaftCommand::Raw(msg) => {
                     if let Err(err) = self.group.step(msg) {
                         let _ = command.notifier.send(Err(err.into()));
                     }
+                }
+                RaftCommand::Stop => {
+                    self.op_handler.stop();
                 }
             }
         }
@@ -436,25 +459,49 @@ where
 
     // Generalize this to handle other operations like EntryConfChange?. propose_conf_change. Two more channels for messaging and conf change. Wrap this two in one channel.
     // Idempotence must to be handle at implementation level.
+    // Deadlock of peer waiting leader, and leader waiting peer.
     async fn on_write(&mut self, w_buffer: &mut Vec<AwaitableWriteOp<SM>>) {
-        for w_op in w_buffer.drain(..) {
-            let op_buffer = w_op.op.serialize();
-            if self.group.raft.state != StateRole::Leader {
-                println!("Node is not leader. Sending over the network");
+        if w_buffer.is_empty() {
+            return;
+        }
 
-                // Must return message id.
-                // Allow batching.
-                // Track Rejections to remove dirty callbacks.
-                match self.client_peer_proxy.write(op_buffer.as_slice()).await {
-                    Ok(message_id) => {
-                        self.callbacks.update_next(message_id);
+        if self.group.raft.state != StateRole::Leader {
+            println!("Node is not leader. Sending writes over the network");
+            let mut ops_buffer = Vec::new();
+            // Avoid networking
+            for w_op in w_buffer.iter() {
+                let op_buffer = w_op.op.serialize();
+                ops_buffer.push(op_buffer);
+            }
+
+            // Must return message id.
+            // Allow batching.
+            // Track Rejections to remove dirty callbacks.
+            match self.client_peer_proxy.write(ops_buffer).await {
+                Ok(mut results) => {
+                    let mut updated = false;
+
+                    for (idx, w_op) in w_buffer.drain(..).enumerate().rev() {
+                        let message_id = results.swap_remove(idx);
+
+                        // To avoid loss of callbacks if reelection.
+                        if !updated {
+                            self.callbacks.update_next(message_id);
+                            updated = true;
+                        }
+
                         self.callbacks.add(message_id, w_op);
                     }
-                    Err(err) => {
-                        let _ = w_op.notifier.send(Err(err.into())).await;
+                }
+                Err(err) => {
+                    for w_op in w_buffer.drain(..) {
+                        let _ = w_op.notifier.send(Err(err.to_string().into())).await;
                     }
-                };
-            } else {
+                }
+            };
+        } else {
+            for w_op in w_buffer.drain(..) {
+                let op_buffer = w_op.op.serialize();
                 let message_id = self.callbacks.next();
                 let context = message_id.to_be_bytes().to_vec();
                 if let Err(err) = self.group.propose(context, op_buffer) {
@@ -462,6 +509,11 @@ where
                     println!("Error: {err}");
                     let _ = w_op.notifier.send(Err(err.into())).await;
                 } else {
+                    // If remote notify now. This no matter if Progress Tracker or not, in the moment we have proposed and with messageId, the remote call must return.
+                    if w_op.remote == true {
+                        let _ = w_op.notifier.send(Ok(message_id)).await;
+                    }
+                    // If go from remote request maintain callback in leader too to avoid one deserialization. But converge to avoid deadlock.
                     self.callbacks.add(message_id, w_op);
                 }
             }
@@ -480,7 +532,7 @@ where
         Vec<ReadOpFn<SM>>,
         Vec<AwaitableRaftCommand>,
     ) {
-        let max_drain = 512;
+        let max_drain = 256;
         let (read_mut, write_mut, raft_msg_mut) = self.op_handler.as_mut();
         tokio::select! {
             biased;
