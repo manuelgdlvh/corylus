@@ -1,8 +1,9 @@
 use crate::node::GenericError;
+use crate::peer::PeerId;
 use crate::state_machine::RaftStateMachine;
-use raft::prelude::{ConfChangeV2, Message};
+use raft::prelude::Message;
 use std::net::SocketAddr;
-use std::sync::mpsc::{Receiver, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender};
 
 // Read operation is distinct of write, does not must be persisted in log and returns result.
 // Read operations must be linearized with writes to avoid locks in write's (Raft single threaded, for more parallelism use MultiRaft).
@@ -38,7 +39,11 @@ pub enum RaftCommand {
 
 pub type NodeId = u64;
 pub enum RaftCommandResult {
-    ClusterJoin(NodeId),
+    ClusterJoin {
+        own_node_id: NodeId,
+        leader_node_id: NodeId,
+        leader_addr: SocketAddr,
+    },
     None,
 }
 

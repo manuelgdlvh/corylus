@@ -2,7 +2,6 @@ use crate::node::GenericError;
 use raft::prelude::{ConfState, Entry, HardState, Snapshot};
 use raft::storage::MemStorage as MemStorageInner;
 use raft::{GetEntriesContext, Storage};
-use std::error::Error;
 
 pub trait RaftLog: Storage + Send + 'static {
     fn append(&self, entries: &[Entry]) -> Result<(), GenericError>;

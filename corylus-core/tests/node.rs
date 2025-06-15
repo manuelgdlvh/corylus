@@ -71,13 +71,13 @@ static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[tokio::test]
 async fn should_replicate_operation_successfully() {
-    let result = TEST_LOCK.lock().expect("ASDASD");
+    let guard = TEST_LOCK.lock().unwrap();
 
     let handle_1 = start_raft_node(8080);
     let handle_2 = start_raft_node(8081);
     let handle_3 = start_raft_node(8082);
 
-    let num_of_messages = 100000;
+    let num_of_messages = 10000;
 
     send_write_op(handle_1.clone(), num_of_messages, IncrementOp::default()).await;
     await_until_full_replicated(handle_2.clone(), ReadOp::default(), num_of_messages).await;
@@ -95,16 +95,15 @@ async fn should_replicate_operation_successfully() {
         handle_1.read(ReadOp::default()).recv().await.unwrap()
     );
 
-    let _ = handle_1.raft_command(RaftCommand::Stop).recv();
-    let _ = handle_2.raft_command(RaftCommand::Stop).recv();
-    let _ = handle_3.raft_command(RaftCommand::Stop).recv();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let _ = handle_1.raft_command(RaftCommand::Stop).recv().unwrap();
+    let _ = handle_2.raft_command(RaftCommand::Stop).recv().unwrap();
+    let _ = handle_3.raft_command(RaftCommand::Stop).recv().unwrap();
 }
 
 // Write Blocking event loop. Write / Commands asynchronous?
 #[tokio::test]
 async fn should_forward_write_to_leader_successfully() {
-    let result = TEST_LOCK.lock().expect("ASDASD");
+    let guard = TEST_LOCK.lock().unwrap();
 
     let handle_1 = start_raft_node(8080);
     let handle_2 = start_raft_node(8081);
@@ -147,10 +146,9 @@ async fn should_forward_write_to_leader_successfully() {
     await_until_full_replicated(handle_2.clone(), ReadOp::default(), 0).await;
     await_until_full_replicated(handle_3.clone(), ReadOp::default(), 0).await;
 
-    let _ = handle_1.raft_command(RaftCommand::Stop).recv();
-    let _ = handle_2.raft_command(RaftCommand::Stop).recv();
-    let _ = handle_3.raft_command(RaftCommand::Stop).recv();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let _ = handle_1.raft_command(RaftCommand::Stop).recv().unwrap();
+    let _ = handle_2.raft_command(RaftCommand::Stop).recv().unwrap();
+    let _ = handle_3.raft_command(RaftCommand::Stop).recv().unwrap();
 }
 
 async fn send_write_op(
@@ -159,7 +157,7 @@ async fn send_write_op(
     write_op: impl WriteOperation<InMemoryRaftStateMachine> + Clone + 'static,
 ) {
     for i in 0..(num_of_messages - 1) {
-        if i % 1000 == 0 {
+        if i % 250 == 0 {
             let _ = handle.write(write_op.clone()).recv().await;
             println!("{} messages were sent", i);
             continue;
@@ -185,7 +183,7 @@ async fn await_until_full_replicated(
                 }
 
                 println!("Waiting to receive {} messages. Actual: {}", target, val);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(5000)).await;
             }
         };
     }

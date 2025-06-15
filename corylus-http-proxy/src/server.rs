@@ -4,13 +4,12 @@ use actix_web::web::{Data, Json};
 use actix_web::{App, HttpResponse, HttpServer, Responder, web};
 use corylus_core::handle::RaftNodeHandle;
 use corylus_core::node::GenericError;
-use corylus_core::operation::{NodeId, RaftCommand, RaftCommandResult};
-use corylus_core::peer::{OpDeserializer, RaftPeerServerProxy, ServerHandle};
+use corylus_core::operation::{RaftCommand, RaftCommandResult};
+use corylus_core::peer::{OpDeserializer, RaftPeerServer, RaftPeerServerHandle};
 use corylus_core::state_machine::RaftStateMachine;
-use protobuf::{Message as ProtobufMessage, RepeatedField};
+use protobuf::Message as ProtobufMessage;
 use raft::prelude::Message;
-use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use tokio::runtime::Builder;
@@ -29,11 +28,11 @@ impl ActixHttpServer {
     }
 }
 
-pub struct ActixServerHandle {
+pub struct ActixRaftPeerServerHandle {
     handle: actix_web::dev::ServerHandle,
     socket_addr: SocketAddr,
 }
-impl ServerHandle for ActixServerHandle {
+impl RaftPeerServerHandle for ActixRaftPeerServerHandle {
     fn socket_addr(&self) -> SocketAddr {
         self.socket_addr
     }
@@ -43,7 +42,7 @@ impl ServerHandle for ActixServerHandle {
     }
 }
 
-impl<SM, D> RaftPeerServerProxy<SM, D, ActixServerHandle> for ActixHttpServer
+impl<SM, D> RaftPeerServer<SM, D, ActixRaftPeerServerHandle> for ActixHttpServer
 where
     SM: RaftStateMachine,
     D: OpDeserializer<SM>,
@@ -51,21 +50,20 @@ where
     fn listen(
         self,
         handle: Arc<RaftNodeHandle<SM>>,
-        deserializer: D,
-    ) -> Result<ActixServerHandle, GenericError> {
+        deserializer: Arc<D>,
+    ) -> Result<ActixRaftPeerServerHandle, GenericError> {
         let runtime = Builder::new_multi_thread()
             .thread_name("actix-http-server")
             .enable_all()
             .build()
             .unwrap();
 
-        let (start_signal_tx, start_signal_rx) =
-            mpsc::sync_channel::<Result<ActixServerHandle, GenericError>>(1);
+        let (started_signal_tx, started_signal_rx) =
+            mpsc::sync_channel::<Result<ActixRaftPeerServerHandle, GenericError>>(1);
+
         thread::spawn(move || {
             runtime.block_on(async move {
-                // Signal if failed binding
-                let app_data = Arc::new((deserializer, handle));
-
+                let app_data = (deserializer, handle);
                 match HttpServer::new(move || {
                     App::new()
                         .app_data(Data::new(app_data.clone()))
@@ -76,28 +74,28 @@ where
                 .bind((self.net_interface, self.port))
                 {
                     Ok(server) => {
-                        let socket_addr = SocketAddr::V4(SocketAddrV4::new(
-                            Ipv4Addr::new(127, 0, 0, 1),
-                            self.port,
-                        ));
+                        let socket_addr = server
+                            .addrs()
+                            .first()
+                            .expect("Socket Address should be initialized")
+                            .clone();
                         let server = server.run();
-
-                        let handle = ActixServerHandle {
+                        let handle = ActixRaftPeerServerHandle {
                             handle: server.handle(),
                             socket_addr,
                         };
-                        start_signal_tx.send(Ok(handle)).unwrap();
 
+                        started_signal_tx.send(Ok(handle)).unwrap();
                         let _ = server.await;
                     }
                     Err(err) => {
-                        start_signal_tx.send(Err(err.into())).unwrap();
+                        started_signal_tx.send(Err(err.into())).unwrap();
                     }
                 }
             })
         });
 
-        start_signal_rx
+        started_signal_rx
             .recv()
             .expect("Server should start successfully")
     }
@@ -105,14 +103,12 @@ where
 
 async fn join<SM, D>(
     request: Json<ClusterJoinRequest>,
-    state: Data<Arc<(D, Arc<RaftNodeHandle<SM>>)>>,
+    state: Data<(Arc<D>, Arc<RaftNodeHandle<SM>>)>,
 ) -> impl Responder
 where
     SM: RaftStateMachine,
     D: OpDeserializer<SM>,
 {
-    println!("request join received");
-
     let socket_addr: SocketAddr = request.socket_addr.parse().unwrap();
 
     // Thread blocked waiting response, change to async
@@ -123,9 +119,15 @@ where
     {
         match result {
             Ok(response) => match response {
-                RaftCommandResult::ClusterJoin(id) => {
-                    HttpResponse::Ok().json(ClusterJoinResponse { node_id: id })
-                }
+                RaftCommandResult::ClusterJoin {
+                    own_node_id,
+                    leader_node_id,
+                    leader_addr,
+                } => HttpResponse::Ok().json(ClusterJoinResponse {
+                    own_node_id,
+                    leader_node_id,
+                    leader_addr,
+                }),
                 RaftCommandResult::None => HttpResponse::UnprocessableEntity().finish(),
             },
             Err(_) => HttpResponse::InternalServerError().finish(),
@@ -137,7 +139,7 @@ where
 
 async fn messages<SM, D>(
     request: Json<MessagesRequest>,
-    state: Data<Arc<(D, Arc<RaftNodeHandle<SM>>)>>,
+    state: Data<(Arc<D>, Arc<RaftNodeHandle<SM>>)>,
 ) -> impl Responder
 where
     SM: RaftStateMachine,
@@ -154,21 +156,16 @@ where
 
 async fn write<SM, D>(
     request: Json<WritesRequest>,
-    state: Data<Arc<(D, Arc<RaftNodeHandle<SM>>)>>,
+    state: Data<(Arc<D>, Arc<RaftNodeHandle<SM>>)>,
 ) -> impl Responder
 where
     SM: RaftStateMachine,
     D: OpDeserializer<SM>,
 {
-    println!(
-        "request write received with {} messages",
-        request.data.len()
-    );
-
     let mut waiters = Vec::new();
     for msg_buff in request.data.iter() {
         let operation = state.0.deserialize(msg_buff);
-        waiters.push(state.1.write_boxed(operation));
+        waiters.push(state.1.write_forwarded(operation));
     }
 
     let mut message_ids = Vec::new();

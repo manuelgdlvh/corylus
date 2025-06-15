@@ -12,30 +12,44 @@ use crate::node::GenericError;
 use crate::operation::{RaftCommandResult, WriteOperation};
 use crate::state_machine::RaftStateMachine;
 use raft::prelude::Message;
-use std::collections::HashMap;
-use std::error::Error;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub type MessageId = u128;
 pub type PeerId = u64;
 
-pub trait OpDeserializer<SM>: Send + Sync + Clone + 'static
+#[derive(Default)]
+pub struct OperationBucket {
+    pub(crate) messages: Vec<Vec<u8>>,
+}
+
+impl OperationBucket {
+    pub fn add(&mut self, msg: Vec<u8>) {
+        self.messages.push(msg);
+    }
+
+    pub fn take_messages(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.messages)
+    }
+}
+
+pub trait OpDeserializer<SM>: Send + Sync + 'static
 where
     SM: RaftStateMachine,
 {
     fn deserialize(&self, data: &[u8]) -> Box<dyn WriteOperation<SM>>;
 }
 
-pub trait RaftPeerClientProxy<S>: Send + 'static
+pub trait RaftPeerClient<S>: Send + 'static
 where
     S: RaftStateMachine,
 {
     // The implementation must ensure to always be forwarded to Leader Node in other case always will fail in propose().
 
     fn message(
-        &mut self,
-        message: HashMap<PeerId, Vec<Message>>,
+        &self,
+        peer_id: PeerId,
+        messages: Vec<Message>,
     ) -> impl Future<Output = Result<RaftCommandResult, GenericError>>;
     fn join(
         &mut self,
@@ -44,11 +58,10 @@ where
 
     fn write(
         &mut self,
-        data: Vec<Vec<u8>>,
+        bucket: OperationBucket,
     ) -> impl Future<Output = Result<Vec<MessageId>, GenericError>>;
 
-    fn upsert_peer(&mut self, node_id: u64, addr: SocketAddr, is_leader: bool);
-    fn generate_peer_id(&mut self) -> PeerId;
+    fn upsert_peer(&mut self, node_id: PeerId, addr: SocketAddr, is_leader: bool);
 
     /*
     This clash with ReadOpFn. At the moment only eventual consistency.
@@ -56,16 +69,20 @@ where
     */
 }
 
-pub trait ServerHandle {
+pub trait RaftPeerServerHandle {
     fn socket_addr(&self) -> SocketAddr;
     async fn stop(&self);
 }
 
-pub trait RaftPeerServerProxy<SM, D, H>: Send + 'static
+pub trait RaftPeerServer<SM, D, H>: Send + 'static
 where
     SM: RaftStateMachine,
     D: OpDeserializer<SM>,
-    H: ServerHandle,
+    H: RaftPeerServerHandle,
 {
-    fn listen(self, handle: Arc<RaftNodeHandle<SM>>, deserializer: D) -> Result<H, GenericError>;
+    fn listen(
+        self,
+        handle: Arc<RaftNodeHandle<SM>>,
+        deserializer: Arc<D>,
+    ) -> Result<H, GenericError>;
 }

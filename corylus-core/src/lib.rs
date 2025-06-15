@@ -1,5 +1,4 @@
 mod callback;
-mod config;
 pub mod handle;
 pub mod node;
 pub mod operation;
