@@ -71,7 +71,7 @@ static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[tokio::test]
 async fn should_replicate_operation_successfully() {
-    let guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap();
 
     let handle_1 = start_raft_node(8080);
     let handle_2 = start_raft_node(8081);
@@ -103,7 +103,7 @@ async fn should_replicate_operation_successfully() {
 // Write Blocking event loop. Write / Commands asynchronous?
 #[tokio::test]
 async fn should_forward_write_to_leader_successfully() {
-    let guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock().unwrap();
 
     let handle_1 = start_raft_node(8080);
     let handle_2 = start_raft_node(8081);

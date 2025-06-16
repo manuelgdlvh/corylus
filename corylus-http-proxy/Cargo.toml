@@ -11,3 +11,4 @@ reqwest = { workspace = true }
 protobuf = { workspace = true }
 serde = { version = "1.0.219", features = ["derive"] }
 raft = { workspace = true }
+dashmap = "6.1.0"

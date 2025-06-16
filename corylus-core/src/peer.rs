@@ -40,7 +40,7 @@ where
     fn deserialize(&self, data: &[u8]) -> Box<dyn WriteOperation<SM>>;
 }
 
-pub trait RaftPeerClient<S>: Send + 'static
+pub trait RaftPeerClient<S>: Send + Sync + 'static
 where
     S: RaftStateMachine,
 {
@@ -52,16 +52,16 @@ where
         messages: Vec<Message>,
     ) -> impl Future<Output = Result<RaftCommandResult, GenericError>>;
     fn join(
-        &mut self,
+        &self,
         socket_addr: SocketAddr,
     ) -> impl Future<Output = Result<Option<RaftCommandResult>, GenericError>>;
 
     fn write(
-        &mut self,
+        &self,
         bucket: OperationBucket,
-    ) -> impl Future<Output = Result<Vec<MessageId>, GenericError>>;
+    ) -> impl Future<Output = Result<Vec<MessageId>, GenericError>> + Send;
 
-    fn upsert_peer(&mut self, node_id: PeerId, addr: SocketAddr, is_leader: bool);
+    fn upsert_peer(&self, node_id: PeerId, addr: SocketAddr, is_leader: bool);
 
     /*
     This clash with ReadOpFn. At the moment only eventual consistency.

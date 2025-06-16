@@ -1,5 +1,4 @@
 use crate::node::GenericError;
-use crate::peer::PeerId;
 use crate::state_machine::RaftStateMachine;
 use raft::prelude::Message;
 use std::net::SocketAddr;

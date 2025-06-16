@@ -4,16 +4,16 @@ use corylus_core::node::GenericError;
 use corylus_core::operation::RaftCommandResult;
 use corylus_core::peer::{MessageId, OperationBucket, PeerId, RaftPeerClient};
 use corylus_core::state_machine::RaftStateMachine;
+use dashmap::{DashMap, DashSet};
 use protobuf::Message as ProtobufMessage;
 use raft::eraftpb::Message;
 use reqwest::Client;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 #[derive(Default)]
 pub struct ReqwestHttpClient {
-    peers: HashMap<PeerId, SocketAddr>,
-    leader_id: PeerId,
+    peers: DashMap<PeerId, SocketAddr>,
+    leader_id: DashSet<PeerId>,
 }
 
 impl<SM> RaftPeerClient<SM> for ReqwestHttpClient
@@ -27,7 +27,7 @@ where
     ) -> Result<RaftCommandResult, GenericError> {
         let client = Client::new();
         if let Some(addr) = self.peers.get(&peer_id) {
-            let url = format!("http://{addr}/messages");
+            let url = format!("http://{}/messages", addr.value());
 
             let mut msgs_buffer = Vec::new();
             for msg in messages {
@@ -46,7 +46,7 @@ where
     // Split logic by move to inner implementation
     // Logic to find (Must be changed). Localhost
     async fn join(
-        &mut self,
+        &self,
         socket_addr: SocketAddr,
     ) -> Result<Option<RaftCommandResult>, GenericError> {
         let client = Client::new();
@@ -88,17 +88,20 @@ where
     }
 
     // Decouple this peer handling for client proxy implementation. Always must be the same. PeerHandler
-    fn upsert_peer(&mut self, node_id: u64, addr: SocketAddr, is_leader: bool) {
+    fn upsert_peer(&self, node_id: u64, addr: SocketAddr, is_leader: bool) {
         self.peers.insert(node_id, addr);
         if is_leader {
-            self.leader_id = node_id;
+            self.leader_id.clear();
+            self.leader_id.insert(node_id);
         }
     }
 
-    async fn write(&mut self, mut bucket: OperationBucket) -> Result<Vec<MessageId>, GenericError> {
-        if let Some(addr) = self.peers.get(&self.leader_id) {
+    async fn write(&self, mut bucket: OperationBucket) -> Result<Vec<MessageId>, GenericError> {
+        let leader_id_ref = &self.leader_id.iter().find(|_| true).unwrap();
+
+        if let Some(addr) = self.peers.get(&leader_id_ref) {
             let client = Client::new();
-            let url = format!("http://{addr}/write");
+            let url = format!("http://{}/write", addr.value());
 
             let request = WritesRequest {
                 data: bucket.take_messages(),

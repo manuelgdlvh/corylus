@@ -8,6 +8,7 @@ tokio = { workspace = true }
 raft = { workspace = true }
 futures = { workspace = true }
 protobuf = { workspace = true }
+async-trait = "0.1.88"
 
 
 [dev-dependencies]

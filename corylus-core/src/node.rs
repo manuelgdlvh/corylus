@@ -1,3 +1,4 @@
+use crate::async_task::{AsyncRaftRunnable, AsyncRunnableExecutor, ForwardWrites};
 use crate::callback::CallbackHolder;
 use crate::handle::{AwaitableWriteOp, RaftNodeHandle, ReadOpFn};
 use crate::operation::{AwaitableRaftCommand, RaftCommand, RaftCommandResult, WriteOperation};
@@ -14,8 +15,9 @@ use raft::prelude::{ConfChangeV2, Entry, EntryType, Message};
 use raft::{Config, RawNode, StateRole};
 use std::collections::HashMap;
 use std::error::Error;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Builder;
@@ -25,53 +27,53 @@ use tokio::time;
 
 pub type GenericError = Box<dyn Error + Send + Sync>;
 // As trait
-struct OperationHandler<S, D>
+struct OperationHandler<SM, D>
 where
-    S: RaftStateMachine,
-    D: OpDeserializer<S>,
+    SM: RaftStateMachine,
+    D: OpDeserializer<SM>,
 {
-    r_rx: mpsc::UnboundedReceiver<ReadOpFn<S>>,
-    w_rx: mpsc::UnboundedReceiver<AwaitableWriteOp<S>>,
+    read_rx: mpsc::UnboundedReceiver<ReadOpFn<SM>>,
+    write_rx: mpsc::UnboundedReceiver<AwaitableWriteOp<SM>>,
     raft_msg_rx: mpsc::UnboundedReceiver<AwaitableRaftCommand>,
     deserializer: D,
-    handle: Option<RaftNodeHandle<S>>,
+    handle: Option<RaftNodeHandle<SM>>,
 }
 
-impl<S, D> OperationHandler<S, D>
+impl<SM, D> OperationHandler<SM, D>
 where
-    S: RaftStateMachine,
-    D: OpDeserializer<S>,
+    SM: RaftStateMachine,
+    D: OpDeserializer<SM>,
 {
     fn new(deserializer: D) -> Self {
-        let (r_tx, r_rx) = mpsc::unbounded_channel();
-        let (w_tx, w_rx) = mpsc::unbounded_channel();
+        let (read_tx, read_rx) = mpsc::unbounded_channel();
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
         let (raft_msg_tx, raft_msg_rx) = mpsc::unbounded_channel();
 
         Self {
-            r_rx,
-            w_rx,
+            read_rx,
+            write_rx,
             raft_msg_rx,
             deserializer,
-            handle: Some(RaftNodeHandle::new(r_tx, w_tx, raft_msg_tx)),
+            handle: Some(RaftNodeHandle::new(read_tx, write_tx, raft_msg_tx)),
         }
     }
 
     fn as_mut(
         &mut self,
     ) -> (
-        &mut mpsc::UnboundedReceiver<ReadOpFn<S>>,
-        &mut mpsc::UnboundedReceiver<AwaitableWriteOp<S>>,
+        &mut mpsc::UnboundedReceiver<ReadOpFn<SM>>,
+        &mut mpsc::UnboundedReceiver<AwaitableWriteOp<SM>>,
         &mut mpsc::UnboundedReceiver<AwaitableRaftCommand>,
     ) {
-        (&mut self.r_rx, &mut self.w_rx, &mut self.raft_msg_rx)
+        (&mut self.read_rx, &mut self.write_rx, &mut self.raft_msg_rx)
     }
 
-    fn try_recv_write_op(&mut self) -> Result<AwaitableWriteOp<S>, TryRecvError> {
-        self.w_rx.try_recv()
+    fn try_recv_write_op(&mut self) -> Result<AwaitableWriteOp<SM>, TryRecvError> {
+        self.write_rx.try_recv()
     }
 
-    fn try_recv_read_op(&mut self) -> Result<ReadOpFn<S>, TryRecvError> {
-        self.r_rx.try_recv()
+    fn try_recv_read_op(&mut self) -> Result<ReadOpFn<SM>, TryRecvError> {
+        self.read_rx.try_recv()
     }
 
     fn try_recv_raft_msg(&mut self) -> Result<AwaitableRaftCommand, TryRecvError> {
@@ -79,12 +81,16 @@ where
     }
 
     fn stop(&mut self) {
-        self.r_rx.close();
-        self.w_rx.close();
+        self.read_rx.close();
+        self.write_rx.close();
+    }
+
+    fn deserialize(&self, data: &[u8]) -> Box<dyn WriteOperation<SM>> {
+        self.deserializer.deserialize(data)
     }
 
     fn is_stopped(&self) -> bool {
-        self.r_rx.is_closed() || self.w_rx.is_closed()
+        self.read_rx.is_closed() || self.write_rx.is_closed()
     }
 }
 
@@ -100,8 +106,8 @@ where
     group: RawNode<L>,
     op_handler: OperationHandler<SM, D>,
     state: SM,
-    client: C,
-    callbacks: CallbackHolder<SM>,
+    client: Arc<C>,
+    pub(crate) callbacks: CallbackHolder<SM>,
 }
 
 impl<SM, D, L, C> Drop for RaftNode<SM, D, L, C>
@@ -148,7 +154,7 @@ where
             group,
             op_handler: OperationHandler::new(deserializer),
             state,
-            client,
+            client: Arc::new(client),
             callbacks: CallbackHolder::new(),
         };
 
@@ -171,8 +177,7 @@ where
             .unwrap();
 
         let handle = Arc::new(self.op_handler.handle.take().unwrap());
-        let (started_signal_tx, started_signal_rx) =
-            std::sync::mpsc::sync_channel::<Result<(), GenericError>>(1);
+        let (started_signal_tx, started_signal_rx) = sync_channel::<Result<(), GenericError>>(1);
         {
             let handle = Arc::clone(&handle);
             thread::spawn(move || {
@@ -191,8 +196,10 @@ where
                         }
                     };
 
+                    let mut async_executor = AsyncRunnableExecutor::<SM, D, L, C>::new();
                     let tick_max_time = Duration::from_millis(100);
                     loop {
+                        async_executor.process(&mut self).await;
                         let (read_buffer, write_buffer, raft_msg_buffer) =
                             self.drain_ops(tick_max_time).await;
 
@@ -202,7 +209,9 @@ where
                         }
 
                         self.on_read(read_buffer).await;
-                        self.on_write(write_buffer).await;
+                        if let Some(fut) = self.on_write(write_buffer).await {
+                            async_executor.add(fut);
+                        }
 
                         self.tick().await;
                     }
@@ -286,10 +295,8 @@ where
                             let _ = callback.notifier.send(Ok(message_id)).await;
                         }
                     } else {
-                        let operation: Box<dyn WriteOperation<SM>> = self
-                            .op_handler
-                            .deserializer
-                            .deserialize(entry.data.as_ref());
+                        let operation: Box<dyn WriteOperation<SM>> =
+                            self.op_handler.deserialize(entry.data.as_ref());
                         operation.execute(&mut self.state);
                     }
                 }
@@ -321,6 +328,8 @@ where
         }
     }
 
+    // Cannot be delayed per iteration to avoid lost messages or network reording.
+    // Must be ack'ed ordered.
     async fn handle_messages(&mut self, messages: Vec<Message>) {
         if messages.is_empty() {
             return;
@@ -384,6 +393,7 @@ where
     }
 
     // Add if no Leader depends on configuration, read from master or not (Proxied)
+    // Could be polled per each iteration without blocking
     async fn on_read(&self, r_buffer: Vec<ReadOpFn<SM>>) {
         if !r_buffer.is_empty() {
             let futures = r_buffer.into_iter().map(|op| op(&self.state));
@@ -447,40 +457,27 @@ where
         }
     }
 
-    async fn on_write(&mut self, mut w_buffer: Vec<AwaitableWriteOp<SM>>) {
-        if w_buffer.is_empty() {
-            return;
+    // Could be polled per each iteration without blocking
+    async fn on_write(
+        &mut self,
+        mut write_buffer: Vec<AwaitableWriteOp<SM>>,
+    ) -> Option<ForwardWrites<SM>> {
+        if write_buffer.is_empty() {
+            return None;
         }
 
         if self.group.raft.state != StateRole::Leader {
             let mut operation_bucket = OperationBucket::default();
-            for awaitable_operation in w_buffer.iter() {
+            for awaitable_operation in write_buffer.iter() {
                 let op_buffer = awaitable_operation.op.serialize();
                 operation_bucket.add(op_buffer);
             }
 
-            match self.client.write(operation_bucket).await {
-                Ok(mut results) => {
-                    let mut updated = false;
-
-                    for (idx, w_op) in w_buffer.drain(..).enumerate().rev() {
-                        let message_id = results.swap_remove(idx);
-                        if !updated {
-                            self.callbacks.update_next(message_id);
-                            updated = true;
-                        }
-
-                        self.callbacks.add(message_id, w_op);
-                    }
-                }
-                Err(err) => {
-                    for w_op in w_buffer.drain(..) {
-                        let _ = w_op.notifier.send(Err(err.to_string().into())).await;
-                    }
-                }
-            };
+            let client = self.client.clone();
+            let fut = tokio::spawn(async move { client.write(operation_bucket).await });
+            return Some(ForwardWrites::<SM>::new(write_buffer, fut));
         } else {
-            for w_op in w_buffer.drain(..) {
+            for w_op in write_buffer.drain(..) {
                 let op_buffer = w_op.op.serialize();
                 let message_id = self.callbacks.next();
                 let context = message_id.to_be_bytes().to_vec();
@@ -498,6 +495,8 @@ where
                 }
             }
         }
+
+        None
     }
 
     // Limit batch size of op's
