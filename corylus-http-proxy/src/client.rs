@@ -59,7 +59,7 @@ where
             if socket_addr.port() == port {
                 continue;
             }
-
+            
             let url = format!("http://localhost:{port}/join");
 
             let response = match client.post(&url).json(&join_request).send().await {

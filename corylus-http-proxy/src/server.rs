@@ -50,7 +50,7 @@ where
     fn listen(
         self,
         handle: Arc<RaftNodeHandle<SM>>,
-        deserializer: Arc<D>,
+        deserializer: D,
     ) -> Result<ActixRaftPeerServerHandle, GenericError> {
         let runtime = Builder::new_multi_thread()
             .thread_name("actix-http-server")
@@ -85,11 +85,11 @@ where
                             socket_addr,
                         };
 
-                        started_signal_tx.send(Ok(handle)).unwrap();
+                        started_signal_tx.send(Ok(handle)).expect("");
                         let _ = server.await;
                     }
                     Err(err) => {
-                        started_signal_tx.send(Err(err.into())).unwrap();
+                        started_signal_tx.send(Err(err.into())).expect("");
                     }
                 }
             })
@@ -103,7 +103,7 @@ where
 
 async fn join<SM, D>(
     request: Json<ClusterJoinRequest>,
-    state: Data<(Arc<D>, Arc<RaftNodeHandle<SM>>)>,
+    state: Data<(D, Arc<RaftNodeHandle<SM>>)>,
 ) -> impl Responder
 where
     SM: RaftStateMachine,
@@ -139,7 +139,7 @@ where
 
 async fn messages<SM, D>(
     request: Json<MessagesRequest>,
-    state: Data<(Arc<D>, Arc<RaftNodeHandle<SM>>)>,
+    state: Data<(D, Arc<RaftNodeHandle<SM>>)>,
 ) -> impl Responder
 where
     SM: RaftStateMachine,
@@ -156,7 +156,7 @@ where
 
 async fn write<SM, D>(
     request: Json<WritesRequest>,
-    state: Data<(Arc<D>, Arc<RaftNodeHandle<SM>>)>,
+    state: Data<(D, Arc<RaftNodeHandle<SM>>)>,
 ) -> impl Responder
 where
     SM: RaftStateMachine,

@@ -73,9 +73,9 @@ static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 async fn should_replicate_operation_successfully() {
     let _guard = TEST_LOCK.lock().unwrap();
 
-    let handle_1 = start_raft_node(8080);
-    let handle_2 = start_raft_node(8081);
-    let handle_3 = start_raft_node(8082);
+    let handle_1 = start_raft_node(8080).await;
+    let handle_2 = start_raft_node(8081).await;
+    let handle_3 = start_raft_node(8082).await;
 
     let num_of_messages = 10000;
 
@@ -105,9 +105,9 @@ async fn should_replicate_operation_successfully() {
 async fn should_forward_write_to_leader_successfully() {
     let _guard = TEST_LOCK.lock().unwrap();
 
-    let handle_1 = start_raft_node(8080);
-    let handle_2 = start_raft_node(8081);
-    let handle_3 = start_raft_node(8082);
+    let handle_1 = start_raft_node(8080).await;
+    let handle_2 = start_raft_node(8081).await;
+    let handle_3 = start_raft_node(8082).await;
 
     // To avoid deadlock in write. Peer not found
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -155,20 +155,15 @@ async fn should_forward_write_to_leader_successfully() {
 async fn should_follower_apply_snapshot_successfully() {
     let _guard = TEST_LOCK.lock().unwrap();
 
-    let handle_1 = start_raft_node(8080);
+    let handle_1 = start_raft_node(8080).await;
 
     let num_of_messages = 10000;
-    send_write_op(
-        handle_1.clone(),
-        num_of_messages,
-        IncrementOp::default(),
-    )
-    .await;
+    send_write_op(handle_1.clone(), num_of_messages, IncrementOp::default()).await;
 
     await_until_full_replicated(handle_1.clone(), ReadOp::default(), num_of_messages).await;
 
-    let handle_2 = start_raft_node(8081);
-    let handle_3 = start_raft_node(8082);
+    let handle_2 = start_raft_node(8081).await;
+    let handle_3 = start_raft_node(8082).await;
 
     await_until_full_replicated(handle_2.clone(), ReadOp::default(), num_of_messages).await;
     await_until_full_replicated(handle_3.clone(), ReadOp::default(), num_of_messages).await;
@@ -218,13 +213,14 @@ async fn await_until_full_replicated(
     assert_eq!(Some(target), handle.read(read_op).recv().await.unwrap());
 }
 
-fn start_raft_node(port: u16) -> Arc<RaftNodeHandle<InMemoryRaftStateMachine>> {
+async fn start_raft_node(port: u16) -> Arc<RaftNodeHandle<InMemoryRaftStateMachine>> {
     let sm = InMemoryRaftStateMachine::default();
     let rl = InMemoryRaftLog::new();
     let client_proxy = ReqwestHttpClient::default();
     let server_proxy = ActixHttpServer::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
     let deserializer = CustomDeserializer::default();
 
-    let node = RaftNode::new(sm, deserializer, rl, client_proxy).unwrap();
-    node.start(server_proxy, deserializer).unwrap()
+    let node = RaftNode::new(sm, deserializer, rl, client_proxy).expect("");
+
+    node.start(server_proxy, deserializer).await.expect("")
 }

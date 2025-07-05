@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Builder;
@@ -161,7 +160,7 @@ where
         Ok(self_)
     }
 
-    pub fn start<S, H>(
+    pub async fn start<S, H>(
         mut self,
         server_proxy: S,
         deserializer: D,
@@ -170,59 +169,40 @@ where
         H: RaftPeerServerHandle,
         S: RaftPeerServer<SM, D, H>,
     {
+        let r_handle = Arc::new(self.op_handler.handle.take().expect(""));
+        let s_handle = self
+            .on_init(r_handle.clone(), deserializer, server_proxy)
+            .await?;
+        
         let runtime = Builder::new_current_thread()
             .thread_name("raft-worker")
             .enable_all()
-            .build()
-            .unwrap();
+            .build()?;
+        thread::spawn(move || {
+            runtime.block_on(async move {
+                let mut async_executor = AsyncRunnableExecutor::<SM, D, L, C>::new();
+                let tick_max_time = Duration::from_millis(100);
+                loop {
+                    async_executor.process(&mut self).await;
+                    let (read_buffer, write_buffer, raft_msg_buffer) =
+                        self.drain_ops(tick_max_time).await;
 
-        let handle = Arc::new(self.op_handler.handle.take().unwrap());
-        let (started_signal_tx, started_signal_rx) = sync_channel::<Result<(), GenericError>>(1);
-        {
-            
-            let handle = Arc::clone(&handle);
-            thread::spawn(move || {
-                runtime.block_on(async move {
-                    let deserializer = Arc::new(deserializer);
-                    let server_handle = match self.on_init(handle, deserializer, server_proxy).await
-                    {
-                        Ok(server_handle) => {
-                            started_signal_tx.send(Ok(())).unwrap();
-                            server_handle
-                        }
-                        Err(err) => {
-                            started_signal_tx.send(Err(err)).unwrap();
-                            return;
-                        }
-                    };
-
-                    let mut async_executor = AsyncRunnableExecutor::<SM, D, L, C>::new();
-                    let tick_max_time = Duration::from_millis(100);
-                    loop {
-                        async_executor.process(&mut self).await;
-                        let (read_buffer, write_buffer, raft_msg_buffer) =
-                            self.drain_ops(tick_max_time).await;
-
-                        self.on_raft_command(&server_handle, raft_msg_buffer).await;
-                        if self.op_handler.is_stopped() {
-                            break;
-                        }
-
-                        self.on_read(read_buffer).await;
-                        if let Some(fut) = self.on_write(write_buffer).await {
-                            async_executor.add(fut);
-                        }
-
-                        self.tick().await;
+                    self.on_raft_command(&s_handle, raft_msg_buffer).await;
+                    if self.op_handler.is_stopped() {
+                        break;
                     }
-                });
-            });
-        }
 
-        match started_signal_rx.recv().unwrap() {
-            Ok(_) => Ok(handle),
-            Err(err) => Err(err),
-        }
+                    self.on_read(read_buffer).await;
+                    if let Some(fut) = self.on_write(write_buffer).await {
+                        async_executor.add(fut);
+                    }
+
+                    self.tick().await;
+                }
+            });
+        });
+
+        Ok(r_handle)
     }
 
     // API must be well defined for Remote Server messages
@@ -365,7 +345,7 @@ where
     async fn on_init<S, H>(
         &mut self,
         handle: Arc<RaftNodeHandle<SM>>,
-        deserializer: Arc<D>,
+        deserializer: D,
         server_proxy: S,
     ) -> Result<H, GenericError>
     where

@@ -33,7 +33,7 @@ impl OperationBucket {
     }
 }
 
-pub trait OpDeserializer<SM>: Send + Sync + 'static
+pub trait OpDeserializer<SM>: Clone + Send + Sync + 'static
 where
     SM: RaftStateMachine,
 {
@@ -69,7 +69,7 @@ where
     */
 }
 
-pub trait RaftPeerServerHandle {
+pub trait RaftPeerServerHandle: Send + 'static {
     fn socket_addr(&self) -> SocketAddr;
     async fn stop(&self);
 }
@@ -80,9 +80,5 @@ where
     D: OpDeserializer<SM>,
     H: RaftPeerServerHandle,
 {
-    fn listen(
-        self,
-        handle: Arc<RaftNodeHandle<SM>>,
-        deserializer: Arc<D>,
-    ) -> Result<H, GenericError>;
+    fn listen(self, handle: Arc<RaftNodeHandle<SM>>, deserializer: D) -> Result<H, GenericError>;
 }
