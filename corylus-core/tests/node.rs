@@ -151,6 +151,33 @@ async fn should_forward_write_to_leader_successfully() {
     let _ = handle_3.raft_command(RaftCommand::Stop).recv().unwrap();
 }
 
+#[tokio::test]
+async fn should_follower_apply_snapshot_successfully() {
+    let _guard = TEST_LOCK.lock().unwrap();
+
+    let handle_1 = start_raft_node(8080);
+
+    let num_of_messages = 10000;
+    send_write_op(
+        handle_1.clone(),
+        num_of_messages,
+        IncrementOp::default(),
+    )
+    .await;
+
+    await_until_full_replicated(handle_1.clone(), ReadOp::default(), num_of_messages).await;
+
+    let handle_2 = start_raft_node(8081);
+    let handle_3 = start_raft_node(8082);
+
+    await_until_full_replicated(handle_2.clone(), ReadOp::default(), num_of_messages).await;
+    await_until_full_replicated(handle_3.clone(), ReadOp::default(), num_of_messages).await;
+
+    let _ = handle_1.raft_command(RaftCommand::Stop).recv().unwrap();
+    let _ = handle_2.raft_command(RaftCommand::Stop).recv().unwrap();
+    let _ = handle_3.raft_command(RaftCommand::Stop).recv().unwrap();
+}
+
 async fn send_write_op(
     handle: Arc<RaftNodeHandle<InMemoryRaftStateMachine>>,
     num_of_messages: u64,

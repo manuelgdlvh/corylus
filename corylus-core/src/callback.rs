@@ -1,7 +1,7 @@
 use crate::handle::AwaitableWriteOp;
+use crate::peer::MessageId;
 use crate::state_machine::RaftStateMachine;
 use std::collections::HashMap;
-use crate::peer::MessageId;
 
 pub struct CallbackHolder<S>
 where
@@ -31,7 +31,9 @@ where
     }
 
     pub fn update_next(&mut self, message_id: MessageId) {
-        self.next = message_id;
+        if message_id > self.next {
+            self.next = message_id;
+        }
     }
 
     // Last applied to remove dirty callbacks

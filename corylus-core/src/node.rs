@@ -179,9 +179,9 @@ where
         let handle = Arc::new(self.op_handler.handle.take().unwrap());
         let (started_signal_tx, started_signal_rx) = sync_channel::<Result<(), GenericError>>(1);
         {
+            
             let handle = Arc::clone(&handle);
             thread::spawn(move || {
-                let handle = Arc::clone(&handle);
                 runtime.block_on(async move {
                     let deserializer = Arc::new(deserializer);
                     let server_handle = match self.on_init(handle, deserializer, server_proxy).await
