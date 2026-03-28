@@ -1,0 +1,12 @@
+[package]
+name = "corylus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+uuid = "1.22.0"
+twox-hash = "2.1.2"
+
+[lib]
+name = "corylus"
+path = "src/lib.rs"
