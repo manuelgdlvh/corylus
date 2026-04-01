@@ -2,8 +2,8 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     io,
-    net::{ TcpListener},
-    sync::{ atomic::Ordering},
+    net::TcpListener,
+    sync::atomic::Ordering,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -12,11 +12,10 @@ use rand::RngExt;
 use tracing::{error, info};
 
 use crate::network::{
-    self,
+    self, Discovery,
     packet::Packet,
-    registry::{PeerRead, PeerWrite, Registry}, Discovery,
+    registry::{PeerRead, PeerWrite, Registry},
 };
-
 
 pub(crate) fn hb(
     config: network::Config,
@@ -109,10 +108,7 @@ pub(crate) fn hb(
         })
 }
 
-pub(crate) fn listener(
-    config: network::Config,
-    registry: Registry,
-) -> io::Result<JoinHandle<()>> {
+pub(crate) fn listener(config: network::Config, registry: Registry) -> io::Result<JoinHandle<()>> {
     let listener = TcpListener::bind(registry.as_ref().config.addr)?;
     listener.set_nonblocking(true)?;
 
@@ -158,7 +154,7 @@ pub(crate) fn listener(
                             &Packet::WhoIsReply {
                                 id: registry.as_ref().id,
                             },
-                            Some(config.timeout.write)) {                           
+                            Some(config.timeout.write)) {
                             error!(id = %registry.as_ref().id, peer_id = %peer_id, err = %err ,"Peer connection accept failed sending own identity");
                             continue;
                         }

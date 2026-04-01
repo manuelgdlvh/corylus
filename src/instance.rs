@@ -57,7 +57,8 @@ impl Instance {
             .members
             .lock()
             .expect("Cannot be poisoned")
-            .iter().copied()
+            .iter()
+            .copied()
             .collect()
     }
 }
