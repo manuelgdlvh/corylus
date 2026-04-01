@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, u64};
 
 use uuid::Uuid;
 
@@ -10,8 +10,8 @@ pub enum Event {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct InboundPacket {
-    from: Uuid,
-    p: Packet,
+    pub(crate) from: Uuid,
+    pub(crate) p: Packet,
 }
 
 impl InboundPacket {
@@ -26,6 +26,8 @@ pub enum Packet {
     WhoIs { id: Uuid, addr: SocketAddr },
     WhoIsReply { id: Uuid },
     HeartBeat,
+    NoOp { corr_id: u64 },
+    NoOpReply { corr_id: u64 },
 }
 
 pub(crate) const DISCRIMINANT: usize = 1;
@@ -37,6 +39,25 @@ impl Packet {
             Self::WhoIs { .. } => 1,
             Self::WhoIsReply { .. } => 2,
             Self::HeartBeat => 3,
+            Self::NoOp { .. } => 4,
+            Self::NoOpReply { .. } => 5,
+        }
+    }
+
+    pub fn is_request(&self) -> bool {
+        match self {
+            Self::WhoIs { .. }
+            | Self::WhoIsReply { .. }
+            | Self::HeartBeat
+            | Self::NoOpReply { .. } => false,
+            Self::NoOp { .. } => true,
+        }
+    }
+
+    pub fn correlation_id(&self) -> Option<u64> {
+        match self {
+            Self::WhoIs { .. } | Self::WhoIsReply { .. } | Self::HeartBeat => None,
+            Self::NoOp { corr_id } | Self::NoOpReply { corr_id } => Some(*corr_id),
         }
     }
 
@@ -45,6 +66,8 @@ impl Packet {
             1 => None,
             2 => Some(16),
             3 => Some(0),
+            4 => Some(8),
+            5 => Some(8),
             _ => None,
         }
     }
@@ -79,6 +102,12 @@ impl From<&Packet> for Vec<u8> {
                 buffer.extend_from_slice(id.as_bytes());
             }
             Packet::HeartBeat => {}
+            Packet::NoOp { corr_id } => {
+                buffer.extend_from_slice(corr_id.to_le_bytes().as_slice());
+            }
+            Packet::NoOpReply { corr_id } => {
+                buffer.extend_from_slice(corr_id.to_le_bytes().as_slice());
+            }
         }
 
         if filled {
@@ -94,7 +123,9 @@ impl From<&Packet> for Vec<u8> {
 
 impl From<&[u8]> for Packet {
     fn from(value: &[u8]) -> Self {
-        let discriminant = value.first().unwrap();
+        let discriminant = value
+            .first()
+            .expect("First byte must contains discriminant");
         match *discriminant {
             1 => {
                 let id = Uuid::from_slice(&value[1..=16]).unwrap();
@@ -105,6 +136,18 @@ impl From<&[u8]> for Packet {
                 id: Uuid::from_slice(&value[1..]).unwrap(),
             },
             3 => Packet::HeartBeat,
+            4 => {
+                let buff: [u8; 8] = value[1..].try_into().unwrap();
+                Packet::NoOp {
+                    corr_id: u64::from_le_bytes(buff),
+                }
+            }
+            5 => {
+                let buff: [u8; 8] = value[1..].try_into().unwrap();
+                Packet::NoOpReply {
+                    corr_id: u64::from_le_bytes(buff),
+                }
+            }
             _ => {
                 panic!("Unknown packet");
             }

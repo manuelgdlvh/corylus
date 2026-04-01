@@ -1,6 +1,7 @@
 use std::{
     array,
     collections::{BinaryHeap, HashMap, HashSet},
+    io,
     sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
@@ -10,7 +11,7 @@ use uuid::Uuid;
 const RING_CAPACITY: usize = 1024;
 const PARTITION_HASH_SEED: u64 = 1234;
 
-pub trait RawSegment {
+pub trait RawSegment: Send + Sync {
     fn rebuild(&mut self, raw: Vec<u8>);
     fn as_raw(&self) -> &[u8];
 }
@@ -18,6 +19,7 @@ pub trait RawSegment {
 pub struct Segment {
     id: &'static str,
     data: Box<dyn RawSegment>,
+    // Useful for entropy process of partitions after membership changes or corruption detection
     seq: u64,
     checksum: u64,
 }
@@ -34,19 +36,15 @@ impl Segment {
 }
 
 pub struct Group {
-    replica_factor: usize,
     partitions: [Partition; RING_CAPACITY],
 }
 
 impl Group {
-    pub fn new(member_ids: &[Uuid], replica_factor: usize) -> Self {
+    pub fn new(member_id: Uuid) -> Self {
         let partitions: [Partition; RING_CAPACITY] =
-            array::from_fn(|id| Partition::new(id, replica_factor, member_ids));
+            array::from_fn(|id| Partition::new(id, member_id));
 
-        Self {
-            partitions,
-            replica_factor,
-        }
+        Self { partitions }
     }
 
     pub fn with_segment<F>(mut self, f: F) -> Self
@@ -103,44 +101,12 @@ impl Group {
         metadata.replica_ids.contains(&member_id)
     }
 
-    pub fn segment_read(
-        &self,
-        segment_id: &'static str,
-        partition_id: u64,
-    ) -> Option<SegmentReadGuard<'_>> {
-        if partition_id >= RING_CAPACITY as u64 {
-            panic!("Partition id out of range");
-        }
-        let partition = &self.partitions[partition_id as usize];
-        partition
-            .segments
-            .get(segment_id)
-            .map(|s| s.read().expect("No poisoned"))
-            .map(|g| SegmentReadGuard { g })
-    }
-
-    pub fn segment_write(
-        &self,
-        segment_id: &'static str,
-        partition_id: u64,
-    ) -> Option<SegmentWriteGuard<'_>> {
-        if partition_id >= RING_CAPACITY as u64 {
-            panic!("Partition id out of range");
-        }
-        let partition = &self.partitions[partition_id as usize];
-        partition
-            .segments
-            .get(segment_id)
-            .map(|s| s.write().expect("No poisoned"))
-            .map(|g| SegmentWriteGuard { g })
-    }
-
     // The algorithm should be after updated, i get as read lock all the states that i should migrate. Then i send to assigned peer the snapshot. When OK i clear and unlock.
     pub fn update(&self, member_ids: &[Uuid]) -> HashMap<usize, Vec<MembershipChange>> {
         let mut result = HashMap::with_capacity(RING_CAPACITY);
         for p_id in 0..RING_CAPACITY {
             let partition = &self.partitions[p_id];
-            let changes = partition.update(self.replica_factor, member_ids);
+            let changes = partition.update(member_ids);
             if !changes.is_empty() {
                 result.insert(p_id, changes);
             }
@@ -148,18 +114,63 @@ impl Group {
 
         result
     }
+
+    pub fn with_segment_read<F, O>(
+        &self,
+        p_id: usize,
+        s_id: &'static str,
+        f: F,
+    ) -> Result<O, io::Error>
+    where
+        F: Fn(RwLockReadGuard<'_, Segment>) -> O,
+    {
+        if p_id >= RING_CAPACITY {
+            panic!("Partition id out of range");
+        }
+
+        let partition = &self.partitions[p_id];
+
+        if let Some(segment) = partition.segments.get(s_id) {
+            let guard = segment.read().expect("Cannot be poisoned");
+            Ok(f(guard))
+        } else {
+            todo!("Should return error")
+        }
+    }
+
+    pub fn with_segment_write<F>(
+        &self,
+        p_id: usize,
+        s_id: &'static str,
+        f: F,
+    ) -> Result<(), io::Error>
+    where
+        F: Fn(RwLockWriteGuard<'_, Segment>),
+    {
+        if p_id >= RING_CAPACITY {
+            panic!("Partition id out of range");
+        }
+
+        let partition = &self.partitions[p_id];
+        if let Some(segment) = partition.segments.get(s_id) {
+            let guard = segment.write().expect("Cannot be poisoned");
+            f(guard);
+            Ok(())
+        } else {
+            todo!("Should return error")
+        }
+    }
 }
 
 pub struct Partition {
     metadata: RwLock<Metadata>,
-    // TODO: Think about it. Checksum and seq to track inconsistencies
     segments: HashMap<&'static str, RwLock<Segment>>,
 }
 
 impl Partition {
-    pub fn new(id: usize, replica_factor: usize, member_ids: &[Uuid]) -> Self {
+    pub fn new(id: usize, member_id: Uuid) -> Self {
         let (master_id, replica_ids) =
-            Partition::compute_membership(id, replica_factor, member_ids);
+            Partition::compute_membership(id, vec![member_id].as_slice());
 
         Self {
             metadata: RwLock::new(Metadata::new(id, master_id, replica_ids)),
@@ -172,11 +183,7 @@ impl Partition {
         self
     }
 
-    fn compute_membership(
-        partiton_id: usize,
-        replica_factor: usize,
-        member_ids: &[Uuid],
-    ) -> (Uuid, Vec<Uuid>) {
+    fn compute_membership(partiton_id: usize, member_ids: &[Uuid]) -> (Uuid, Vec<Uuid>) {
         if 0.eq(&member_ids.len()) {
             panic!("Members cannot be empty");
         }
@@ -196,7 +203,7 @@ impl Partition {
             .expect("No zero member list previously checked")
             .1;
 
-        let replicas_len = top_k.len().min(replica_factor);
+        let replicas_len = top_k.len();
         let mut replica_ids = Vec::with_capacity(replicas_len);
         for _ in 0..replicas_len {
             let replica_id = top_k
@@ -210,13 +217,12 @@ impl Partition {
         (master_id, replica_ids)
     }
 
-    fn update(&self, replica_factor: usize, member_ids: &[Uuid]) -> Vec<MembershipChange> {
+    fn update(&self, member_ids: &[Uuid]) -> Vec<MembershipChange> {
         let mut metadata = self
             .metadata
             .write()
             .expect("Critical section cannot be poisoned");
-        let (master_id, replica_ids) =
-            Partition::compute_membership(metadata.id, replica_factor, member_ids);
+        let (master_id, replica_ids) = Partition::compute_membership(metadata.id, member_ids);
         metadata.update(master_id, replica_ids)
     }
 }
@@ -278,12 +284,4 @@ pub enum MembershipChange {
         added: Vec<Uuid>,
         removed: Vec<Uuid>,
     },
-}
-
-pub struct SegmentReadGuard<'a> {
-    g: RwLockReadGuard<'a, Segment>,
-}
-
-pub struct SegmentWriteGuard<'a> {
-    g: RwLockWriteGuard<'a, Segment>,
 }

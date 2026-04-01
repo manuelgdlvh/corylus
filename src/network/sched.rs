@@ -2,8 +2,8 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     io,
-    net::{SocketAddr, TcpListener},
-    sync::{Arc, atomic::Ordering},
+    net::{ TcpListener},
+    sync::{ atomic::Ordering},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -14,18 +14,14 @@ use tracing::{error, info};
 use crate::network::{
     self,
     packet::Packet,
-    registry::{PeerRead, PeerWrite, Registry},
+    registry::{PeerRead, PeerWrite, Registry}, Discovery,
 };
 
-pub enum Discovery {
-    Dns { host: String },
-    List { addresses: Vec<SocketAddr> },
-}
 
 pub(crate) fn hb(
     config: network::Config,
     d: Discovery,
-    registry: Arc<Registry>,
+    registry: Registry,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("heartbeat".to_string())
@@ -33,9 +29,9 @@ pub(crate) fn hb(
             let poll_interval = config.hb.poll_interval;
             let hb_tolerance = config.hb.tolerance;
 
-            info!(id = %config.id, "Heartbeat scheduler initialized");
+            info!(id = %registry.as_ref().id, "Heartbeat scheduler initialized");
             loop {
-                if registry.sigterm.load(Ordering::Acquire) {
+                if registry.as_ref().sigterm.load(Ordering::Acquire) {
                     break;
                 }
 
@@ -51,11 +47,11 @@ pub(crate) fn hb(
                     Discovery::List { addresses } => Cow::Borrowed(addresses.as_slice()),
                 }
                 .iter()
-                .filter(|addr| !registry.config.addr.eq(addr))
+                .filter(|addr| !registry.as_ref().config.addr.eq(addr))
                 .filter(|addr| !registry.is_connected(addr))
                 .for_each(|addr| {
                     if let Err(err) = registry.connect(addr, None) {
-                        error!(id = %registry.config.id, addr = %addr, err = %err, "Connection to peer failed");
+                        error!(id = %registry.as_ref().id, addr = %addr, err = %err, "Connection to peer failed");
                     }
                 });
 
@@ -79,7 +75,7 @@ pub(crate) fn hb(
                                     true
                                 }
                                 Err(err) => {
-                                    error!(id = %registry.config.id, peer_id = %id, err = %err, "Packet send failed");
+                                    error!(id = %registry.as_ref().id, peer_id = %id, err = %err, "Packet send failed");
                                     false
                                 }
                                 Ok(_) => false,
@@ -90,7 +86,7 @@ pub(crate) fn hb(
 
                     peer_v.insert(id, v);
                     if reconnect {
-                        let _ = registry.connect_from_id(*id, Some(v));
+                        let _ = registry.connect_with_id(*id, Some(v));
                     }
                 });
 
@@ -106,27 +102,27 @@ pub(crate) fn hb(
                     }
                 });
 
-                info!(id = %config.id, "Heartbeat tick finished");
+                info!(id = %registry.as_ref().id, "Heartbeat tick finished");
             }
 
-            info!(id = %config.id, "Heartbeat scheduler destroyed");
+            info!(id = %registry.as_ref().id, "Heartbeat scheduler destroyed");
         })
 }
 
 pub(crate) fn listener(
     config: network::Config,
-    registry: Arc<Registry>,
+    registry: Registry,
 ) -> io::Result<JoinHandle<()>> {
-    let listener = TcpListener::bind(registry.config.addr)?;
+    let listener = TcpListener::bind(registry.as_ref().config.addr)?;
     listener.set_nonblocking(true)?;
 
     thread::Builder::new()
         .name("listener".to_string())
         .spawn(move || {
 
-            info!(id = %config.id, "Listener scheduler initialized");
+            info!(id = %registry.as_ref().id, "Listener scheduler initialized");
             loop {
-                if registry.sigterm.load(Ordering::Acquire) {
+                if registry.as_ref().sigterm.load(Ordering::Acquire) {
                     break;
                 }
 
@@ -135,7 +131,7 @@ pub(crate) fn listener(
                         let read_stream = match stream.try_clone() {
                             Ok(v) => v,
                             Err(err) => {
-                                error!(id = %registry.config.id, err = %err ,"Peer connection accept failed");
+                                error!(id = %registry.as_ref().id, err = %err ,"Peer connection accept failed");
                                 continue;
                             }
                         };
@@ -146,7 +142,7 @@ pub(crate) fn listener(
                         let who_is_req = match r.read(Some(config.timeout.read)) {
                             Ok(packet) => packet,
                             Err(err) => {
-                                error!(id = %registry.config.id, err = %err ,"Peer connection accept failed waiting identity discovery");
+                                error!(id = %registry.as_ref().id, err = %err ,"Peer connection accept failed waiting identity discovery");
                                 continue;
                             }
                         };
@@ -160,29 +156,29 @@ pub(crate) fn listener(
 
                         if let Err(err) = w.write(
                             &Packet::WhoIsReply {
-                                id: registry.config.id,
+                                id: registry.as_ref().id,
                             },
                             Some(config.timeout.write)) {                           
-                            error!(id = %registry.config.id, peer_id = %peer_id, err = %err ,"Peer connection accept failed sending own identity");
+                            error!(id = %registry.as_ref().id, peer_id = %peer_id, err = %err ,"Peer connection accept failed sending own identity");
                             continue;
                         }
 
 
                         let v = w.v;
                         registry.register(peer_id, &peer_addr, w);
-                        let _ = r.start(Arc::clone(&registry), peer_id, v);
+                        let _ = r.start(registry.clone(), peer_id, v);
 
-                        info!(id = %registry.config.id, peer_id = %peer_id, v = %v, "Peer connection accept successfully");
+                        info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %v, "Peer connection accept successfully");
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
                     }
                     Err(err) => {
-                        error!(id = %registry.config.id, err = %err, "Listener threw an error");
+                        error!(id = %registry.as_ref().id, err = %err, "Listener threw an error");
                     }
                 }
             }
 
-            info!(id = %config.id, "Listener scheduler destroyed");
+            info!(id = %registry.as_ref().id, "Listener scheduler destroyed");
         })
 }
