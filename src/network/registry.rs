@@ -7,7 +7,7 @@ use std::{
     sync::{
         Arc, Mutex, RwLock, RwLockReadGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::SyncSender,
+        mpsc::{self, RecvTimeoutError, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -18,59 +18,125 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::network::{
-    self,
+    self, Message,
     packet::{Event, InboundPacket, PACKET_LENGTH, Packet},
 };
 
 const CONN_STRIPES_LEN: usize = 8;
+struct Limiter {
+    stripes: [Mutex<()>; CONN_STRIPES_LEN],
+}
 
+impl Limiter {
+    pub fn new() -> Self {
+        Self {
+            stripes: array::from_fn(|_| Mutex::new(())),
+        }
+    }
+
+    pub fn execute<F: Fn() -> io::Result<()>>(&self, addr: &SocketAddr, f: F) -> io::Result<()> {
+        let mut hasher = DefaultHasher::new();
+        addr.hash(&mut hasher);
+        let id = (hasher.finish() as usize) & (CONN_STRIPES_LEN - 1);
+
+        let _guard = &self.stripes[id].lock().expect("Cannot be poisoned");
+        f()
+    }
+}
+
+pub struct Response<'a> {
+    corr_id: u64,
+    reg: &'a Registry,
+    receiver: mpsc::Receiver<Packet>,
+}
+
+impl<'a> Response<'a> {
+    fn new(corr_id: u64, reg: &'a Registry, receiver: mpsc::Receiver<Packet>) -> Self {
+        Self {
+            corr_id,
+            reg,
+            receiver,
+        }
+    }
+
+    pub fn get(&self, timeout: Duration) -> Result<Packet, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+}
+
+impl Drop for Response<'_> {
+    fn drop(&mut self) {
+        self.reg.remove_ack(self.corr_id);
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct Registry {
+    inner: Arc<Inner>,
+}
+
+pub(crate) struct Inner {
+    pub(crate) id: Uuid,
     pub(crate) config: network::Config,
-    tx_pckt: SyncSender<InboundPacket>,
-    tx_event: SyncSender<Event>,
+    tx_msg: SyncSender<Message>,
     pub(crate) sigterm: Arc<AtomicBool>,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
     writers: RwLock<HashMap<Uuid, PeerWrite>>,
-    conn_stripes: [Mutex<()>; CONN_STRIPES_LEN],
+    acks: Mutex<HashMap<u64, SyncSender<Packet>>>,
+    limiter: Limiter,
+}
+
+impl AsRef<Inner> for Registry {
+    fn as_ref(&self) -> &Inner {
+        &self.inner
+    }
 }
 
 impl Registry {
     pub fn new(
+        id: Uuid,
         config: network::Config,
-        tx_pckt: SyncSender<InboundPacket>,
-        tx_event: SyncSender<Event>,
+        tx_msg: SyncSender<Message>,
         sigterm: Arc<AtomicBool>,
     ) -> Self {
-        Self {
+        let inner = Arc::new(Inner {
+            id,
             config,
-            tx_pckt,
-            tx_event,
+            tx_msg,
             sigterm,
             addrs: Mutex::new(HashMap::new()),
             writers: RwLock::new(HashMap::new()),
-            conn_stripes: array::from_fn(|_| Mutex::new(())),
-        }
+            acks: Mutex::new(HashMap::new()),
+            limiter: Limiter::new(),
+        });
+        Self { inner }
     }
 
     // Listener accepts connection single threaded, so we always have linearizability here.
     pub fn register(&self, peer_id: Uuid, peer_addr: &SocketAddr, writer: PeerWrite) {
         let old_addr = self
+            .as_ref()
             .addrs
             .lock()
             .expect("Cannot be poisoned")
             .insert(peer_id, *peer_addr);
-        self.writers
+        self.as_ref()
+            .writers
             .write()
             .expect("Cannot be poisoned")
             .insert(peer_id, writer);
         if old_addr.is_none()
-            && let Err(err) = self.tx_event.send(Event::PeerAdded { id: peer_id }) {
-                error!(err = %err, "Peer added event enqueue failed");
-            }
+            && let Err(err) = self.as_ref().tx_msg.send(Message::Event {
+                val: Event::PeerAdded { id: peer_id },
+            })
+        {
+            error!(err = %err, "Peer added event enqueue failed");
+        }
     }
 
     pub fn unregister(&self, peer_id: Uuid, v: u64) {
         match self
+            .as_ref()
             .writers
             .write()
             .expect("Cannot be poisoned")
@@ -86,24 +152,28 @@ impl Registry {
             std::collections::hash_map::Entry::Vacant(_) => {}
         }
 
-        self.addrs
+        self.as_ref()
+            .addrs
             .lock()
             .expect("Cannot be poisoned")
             .remove_entry(&peer_id);
-        let _ = self.tx_event.send(Event::PeerRemoved { id: peer_id });
+        let _ = self.as_ref().tx_msg.send(Message::Event {
+            val: Event::PeerRemoved { id: peer_id },
+        });
 
-        info!(id = %self.config.id, peer_id = %peer_id, "Peer disconnected successfully");
+        info!(id = %self.as_ref().id, peer_id = %peer_id, "Peer disconnected successfully");
     }
 
     pub fn version(&self, id: Uuid) -> Option<u64> {
-        self.writers
+        self.as_ref()
+            .writers
             .read()
             .expect("Cannot be poisoned")
             .get(&id)
             .map(|w| w.v)
     }
 
-    pub fn connect_from_id(self: &Arc<Self>, id: Uuid, v: Option<u64>) -> io::Result<()> {
+    pub fn connect_with_id(&self, id: Uuid, v: Option<u64>) -> io::Result<()> {
         if let Some(addr) = self.addr(id) {
             self.connect(&addr, v)
         } else {
@@ -114,55 +184,52 @@ impl Registry {
         }
     }
 
-    pub fn connect(self: &Arc<Self>, peer_addr: &SocketAddr, v: Option<u64>) -> io::Result<()> {
-        let mut hasher = DefaultHasher::new();
-        peer_addr.hash(&mut hasher);
-        let id = (hasher.finish() as usize) & (CONN_STRIPES_LEN - 1);
+    pub fn connect(&self, peer_addr: &SocketAddr, v: Option<u64>) -> io::Result<()> {
+        self.as_ref().limiter.execute(peer_addr, || {
+            if let Some(peer_id) = self.peer_id_from_addr(peer_addr)
+                && let Some(current_v) = self.version(peer_id)
+            {
+                match v {
+                    Some(val) => {
+                        if val != current_v {
+                            return Ok(());
+                        }
+                    }
 
-        let conn_lock = &self.conn_stripes[id];
-        let _guard = conn_lock.lock().expect("Cannot be poisoned");
-        if let Some(peer_id) = self.peer_id_from_addr(peer_addr)
-            && let Some(current_v) = self.version(peer_id)
-        {
-            match v {
-                Some(val) => {
-                    if val != current_v {
+                    None => {
                         return Ok(());
                     }
                 }
+            }
 
-                None => {
-                    return Ok(());
+            let stream =
+                TcpStream::connect_timeout(peer_addr, self.as_ref().config.timeout.connect)?;
+            let mut r = PeerRead::new(stream.try_clone()?);
+            let w = PeerWrite::new(stream);
+            w.write(
+                &Packet::WhoIs {
+                    id: self.as_ref().id,
+                    addr: self.as_ref().config.addr,
+                },
+                Some(self.as_ref().config.timeout.write),
+            )?;
+
+            match r.read(Some(self.as_ref().config.timeout.read))? {
+                Packet::WhoIsReply { id } => {
+                    let v = w.v;
+                    self.register(id, peer_addr, w);
+                    r.start(self.clone(), id, v).map(|_| ())
                 }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Who Is reply don't received",
+                )),
             }
-        }
-
-        let stream = TcpStream::connect_timeout(peer_addr, self.config.timeout.connect)?;
-        let mut r = PeerRead::new(stream.try_clone()?);
-        let w = PeerWrite::new(stream);
-        w.write(
-            &Packet::WhoIs {
-                id: self.config.id,
-                addr: self.config.addr,
-            },
-            Some(self.config.timeout.write),
-        )?;
-
-        match r.read(Some(self.config.timeout.read))? {
-            Packet::WhoIsReply { id } => {
-                let v = w.v;
-                self.register(id, peer_addr, w);
-                r.start(Arc::clone(self), id, v).map(|_| ())
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "Who Is reply don't received",
-            )),
-        }
+        })
     }
 
     fn peer_id_from_addr(&self, addr: &SocketAddr) -> Option<Uuid> {
-        let addrs = self.addrs.lock().expect("Cannot be poisoned");
+        let addrs = self.as_ref().addrs.lock().expect("Cannot be poisoned");
         for (id, peer_addr) in addrs.iter() {
             if addr.eq(peer_addr) {
                 return Some(*id);
@@ -181,10 +248,12 @@ impl Registry {
     }
 
     pub(crate) fn addr(&self, id: Uuid) -> Option<SocketAddr> {
-        self.addrs
+        self.as_ref()
+            .addrs
             .lock()
             .expect("Cannot be poisoned")
-            .get(&id).copied()
+            .get(&id)
+            .copied()
     }
 
     pub(crate) fn connected_peers(&self) -> Vec<Uuid> {
@@ -200,20 +269,34 @@ impl Registry {
     }
 
     pub(crate) fn hb(&self, id: Uuid) -> Option<Instant> {
-        self.with_writers_read(|writers| {
-            writers.get(&id).map(|writer| writer.hb())
-        })
+        self.with_writers_read(|writers| writers.get(&id).map(|writer| writer.hb()))
     }
 
-    pub(crate) fn with_writers_read<
-        O,
+    pub(crate) fn with_writers_read<F, O>(&self, f: F) -> O
+    where
         F: Fn(RwLockReadGuard<'_, HashMap<Uuid, PeerWrite>>) -> O,
-    >(
-        &self,
-        f: F,
-    ) -> O {
-        let guard = self.writers.read().expect("Cannot be poisoned");
+    {
+        let guard = self.as_ref().writers.read().expect("Cannot be poisoned");
         f(guard)
+    }
+
+    pub(crate) fn register_ack(&self, corr_id: u64) -> Response<'_> {
+        let (tx, rx) = mpsc::sync_channel(0);
+        self.as_ref()
+            .acks
+            .lock()
+            .expect("Cannot be poisoned")
+            .insert(corr_id, tx);
+
+        Response::new(corr_id, self, rx)
+    }
+
+    pub(crate) fn remove_ack(&self, corr_id: u64) -> Option<mpsc::SyncSender<Packet>> {
+        self.as_ref()
+            .acks
+            .lock()
+            .expect("Cannot be poisoned")
+            .remove(&corr_id)
     }
 }
 
@@ -274,7 +357,7 @@ impl PeerRead {
 
     pub fn start(
         mut self,
-        registry: Arc<Registry>,
+        registry: Registry,
         peer_id: Uuid,
         version: u64,
     ) -> io::Result<JoinHandle<()>> {
@@ -282,7 +365,7 @@ impl PeerRead {
             .name(format!("tcp-{}-{}", peer_id, version))
             .stack_size(128 * 1024)
             .spawn(move || {
-                info!(id = %registry.config.id, peer_id = %peer_id, v = %version, "tcp connection initialized");
+                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "tcp connection initialized");
 
                 loop {
                     match registry.version(peer_id) {
@@ -290,20 +373,20 @@ impl PeerRead {
                         _ => break,
                     }
 
-                    if registry.sigterm.load(Ordering::Acquire) {
+                    if registry.as_ref().sigterm.load(Ordering::Acquire) {
                         break;
                     }
 
-                    match self.read(Some(registry.config.timeout.read)) {
+                    match self.read(Some(registry.as_ref().config.timeout.read)) {
                         Ok(packet) => {
                             let kind = packet.kind();
                             if matches!(packet, Packet::HeartBeat) {
-                                info!(id = %registry.config.id, peer_id = %peer_id, v = %version, "Heartbeat packet received");
+                                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "Heartbeat packet received");
                                 registry.update_hb(peer_id);
                             } else if let Err(err) =
-                                registry.tx_pckt.send(InboundPacket::new(peer_id, packet))
+                                registry.as_ref().tx_msg.send(Message::Packet{ val :InboundPacket::new(peer_id, packet)})
                             {
-                            error!(id = %registry.config.id, peer_id = %peer_id, v = %version, kind = %kind, err = %err, "Packet enqueue failed");
+                            error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, kind = %kind, err = %err, "Packet enqueue failed");
                             }
                         }
                         Err(err)
@@ -319,12 +402,12 @@ impl PeerRead {
                             break;
                         }
                         Err(err) => {
-                            error!(id = %registry.config.id, peer_id = %peer_id, v = %version, err = %err, "Packet read failed");
+                            error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, err = %err, "Packet read failed");
                         }
                     }
                 }
 
-                info!(id = %registry.config.id, peer_id = %peer_id, v = %version, "tcp connection destroyed");
+                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "tcp connection destroyed");
             })
     }
 }

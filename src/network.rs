@@ -6,28 +6,55 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self},
     },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::network::{
-    packet::{Event, InboundPacket, Packet},
-    registry::Registry,
-    sched::Discovery,
+use crate::{
+    instance::{
+        Instance,
+        task::{self, Task},
+    },
+    network::{
+        self,
+        packet::{Event, InboundPacket, Packet},
+        registry::{Registry, Response},
+    },
 };
 
 pub mod packet;
 mod registry;
 mod sched;
 
+pub enum Discovery {
+    Dns { host: String },
+    List { addresses: Vec<SocketAddr> },
+}
+
 #[derive(Clone)]
 pub struct Sender {
-    registry: Arc<Registry>,
+    registry: Registry,
 }
 
 impl Sender {
+    pub fn sync_send(
+        &self,
+        id: Uuid,
+        packet: Packet,
+        timeout: Option<Duration>,
+    ) -> io::Result<Response<'_>> {
+        if let Some(corr_id) = packet.correlation_id() {
+            let response = self.registry.register_ack(corr_id);
+            self.send(id, packet, timeout)?;
+            Ok(response)
+        } else {
+            todo!("Must return error if not informed correlation_id")
+        }
+    }
+
     pub fn send(&self, id: Uuid, packet: Packet, timeout: Option<Duration>) -> io::Result<()> {
         let (result, v) = self.registry.with_writers_read(|writers| {
             if let Some(writer) = writers.get(&id) {
@@ -54,18 +81,18 @@ impl Sender {
 
         match result {
             Some(Err(err)) => {
-                error!(id = %self.registry.config.id, peer_id = %id, kind = %packet.kind(), err = %err, "Packet send failed");
+                error!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(), err = %err, "Packet send failed");
                 Err(err)
             }
             Some(Ok(_)) => {
-                debug!(id = %self.registry.config.id, peer_id = %id, kind = %packet.kind(),  "Packet send successfully");
+                debug!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(),  "Packet send successfully");
                 Ok(())
             }
             None => {
                 let addr = match self.registry.addr(id) {
                     Some(addr) => addr,
                     None => {
-                        warn!(id = %self.registry.config.id, peer_id = %id, "Connection to peer failed due to no addr found");
+                        warn!(id = %self.registry.as_ref().id, peer_id = %id, "Connection to peer failed due to no addr found");
                         return Err(io::Error::new(
                             io::ErrorKind::AddrNotAvailable,
                             "No peer connection found",
@@ -74,7 +101,7 @@ impl Sender {
                 };
 
                 if let Err(err) = self.registry.connect(&addr, v) {
-                    error!(id = %self.registry.config.id, peer_id= %id, err = %err, "Connection to peer failed");
+                    error!(id = %self.registry.as_ref().id, peer_id= %id, err = %err, "Connection to peer failed");
                     return Err(err);
                 }
 
@@ -88,11 +115,11 @@ impl Sender {
                         )),
                     }) {
                     Err(err) => {
-                        error!(id = %self.registry.config.id, peer_id = %id, kind = %packet.kind(), err = %err, "Packet send failed");
+                        error!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(), err = %err, "Packet send failed");
                         Err(err)
                     }
                     Ok(_) => {
-                        debug!(id = %self.registry.config.id, peer_id = %id, kind = %packet.kind(),  "Packet send successfully");
+                        debug!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(),  "Packet send successfully");
                         Ok(())
                     }
                 }
@@ -101,33 +128,78 @@ impl Sender {
     }
 }
 
+#[derive(Eq, PartialEq, Debug)]
+pub enum Message {
+    Packet { val: InboundPacket },
+    Event { val: Event },
+}
+
 pub struct Receiver {
-    rx_pckt: mpsc::Receiver<InboundPacket>,
-    rx_event: mpsc::Receiver<Event>,
+    rx_msg: mpsc::Receiver<Message>,
+    registry: Registry,
     sigterm: Arc<AtomicBool>,
 }
 
 impl Receiver {
-    pub fn recv_packet(&self, timeout: Option<Duration>) -> Option<InboundPacket> {
+    pub fn recv(&self, timeout: Option<Duration>) -> Option<Message> {
         match timeout {
-            Some(val) => self.rx_pckt.recv_timeout(val).ok(),
+            Some(val) => self.rx_msg.recv_timeout(val).ok(),
             None => Some(
-                self.rx_pckt
+                self.rx_msg
                     .recv()
                     .expect("There is always a sender available"),
             ),
         }
     }
 
-    pub fn recv_event(&self, timeout: Option<Duration>) -> Option<Event> {
-        match timeout {
-            Some(val) => self.rx_event.recv_timeout(val).ok(),
-            None => Some(
-                self.rx_event
-                    .recv()
-                    .expect("There is always a sender available"),
-            ),
-        }
+    pub fn start(self, instance: Instance) -> io::Result<JoinHandle<()>> {
+        let task_executor = task::Executor::new();
+
+        thread::Builder::new()
+            .name(format!("pckt-receiver-{}", instance.as_ref().id))
+            .spawn(move || {
+                info!(id = %instance.as_ref().id, "pckt-receiver started");
+                loop {
+                    if self.sigterm.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    if let Some(message) = self.recv(Some(Duration::from_secs(1))) {
+                        match message {
+                            Message::Packet { val } => {
+                                if val.p.is_request() {
+                                    task_executor
+                                        .spawn(instance.clone(), Task::Request { packet: val });
+                                } else {
+                                    match val.p {
+                                        Packet::WhoIs { .. }
+                                        | Packet::WhoIsReply { .. }
+                                        | Packet::HeartBeat
+                                        | Packet::NoOp { .. } => {}
+                                        Packet::NoOpReply { corr_id } => {
+                                            if let Some(entry) = self.registry.remove_ack(corr_id) {
+                                                let _ = entry.try_send(val.p);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Message::Event { val } => match val {
+                                Event::PeerAdded { id } => {
+                                    instance.add_member(id);
+                                    task_executor.spawn(instance.clone(), Task::PartitionRebalance);
+                                }
+                                Event::PeerRemoved { id } => {
+                                    instance.remove_member(id);
+                                    task_executor.spawn(instance.clone(), Task::PartitionRebalance);
+                                }
+                            },
+                        }
+                    }
+                }
+
+                info!(id = %instance.as_ref().id, "pckt-receiver destroyed");
+            })
     }
 }
 
@@ -139,10 +211,8 @@ impl Drop for Receiver {
 
 #[derive(Clone, Copy)]
 pub struct Config {
-    pub id: Uuid,
     pub addr: SocketAddr,
-    pub pckt_buf_len: usize,
-    pub event_buf_len: usize,
+    pub msg_buf_len: usize,
     pub timeout: TimeoutConfig,
     pub hb: HeartbeatConfig,
 }
@@ -163,10 +233,8 @@ pub struct HeartbeatConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            id: Uuid::from_u128(1),
             addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
-            pckt_buf_len: 1024,
-            event_buf_len: 1024,
+            msg_buf_len: 1024,
             timeout: Default::default(),
             hb: Default::default(),
         }
@@ -192,25 +260,21 @@ impl Default for HeartbeatConfig {
     }
 }
 
-pub fn handle(config: Config, d: Discovery) -> io::Result<(Sender, Receiver)> {
-    let (tx_pckt, rx_pckt) = mpsc::sync_channel(config.pckt_buf_len);
-    let (tx_event, rx_event) = mpsc::sync_channel(config.event_buf_len);
+pub fn handle(id: Uuid, d: Discovery, c: network::Config) -> io::Result<(Sender, Receiver)> {
+    let (tx_msg, rx_msg) = mpsc::sync_channel(c.msg_buf_len);
 
     let sigterm = Arc::new(AtomicBool::new(false));
-    let registry = Arc::new(Registry::new(
-        config,
-        tx_pckt,
-        tx_event,
-        Arc::clone(&sigterm),
-    ));
+    let registry = Registry::new(id, c, tx_msg, Arc::clone(&sigterm));
 
-    sched::listener(config, Arc::clone(&registry))?;
-    sched::hb(config, d, Arc::clone(&registry))?;
+    sched::listener(c, registry.clone())?;
+    sched::hb(c, d, registry.clone())?;
 
-    let net_tx = Sender { registry };
+    let net_tx = Sender {
+        registry: registry.clone(),
+    };
     let net_rx = Receiver {
-        rx_pckt,
-        rx_event,
+        rx_msg,
+        registry,
         sigterm,
     };
 
@@ -228,13 +292,31 @@ mod tests {
     use tracing_subscriber::FmtSubscriber;
     use uuid::Uuid;
 
-    use crate::network::{self, Discovery, Event, handle};
+    use crate::network::{self, Discovery, Event, Message, Receiver, Sender, handle};
 
     #[test]
     pub fn peers_dis_connect_successfully() -> io::Result<()> {
+        let (net_1, net_2) = setup()?;
+
+        drop(net_2);
+        assert_eq!(
+            Some(Message::Event {
+                val: Event::PeerRemoved {
+                    id: Uuid::from_u128(2)
+                }
+            }),
+            net_1.1.recv(None)
+        );
+
+        Ok(())
+    }
+
+    fn setup() -> io::Result<((Sender, Receiver), (Sender, Receiver))> {
         let subscriber = FmtSubscriber::new();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("Failed to set global subscriber");
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+        let id = Uuid::from_u128(1);
+        let id_2 = Uuid::from_u128(2);
 
         let config = network::Config {
             hb: network::HeartbeatConfig {
@@ -245,7 +327,6 @@ mod tests {
         };
 
         let config_2 = network::Config {
-            id: Uuid::from_u128(2),
             addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8081)),
             hb: network::HeartbeatConfig {
                 poll_interval: Duration::from_secs(1),
@@ -255,41 +336,41 @@ mod tests {
         };
 
         let (tx, rx) = handle(
-            config,
+            id,
             Discovery::List {
                 addresses: vec![
                     SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
                     SocketAddr::from((Ipv4Addr::LOCALHOST, 8081)),
                 ],
             },
+            config,
         )?;
 
-        {
-            let (tx_2, rx_2) = handle(
-                config_2,
-                Discovery::List {
-                    addresses: vec![
-                        SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
-                        SocketAddr::from((Ipv4Addr::LOCALHOST, 8081)),
-                    ],
-                },
-            )?;
-
-            assert_eq!(
-                Some(Event::PeerAdded { id: config_2.id }),
-                rx.recv_event(None)
-            );
-            assert_eq!(
-                Some(Event::PeerAdded { id: config.id }),
-                rx_2.recv_event(None)
-            );
-        }
+        let (tx_2, rx_2) = handle(
+            id_2,
+            Discovery::List {
+                addresses: vec![
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8081)),
+                ],
+            },
+            config_2,
+        )?;
 
         assert_eq!(
-            Some(Event::PeerRemoved { id: config_2.id }),
-            rx.recv_event(None)
+            Some(Message::Event {
+                val: Event::PeerAdded { id: id_2 }
+            }),
+            rx.recv(None)
         );
 
-        Ok(())
+        assert_eq!(
+            Some(Message::Event {
+                val: Event::PeerAdded { id }
+            }),
+            rx_2.recv(None)
+        );
+
+        Ok(((tx, rx), (tx_2, rx_2)))
     }
 }

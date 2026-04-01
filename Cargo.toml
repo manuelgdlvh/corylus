@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 uuid = "1.22.0"
 twox-hash = "2.1.2"
+rayon = "1.11.0"
 rand = "0.10.0"
 tracing = "0.1.44"
 
