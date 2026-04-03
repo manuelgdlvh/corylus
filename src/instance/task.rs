@@ -42,12 +42,17 @@ impl Task {
                             &segment_id,
                             |segment| segment.op_reg.read_fn(&op_id),
                         ) {
-                            let read_op = f(raw_op.as_slice());
-                            match instance.read(&segment_id, read_op) {
-                                Ok(val) => {
-                                    result = val;
-                                    ok = true;
-                                }
+                            match f(raw_op.as_slice()) {
+                                Ok(read_op) => match instance.read(&segment_id, read_op) {
+                                    Ok(val) => {
+                                        result = val;
+                                        ok = true;
+                                    }
+                                    Err(_) => {
+                                        result = vec![];
+                                        ok = false;
+                                    }
+                                },
                                 Err(_) => {
                                     result = vec![];
                                     ok = false;
@@ -95,11 +100,15 @@ impl Task {
                             &segment_id,
                             |segment| segment.op_reg.write_fn(&op_id),
                         ) {
-                            let write_op = f(raw_op.as_slice());
-                            match instance.write(&segment_id, write_op) {
-                                Ok(_) => {
-                                    ok = true;
-                                }
+                            match f(raw_op.as_slice()) {
+                                Ok(write_op) => match instance.write(&segment_id, write_op) {
+                                    Ok(_) => {
+                                        ok = true;
+                                    }
+                                    Err(_) => {
+                                        ok = false;
+                                    }
+                                },
                                 Err(_) => {
                                     ok = false;
                                 }

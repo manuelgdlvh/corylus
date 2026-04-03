@@ -1,13 +1,24 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 
 use crate::partition;
+
+#[derive(thiserror::Error, Debug)]
+pub enum DeserializeError {
+    #[error("Invalid buffer size: expected {expected} bytes, got {got}")]
+    InvalidBufferSize { expected: usize, got: usize },
+    #[error("Invalid UTF-8: {0}")]
+    InvalidUtf8(#[from] std::string::FromUtf8Error),
+    #[error("{0}")]
+    Unknown(String),
+}
 
 pub trait Serializer {
     fn serialize(&self) -> Vec<u8>;
 }
 
-pub trait Deserializer {
-    fn deserialize(buffer: &[u8]) -> Self;
+pub trait Deserializer: Sized {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error>;
 }
 
 pub trait Base: Serializer {
@@ -20,22 +31,22 @@ pub trait Base: Serializer {
 
 pub trait Write: Base {
     fn execute(&mut self, segment: &mut dyn partition::RawSegment);
-    fn deserialize(val: &[u8]) -> GenericWrite
+    fn deserialize(val: &[u8]) -> Result<GenericWrite, io::Error>
     where
         Self: Sized;
 }
 
 pub trait Read: Base {
     fn execute(&self, segment: &dyn partition::RawSegment) -> Vec<u8>;
-    fn deserialize(val: &[u8]) -> GenericRead
+    fn deserialize(val: &[u8]) -> Result<GenericRead, io::Error>
     where
         Self: Sized;
 }
 
 // --- Adapter ---
+
 pub struct GenericRead {
     pub(crate) inner: Box<dyn Read>,
-    pub id: String,
 }
 
 impl Serializer for GenericRead {
@@ -53,7 +64,7 @@ impl Base for GenericRead {
     }
 
     fn id(&self) -> &str {
-        self.id.as_str()
+        self.inner.id()
     }
 
     fn partition_key(&self) -> Vec<u8> {
@@ -66,7 +77,7 @@ impl Read for GenericRead {
         self.inner.execute(segment)
     }
 
-    fn deserialize(_: &[u8]) -> GenericRead
+    fn deserialize(_: &[u8]) -> Result<GenericRead, io::Error>
     where
         Self: Sized,
     {
@@ -76,7 +87,6 @@ impl Read for GenericRead {
 
 pub struct GenericWrite {
     pub(crate) inner: Box<dyn Write>,
-    pub id: String,
 }
 
 impl Serializer for GenericWrite {
@@ -94,7 +104,7 @@ impl Base for GenericWrite {
     }
 
     fn id(&self) -> &str {
-        self.id.as_str()
+        self.inner.id()
     }
 
     fn partition_key(&self) -> Vec<u8> {
@@ -107,7 +117,7 @@ impl Write for GenericWrite {
         self.inner.execute(segment);
     }
 
-    fn deserialize(_: &[u8]) -> GenericWrite
+    fn deserialize(_: &[u8]) -> Result<GenericWrite, io::Error>
     where
         Self: Sized,
     {
@@ -117,8 +127,8 @@ impl Write for GenericWrite {
 
 // --- Core ---
 
-pub type ReadBuilder = fn(&[u8]) -> GenericRead;
-pub type WriteBuilder = fn(&[u8]) -> GenericWrite;
+pub type ReadBuilder = fn(&[u8]) -> Result<GenericRead, io::Error>;
+pub type WriteBuilder = fn(&[u8]) -> Result<GenericWrite, io::Error>;
 pub type OpId = &'static str;
 
 pub enum Type {

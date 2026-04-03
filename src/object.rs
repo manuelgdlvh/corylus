@@ -3,7 +3,7 @@ use std::{hash::Hash, io, marker::PhantomData};
 use crate::{
     instance::{
         Instance,
-        operation::{Deserializer, Serializer},
+        operation::{DeserializeError, Deserializer, Serializer},
     },
     object::map::{Get, Put},
 };
@@ -48,39 +48,104 @@ where
         if result.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(V::deserialize(result.as_slice())))
+            Ok(Some(
+                V::deserialize(result.as_slice())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            ))
         }
     }
 }
 
-// --- DeSerializers ---
+// --- Serializers / Deserializers ---
 
 impl Serializer for String {
     fn serialize(&self) -> Vec<u8> {
-        let mut buff = Vec::with_capacity(self.len());
-        buff.extend_from_slice(self.as_bytes());
-        buff
+        self.as_bytes().to_vec()
     }
 }
 
 impl Deserializer for String {
-    fn deserialize(buffer: &[u8]) -> Self {
-        let mut buff = Vec::with_capacity(buffer.len());
-        buff.extend_from_slice(buffer);
-        unsafe { String::from_utf8_unchecked(buff) }
+    type Error = DeserializeError;
+
+    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
+        String::from_utf8(buffer.to_vec()).map_err(DeserializeError::InvalidUtf8)
     }
 }
 
-impl Serializer for u64 {
+impl Serializer for Vec<u8> {
     fn serialize(&self) -> Vec<u8> {
-        let mut buff = Vec::with_capacity(8);
-        buff.extend_from_slice(self.to_le_bytes().as_slice());
-        buff
+        self.clone()
     }
 }
 
-impl Deserializer for u64 {
-    fn deserialize(buffer: &[u8]) -> Self {
-        u64::from_le_bytes(buffer.try_into().expect("buffer must be exactly 8 bytes"))
+impl Deserializer for Vec<u8> {
+    type Error = DeserializeError;
+
+    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
+        Ok(buffer.to_vec())
     }
 }
+
+impl Serializer for bool {
+    fn serialize(&self) -> Vec<u8> {
+        vec![*self as u8]
+    }
+}
+
+impl Deserializer for bool {
+    type Error = DeserializeError;
+
+    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
+        if buffer.len() != 1 {
+            return Err(DeserializeError::InvalidBufferSize {
+                expected: 1,
+                got: buffer.len(),
+            });
+        }
+        match buffer[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            v => Err(DeserializeError::Unknown(format!(
+                "Invalid bool byte: {v}"
+            ))),
+        }
+    }
+}
+
+macro_rules! impl_fixed_serde {
+    ($t:ty) => {
+        impl Serializer for $t {
+            fn serialize(&self) -> Vec<u8> {
+                self.to_le_bytes().to_vec()
+            }
+        }
+
+        impl Deserializer for $t {
+            type Error = DeserializeError;
+
+            fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
+                const N: usize = std::mem::size_of::<$t>();
+                if buffer.len() != N {
+                    return Err(DeserializeError::InvalidBufferSize {
+                        expected: N,
+                        got: buffer.len(),
+                    });
+                }
+                Ok(<$t>::from_le_bytes(buffer.try_into().unwrap()))
+            }
+        }
+    };
+}
+
+impl_fixed_serde!(u8);
+impl_fixed_serde!(u16);
+impl_fixed_serde!(u32);
+impl_fixed_serde!(u64);
+impl_fixed_serde!(u128);
+impl_fixed_serde!(i8);
+impl_fixed_serde!(i16);
+impl_fixed_serde!(i32);
+impl_fixed_serde!(i64);
+impl_fixed_serde!(i128);
+impl_fixed_serde!(f32);
+impl_fixed_serde!(f64);

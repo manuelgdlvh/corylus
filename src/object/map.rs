@@ -1,4 +1,4 @@
-use std::{any::Any, collections::HashMap, hash::Hash, marker::PhantomData};
+use std::{any::Any, collections::HashMap, hash::Hash, io, marker::PhantomData};
 
 use crate::{
     instance::operation::{self, Deserializer, GenericRead, GenericWrite, Read, Serializer, Write},
@@ -83,28 +83,52 @@ where
         map.insert(self.key.clone(), self.value.clone());
     }
 
-    // TODO: Return error if fails
-    fn deserialize(val: &[u8]) -> GenericWrite
+    fn deserialize(val: &[u8]) -> Result<GenericWrite, io::Error>
     where
         Self: Sized,
     {
         let mut pos = 0;
 
+        if val.len() < pos + 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "buffer too short for key length",
+            ));
+        }
         let key_len = u32::from_be_bytes(val[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
-        let key = K::deserialize(&val[pos..pos + key_len]);
+        if val.len() < pos + key_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "buffer too short for key data",
+            ));
+        }
+        let key = K::deserialize(&val[pos..pos + key_len])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         pos += key_len;
 
+        if val.len() < pos + 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "buffer too short for value length",
+            ));
+        }
         let val_len = u32::from_be_bytes(val[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
-        let value = V::deserialize(&val[pos..pos + val_len]);
-
-        GenericWrite {
-            id: "map:put".to_string(),
-            inner: Box::new(Put { key, value }),
+        if val.len() < pos + val_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "buffer too short for value data",
+            ));
         }
+        let value = V::deserialize(&val[pos..pos + val_len])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Ok(GenericWrite {
+            inner: Box::new(Put { key, value }),
+        })
     }
 }
 
@@ -172,24 +196,35 @@ where
         }
     }
 
-    // TODO: Return error if fails
-    fn deserialize(val: &[u8]) -> GenericRead
+    fn deserialize(val: &[u8]) -> Result<GenericRead, io::Error>
     where
         Self: Sized,
     {
         let mut pos = 0;
 
+        if val.len() < pos + 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "buffer too short for key length",
+            ));
+        }
         let key_len = u32::from_be_bytes(val[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
-        let key = K::deserialize(&val[pos..pos + key_len]);
+        if val.len() < pos + key_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "buffer too short for key data",
+            ));
+        }
+        let key = K::deserialize(&val[pos..pos + key_len])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        GenericRead {
-            id: "map:get".to_string(),
+        Ok(GenericRead {
             inner: Box::new(Get {
                 key,
                 _value: PhantomData::<V>,
             }),
-        }
+        })
     }
 }
