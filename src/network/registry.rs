@@ -11,7 +11,6 @@ use std::{
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
-    u64,
 };
 
 use tracing::{error, info};

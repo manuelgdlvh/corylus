@@ -121,7 +121,7 @@ impl Group {
         let partition = &self.partitions[p_id];
         if let Some(segment) = partition.segments.get(s_id) {
             let guard = segment.read().expect("Cannot be poisoned");
-            Ok(f(&*guard))
+            Ok(f(&guard))
         } else {
             Err(Error::SegmentNotFound { id: s_id })
         }
@@ -143,7 +143,8 @@ impl Group {
         let partition = &self.partitions[p_id];
         if let Some(segment) = partition.segments.get(s_id) {
             let mut guard = segment.write().expect("Cannot be poisoned");
-            Ok(f(&mut *guard))
+            f(&mut guard);
+            Ok(())
         } else {
             Err(Error::SegmentNotFound { id: s_id })
         }

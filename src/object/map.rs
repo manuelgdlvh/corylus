@@ -188,7 +188,7 @@ where
             id: "map:get".to_string(),
             inner: Box::new(Get {
                 key,
-                _value: PhantomData::<V>::default(),
+                _value: PhantomData::<V>,
             }),
         }
     }

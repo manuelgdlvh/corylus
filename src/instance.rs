@@ -39,6 +39,12 @@ pub struct Builder<S> {
     _state: PhantomData<S>,
 }
 
+impl Default for Builder<NeedsId> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Builder<NeedsId> {
     pub fn new() -> Self {
         Self {
@@ -166,7 +172,7 @@ impl Instance {
         let owner = self.as_ref().partition.owner_of(p_id);
 
         if self.as_ref().id.eq(&owner) {
-            let _ = self
+            self
                 .as_ref()
                 .partition
                 .with_segment_write(p_id as usize, s_id, |segment| {

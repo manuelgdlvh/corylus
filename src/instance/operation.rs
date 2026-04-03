@@ -131,6 +131,12 @@ pub struct Registry {
     inner: Arc<Inner>,
 }
 
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Registry {
     pub fn new() -> Self {
         Self {
@@ -163,10 +169,10 @@ impl Registry {
     }
 
     pub fn read_fn(&self, op_id: &str) -> Option<ReadBuilder> {
-        self.inner.read_fns.get(op_id).map(|fn_| *fn_)
+        self.inner.read_fns.get(op_id).copied()
     }
 
     pub fn write_fn(&self, op_id: &str) -> Option<WriteBuilder> {
-        self.inner.write_fns.get(op_id).map(|fn_| *fn_)
+        self.inner.write_fns.get(op_id).copied()
     }
 }
