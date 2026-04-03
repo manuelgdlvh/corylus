@@ -172,8 +172,7 @@ impl Instance {
         let owner = self.as_ref().partition.owner_of(p_id);
 
         if self.as_ref().id.eq(&owner) {
-            self
-                .as_ref()
+            self.as_ref()
                 .partition
                 .with_segment_write(p_id as usize, s_id, |segment| {
                     op.execute(&mut *segment.data);
