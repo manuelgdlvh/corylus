@@ -1,0 +1,172 @@
+use std::{collections::HashMap, sync::Arc};
+
+use crate::partition;
+
+pub trait Serializer {
+    fn serialize(&self) -> Vec<u8>;
+}
+
+pub trait Deserializer {
+    fn deserialize(buffer: &[u8]) -> Self;
+}
+
+pub trait Base: Serializer {
+    fn static_id() -> &'static str
+    where
+        Self: Sized;
+    fn id(&self) -> &str;
+    fn partition_key(&self) -> Vec<u8>;
+}
+
+pub trait Write: Base {
+    fn execute(&mut self, segment: &mut dyn partition::RawSegment);
+    fn deserialize(val: &[u8]) -> GenericWrite
+    where
+        Self: Sized;
+}
+
+pub trait Read: Base {
+    fn execute(&self, segment: &dyn partition::RawSegment) -> Vec<u8>;
+    fn deserialize(val: &[u8]) -> GenericRead
+    where
+        Self: Sized;
+}
+
+// --- Adapter ---
+pub struct GenericRead {
+    pub(crate) inner: Box<dyn Read>,
+    pub id: String,
+}
+
+impl Serializer for GenericRead {
+    fn serialize(&self) -> Vec<u8> {
+        self.inner.serialize()
+    }
+}
+
+impl Base for GenericRead {
+    fn static_id() -> &'static str
+    where
+        Self: Sized,
+    {
+        unreachable!("Generic type must not call associated type function")
+    }
+
+    fn id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    fn partition_key(&self) -> Vec<u8> {
+        self.inner.partition_key()
+    }
+}
+
+impl Read for GenericRead {
+    fn execute(&self, segment: &dyn partition::RawSegment) -> Vec<u8> {
+        self.inner.execute(segment)
+    }
+
+    fn deserialize(_: &[u8]) -> GenericRead
+    where
+        Self: Sized,
+    {
+        unreachable!("Generic type must not call associated type function")
+    }
+}
+
+pub struct GenericWrite {
+    pub(crate) inner: Box<dyn Write>,
+    pub id: String,
+}
+
+impl Serializer for GenericWrite {
+    fn serialize(&self) -> Vec<u8> {
+        self.inner.serialize()
+    }
+}
+
+impl Base for GenericWrite {
+    fn static_id() -> &'static str
+    where
+        Self: Sized,
+    {
+        unreachable!("Generic type must not call associated type function")
+    }
+
+    fn id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    fn partition_key(&self) -> Vec<u8> {
+        self.inner.partition_key()
+    }
+}
+
+impl Write for GenericWrite {
+    fn execute(&mut self, segment: &mut dyn partition::RawSegment) {
+        self.inner.execute(segment);
+    }
+
+    fn deserialize(_: &[u8]) -> GenericWrite
+    where
+        Self: Sized,
+    {
+        unreachable!("Generic type must not call associated type function")
+    }
+}
+
+// --- Core ---
+
+pub type ReadBuilder = fn(&[u8]) -> GenericRead;
+pub type WriteBuilder = fn(&[u8]) -> GenericWrite;
+pub type OpId = &'static str;
+
+pub enum Type {
+    Read,
+    Write,
+}
+
+#[derive(Clone)]
+pub struct Registry {
+    inner: Arc<Inner>,
+}
+
+impl Registry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Default::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Inner {
+    types: HashMap<OpId, Type>,
+    read_fns: HashMap<OpId, ReadBuilder>,
+    write_fns: HashMap<OpId, WriteBuilder>,
+}
+
+impl Registry {
+    pub fn with_read_op<O: Read>(mut self) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.types.insert(O::static_id(), Type::Read);
+            inner.read_fns.insert(O::static_id(), O::deserialize);
+        }
+        self
+    }
+    pub fn with_write_op<O: Write>(mut self) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.types.insert(O::static_id(), Type::Write);
+            inner.write_fns.insert(O::static_id(), O::deserialize);
+        }
+        self
+    }
+
+    pub fn read_fn(&self, op_id: &str) -> Option<ReadBuilder> {
+        self.inner.read_fns.get(op_id).map(|fn_| *fn_)
+    }
+
+    pub fn write_fn(&self, op_id: &str) -> Option<WriteBuilder> {
+        self.inner.write_fns.get(op_id).map(|fn_| *fn_)
+    }
+}

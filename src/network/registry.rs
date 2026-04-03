@@ -45,13 +45,13 @@ impl Limiter {
 }
 
 pub struct Response<'a> {
-    corr_id: u64,
+    corr_id: Uuid,
     reg: &'a Registry,
     receiver: mpsc::Receiver<Packet>,
 }
 
 impl<'a> Response<'a> {
-    fn new(corr_id: u64, reg: &'a Registry, receiver: mpsc::Receiver<Packet>) -> Self {
+    fn new(corr_id: Uuid, reg: &'a Registry, receiver: mpsc::Receiver<Packet>) -> Self {
         Self {
             corr_id,
             reg,
@@ -66,7 +66,7 @@ impl<'a> Response<'a> {
 
 impl Drop for Response<'_> {
     fn drop(&mut self) {
-        self.reg.remove_ack(self.corr_id);
+        self.reg.unregister_ack(self.corr_id);
     }
 }
 
@@ -82,7 +82,7 @@ pub(crate) struct Inner {
     pub(crate) sigterm: Arc<AtomicBool>,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
     writers: RwLock<HashMap<Uuid, PeerWrite>>,
-    acks: Mutex<HashMap<u64, SyncSender<Packet>>>,
+    acks: Mutex<HashMap<Uuid, SyncSender<Packet>>>,
     limiter: Limiter,
 }
 
@@ -149,7 +149,9 @@ impl Registry {
 
                 entry.remove_entry();
             }
-            std::collections::hash_map::Entry::Vacant(_) => {}
+            std::collections::hash_map::Entry::Vacant(_) => {
+                return;
+            }
         }
 
         self.as_ref()
@@ -280,8 +282,8 @@ impl Registry {
         f(guard)
     }
 
-    pub(crate) fn register_ack(&self, corr_id: u64) -> Response<'_> {
-        let (tx, rx) = mpsc::sync_channel(0);
+    pub(crate) fn register_ack(&self, corr_id: Uuid) -> Response<'_> {
+        let (tx, rx) = mpsc::sync_channel(1);
         self.as_ref()
             .acks
             .lock()
@@ -291,7 +293,7 @@ impl Registry {
         Response::new(corr_id, self, rx)
     }
 
-    pub(crate) fn remove_ack(&self, corr_id: u64) -> Option<mpsc::SyncSender<Packet>> {
+    pub(crate) fn unregister_ack(&self, corr_id: Uuid) -> Option<mpsc::SyncSender<Packet>> {
         self.as_ref()
             .acks
             .lock()

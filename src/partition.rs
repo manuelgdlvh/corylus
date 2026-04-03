@@ -1,34 +1,47 @@
 use std::{
+    any::Any,
     array,
     collections::{BinaryHeap, HashMap, HashSet},
-    io,
-    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::RwLock,
 };
 
+use thiserror::Error;
 use twox_hash::{XxHash3_64, XxHash3_128};
 use uuid::Uuid;
+
+use crate::{instance::operation, partition};
 
 const RING_CAPACITY: usize = 1024;
 const PARTITION_HASH_SEED: u64 = 1234;
 
-pub trait RawSegment: Send + Sync {
-    fn rebuild(&mut self, raw: Vec<u8>);
-    fn as_raw(&self) -> &[u8];
+#[derive(Error, Debug)]
+pub enum Error<'a> {
+    #[error("Partition not found. Id: {id}")]
+    PartitionNotFound { id: usize },
+    #[error("Segment not found. Id: {id}")]
+    SegmentNotFound { id: &'a str },
+}
+
+pub trait RawSegment: Send + Sync + Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_mut_any(&mut self) -> &mut dyn Any;
 }
 
 pub struct Segment {
-    id: &'static str,
-    data: Box<dyn RawSegment>,
+    id: String,
+    pub(crate) data: Box<dyn RawSegment>,
+    pub(crate) op_reg: operation::Registry,
     // Useful for entropy process of partitions after membership changes or corruption detection
     seq: u64,
     checksum: u64,
 }
 
 impl Segment {
-    pub fn new<S: RawSegment + Default + 'static>(id: &'static str) -> Self {
+    pub fn new<S: RawSegment + 'static>(id: String, data: S, op_reg: operation::Registry) -> Self {
         Self {
             id,
-            data: Box::new(S::default()),
+            data: Box::new(data),
+            op_reg,
             seq: 0,
             checksum: 0,
         }
@@ -40,34 +53,11 @@ pub struct Group {
 }
 
 impl Group {
-    pub fn new(member_id: Uuid) -> Self {
+    pub fn new<F: Fn() -> Segment>(member_id: Uuid, segment_fns: &[F]) -> Self {
         let partitions: [Partition; RING_CAPACITY] =
-            array::from_fn(|id| Partition::new(id, member_id));
+            array::from_fn(|id| Partition::new(id, member_id, segment_fns));
 
         Self { partitions }
-    }
-
-    pub fn with_segment<F>(mut self, f: F) -> Self
-    where
-        F: Fn() -> Segment,
-    {
-        for idx in 0..RING_CAPACITY {
-            // SAFELY move out the partition without needing Default
-            let partition = unsafe {
-                // get a raw pointer to the element
-                let ptr = self.partitions.as_mut_ptr().add(idx);
-                std::ptr::read(ptr) // moves the value out
-            };
-
-            let segment = f();
-            unsafe {
-                // put the modified partition back
-                let ptr = self.partitions.as_mut_ptr().add(idx);
-                std::ptr::write(ptr, partition.with_segment(segment));
-            }
-        }
-
-        self
     }
 
     pub fn partition_of(&self, key: &[u8]) -> u64 {
@@ -115,71 +105,75 @@ impl Group {
         result
     }
 
-    pub fn with_segment_read<F, O>(
+    pub fn with_segment_read<'a, F, O>(
         &self,
         p_id: usize,
-        s_id: &'static str,
+        s_id: &'a str,
         f: F,
-    ) -> Result<O, io::Error>
+    ) -> Result<O, partition::Error<'a>>
     where
-        F: Fn(RwLockReadGuard<'_, Segment>) -> O,
+        F: FnOnce(&Segment) -> O,
     {
         if p_id >= RING_CAPACITY {
-            panic!("Partition id out of range");
+            return Err(Error::PartitionNotFound { id: p_id });
         }
 
         let partition = &self.partitions[p_id];
-
         if let Some(segment) = partition.segments.get(s_id) {
             let guard = segment.read().expect("Cannot be poisoned");
-            Ok(f(guard))
+            Ok(f(&*guard))
         } else {
-            todo!("Should return error")
+            Err(Error::SegmentNotFound { id: s_id })
         }
     }
 
-    pub fn with_segment_write<F>(
+    pub fn with_segment_write<'a, F>(
         &self,
         p_id: usize,
-        s_id: &'static str,
+        s_id: &'a str,
         f: F,
-    ) -> Result<(), io::Error>
+    ) -> Result<(), partition::Error<'a>>
     where
-        F: Fn(RwLockWriteGuard<'_, Segment>),
+        F: FnOnce(&mut Segment),
     {
         if p_id >= RING_CAPACITY {
-            panic!("Partition id out of range");
+            return Err(Error::PartitionNotFound { id: p_id });
         }
 
         let partition = &self.partitions[p_id];
         if let Some(segment) = partition.segments.get(s_id) {
-            let guard = segment.write().expect("Cannot be poisoned");
-            f(guard);
-            Ok(())
+            let mut guard = segment.write().expect("Cannot be poisoned");
+            Ok(f(&mut *guard))
         } else {
-            todo!("Should return error")
+            Err(Error::SegmentNotFound { id: s_id })
         }
     }
 }
 
 pub struct Partition {
     metadata: RwLock<Metadata>,
-    segments: HashMap<&'static str, RwLock<Segment>>,
+    segments: HashMap<String, RwLock<Segment>>,
 }
 
 impl Partition {
-    pub fn new(id: usize, member_id: Uuid) -> Self {
-        let (master_id, replica_ids) =
-            Partition::compute_membership(id, vec![member_id].as_slice());
+    pub fn new<F: Fn() -> Segment>(id: usize, member_id: Uuid, segment_fns: &[F]) -> Self {
+        let (master_id, replica_ids) = Partition::compute_membership(id, &[member_id]);
+
+        let mut segments = HashMap::with_capacity(segment_fns.len());
+        for f in segment_fns {
+            let segment = f();
+            segments.insert(segment.id.to_string(), RwLock::new(segment));
+        }
 
         Self {
             metadata: RwLock::new(Metadata::new(id, master_id, replica_ids)),
-            segments: Default::default(),
+            segments,
         }
     }
 
     pub fn with_segment(mut self, segment: Segment) -> Self {
-        self.segments.insert(segment.id, RwLock::new(segment));
+        self.segments
+            .insert(segment.id.to_string(), RwLock::new(segment));
         self
     }
 

@@ -7,7 +7,8 @@ use crate::{
 
 pub enum Task {
     PartitionRebalance,
-    Request { packet: InboundPacket },
+    Read { packet: InboundPacket },
+    Write { packet: InboundPacket },
 }
 
 impl Task {
@@ -15,22 +16,103 @@ impl Task {
         match self {
             Self::PartitionRebalance => {
                 let members = instance.members();
-                let changes = instance.as_ref().partition.update(members.as_slice());
+                let _ = instance.as_ref().partition.update(members.as_slice());
             }
-            Self::Request { packet } => {
+            Self::Read { packet } => {
                 let from = packet.from;
 
                 match packet.p {
                     Packet::WhoIs { .. }
                     | Packet::WhoIsReply { .. }
                     | Packet::HeartBeat
-                    | Packet::NoOpReply { .. } => {}
-                    Packet::NoOp { corr_id } => {
-                        let _ =
-                            instance
-                                .as_ref()
-                                .net
-                                .send(from, Packet::NoOpReply { corr_id }, None);
+                    | Packet::WriteOpReply { .. }
+                    | Packet::GetOpReply { .. }
+                    | Packet::WriteOp { .. } => {}
+                    Packet::GetOp {
+                        corr_id,
+                        partition_id,
+                        segment_id,
+                        op_id,
+                        raw_op,
+                    } => {
+                        let ok;
+                        let result;
+                        if let Ok(Some(f)) = instance.as_ref().partition.with_segment_read(
+                            partition_id as usize,
+                            &segment_id,
+                            |segment| segment.op_reg.read_fn(&op_id),
+                        ) {
+                            let read_op = f(raw_op.as_slice());
+                            match instance.read(&segment_id, read_op) {
+                                Ok(val) => {
+                                    result = val;
+                                    ok = true;
+                                }
+                                Err(_) => {
+                                    result = vec![];
+                                    ok = false;
+                                }
+                            }
+                        } else {
+                            ok = false;
+                            result = vec![];
+                        }
+
+                        let _ = instance.as_ref().net.send(
+                            from,
+                            Packet::GetOpReply {
+                                corr_id,
+                                ok,
+                                result,
+                            },
+                            None,
+                        );
+                    }
+                }
+            }
+
+            Self::Write { packet } => {
+                let from = packet.from;
+
+                match packet.p {
+                    Packet::WhoIs { .. }
+                    | Packet::WhoIsReply { .. }
+                    | Packet::HeartBeat
+                    | Packet::WriteOpReply { .. }
+                    | Packet::GetOpReply { .. }
+                    | Packet::GetOp { .. } => {}
+
+                    Packet::WriteOp {
+                        corr_id,
+                        partition_id,
+                        segment_id,
+                        op_id,
+                        raw_op,
+                    } => {
+                        let ok;
+                        if let Ok(Some(f)) = instance.as_ref().partition.with_segment_read(
+                            partition_id as usize,
+                            &segment_id,
+                            |segment| segment.op_reg.write_fn(&op_id),
+                        ) {
+                            let write_op = f(raw_op.as_slice());
+                            match instance.write(&segment_id, write_op) {
+                                Ok(_) => {
+                                    ok = true;
+                                }
+                                Err(_) => {
+                                    ok = false;
+                                }
+                            }
+                        } else {
+                            ok = false;
+                        }
+
+                        let _ = instance.as_ref().net.send(
+                            from,
+                            Packet::WriteOpReply { corr_id, ok },
+                            None,
+                        );
                     }
                 }
             }
@@ -39,8 +121,9 @@ impl Task {
 }
 
 pub struct Executor {
-    t_01: rayon::ThreadPool,
-    t_02: rayon::ThreadPool,
+    vacuum: rayon::ThreadPool,
+    read: rayon::ThreadPool,
+    write: rayon::ThreadPool,
 }
 
 impl Default for Executor {
@@ -51,21 +134,31 @@ impl Default for Executor {
 
 impl Executor {
     pub fn new() -> Self {
-        let t_01 = ThreadPoolBuilder::new()
+        let vacuum = ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .expect("Failed to build thread pool");
-        let t_02 = ThreadPoolBuilder::new()
+        let read = ThreadPoolBuilder::new()
             .num_threads(16)
             .build()
             .expect("Failed to build thread pool");
 
-        Self { t_01, t_02 }
+        let write = ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("Failed to build thread pool");
+
+        Self {
+            vacuum,
+            read,
+            write,
+        }
     }
     pub fn spawn(&self, instance: Instance, task: Task) {
         let pool = match task {
-            Task::PartitionRebalance => &self.t_01,
-            Task::Request { .. } => &self.t_02,
+            Task::PartitionRebalance => &self.vacuum,
+            Task::Read { .. } => &self.read,
+            Task::Write { .. } => &self.write,
         };
 
         pool.spawn(move || {

@@ -167,17 +167,25 @@ impl Receiver {
                     if let Some(message) = self.recv(Some(Duration::from_secs(1))) {
                         match message {
                             Message::Packet { val } => {
-                                if val.p.is_request() {
+                                if val.p.is_read() {
                                     task_executor
-                                        .spawn(instance.clone(), Task::Request { packet: val });
+                                        .spawn(instance.clone(), Task::Read { packet: val });
+                                } else if val.p.is_write() {
+                                    task_executor
+                                        .spawn(instance.clone(), Task::Write { packet: val });
                                 } else {
                                     match val.p {
                                         Packet::WhoIs { .. }
                                         | Packet::WhoIsReply { .. }
                                         | Packet::HeartBeat
-                                        | Packet::NoOp { .. } => {}
-                                        Packet::NoOpReply { corr_id } => {
-                                            if let Some(entry) = self.registry.remove_ack(corr_id) {
+                                        | Packet::WriteOp { .. }
+                                        | Packet::GetOp { .. } => {}
+
+                                        Packet::WriteOpReply { corr_id, .. }
+                                        | Packet::GetOpReply { corr_id, .. } => {
+                                            if let Some(entry) =
+                                                self.registry.unregister_ack(corr_id)
+                                            {
                                                 let _ = entry.try_send(val.p);
                                             }
                                         }
