@@ -2,7 +2,10 @@ use std::{
     any::Any,
     array,
     collections::{BinaryHeap, HashMap, HashSet},
-    sync::RwLock,
+    sync::{
+        RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use thiserror::Error;
@@ -50,6 +53,7 @@ impl Segment {
 
 pub struct Group {
     partitions: [Partition; RING_CAPACITY],
+    version: AtomicU64,
 }
 
 impl Group {
@@ -57,7 +61,10 @@ impl Group {
         let partitions: [Partition; RING_CAPACITY] =
             array::from_fn(|id| Partition::new(id, member_id, segment_fns));
 
-        Self { partitions }
+        Self {
+            partitions,
+            version: AtomicU64::new(0),
+        }
     }
 
     pub fn partition_of(&self, key: &[u8]) -> u64 {
@@ -102,6 +109,7 @@ impl Group {
             }
         }
 
+        self.version.fetch_add(1, Ordering::Relaxed);
         result
     }
 
@@ -148,6 +156,10 @@ impl Group {
         } else {
             Err(Error::SegmentNotFound { id: s_id })
         }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
     }
 }
 

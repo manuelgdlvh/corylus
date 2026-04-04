@@ -17,7 +17,7 @@ impl Task {
             Self::PartitionRebalance => {
                 if let Some(ref_) = instance.as_ref().upgrade() {
                     let members = ref_.members();
-                    let _ = ref_.partition.update(members.as_slice());
+                    let _ = ref_.part_group.update(members.as_slice());
                 }
             }
             Self::Read { packet } => {
@@ -40,7 +40,7 @@ impl Task {
                         if let Some(ref_) = instance.as_ref().upgrade() {
                             let ok;
                             let result;
-                            if let Ok(Some(f)) = ref_.partition.with_segment_read(
+                            if let Ok(Some(f)) = ref_.part_group.with_segment_read(
                                 partition_id as usize,
                                 &segment_id,
                                 |segment| segment.op_reg.read_fn(&op_id),
@@ -100,7 +100,7 @@ impl Task {
                     } => {
                         if let Some(ref_) = instance.as_ref().upgrade() {
                             let ok;
-                            if let Ok(Some(f)) = ref_.partition.with_segment_read(
+                            if let Ok(Some(f)) = ref_.part_group.with_segment_read(
                                 partition_id as usize,
                                 &segment_id,
                                 |segment| segment.op_reg.write_fn(&op_id),

@@ -37,7 +37,7 @@ impl Instance {
         let inner = Arc::new(instance::Inner {
             id,
             net,
-            partition: part_group,
+            part_group,
             members: Mutex::new(members),
             shutdown,
         });
@@ -53,13 +53,17 @@ impl Instance {
         self.inner.members()
     }
 
+    pub fn part_group_version(&self) -> u64 {
+        self.inner.part_group.version()
+    }
+
     pub fn get_map<K, V>(&self, id: &str) -> Option<DistributedMap<K, V>>
     where
         K: Serializer + Deserializer + Hash + Eq + Clone + 'static,
         V: Serializer + Deserializer + Clone + 'static,
     {
         let id = format!("map:{}", id);
-        let result = self.inner.partition.with_segment_read(0, &id, |segment| {
+        let result = self.inner.part_group.with_segment_read(0, &id, |segment| {
             segment
                 .data
                 .as_any()

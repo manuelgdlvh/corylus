@@ -185,7 +185,7 @@ impl Shutdown {
 }
 
 pub struct Config {
-    network: network::Config,
+    pub network: network::Config,
 }
 
 #[derive(Clone)]
@@ -208,7 +208,7 @@ impl AsRef<sync::Weak<Inner>> for Weak {
 pub struct Inner {
     pub(crate) id: Uuid,
     pub(crate) net: network::Sender,
-    pub(crate) partition: partition::Group,
+    pub(crate) part_group: partition::Group,
     pub(crate) members: Mutex<HashSet<Uuid>>,
     pub(crate) shutdown: Arc<Shutdown>,
 }
@@ -241,11 +241,11 @@ impl Inner {
 
     pub(crate) fn write<O: operation::Write>(&self, s_id: &str, mut op: O) -> io::Result<()> {
         let key = op.partition_key();
-        let p_id = self.partition.partition_of(&key);
-        let owner = self.partition.owner_of(p_id);
+        let p_id = self.part_group.partition_of(&key);
+        let owner = self.part_group.owner_of(p_id);
 
         if self.id.eq(&owner) {
-            self.partition
+            self.part_group
                 .with_segment_write(p_id as usize, s_id, |segment| {
                     op.execute(&mut *segment.data);
                 })
@@ -284,11 +284,11 @@ impl Inner {
 
     pub(crate) fn read<O: operation::Read>(&self, s_id: &str, op: O) -> io::Result<Vec<u8>> {
         let key = op.partition_key();
-        let p_id = self.partition.partition_of(&key);
-        let owner = self.partition.owner_of(p_id);
+        let p_id = self.part_group.partition_of(&key);
+        let owner = self.part_group.owner_of(p_id);
         if self.id.eq(&owner) {
             let result = self
-                .partition
+                .part_group
                 .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
                 .expect("As internal operation, partition and segment must always exist");
             Ok(result)
@@ -320,146 +320,6 @@ impl Inner {
             } else {
                 Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        io,
-        net::{Ipv4Addr, SocketAddr},
-        thread::sleep,
-        time::{Duration, Instant},
-    };
-
-    use tracing_subscriber::FmtSubscriber;
-    use uuid::Uuid;
-
-    use crate::{
-        instance::{self, Config, Instance},
-        network::{self, Discovery},
-    };
-
-    #[test]
-    pub fn should_register_map_successfully() -> io::Result<()> {
-        let (instance_1, instance_2) = setup()?;
-
-        assert!(instance_1.get_map::<String, String>("str-str").is_some());
-        assert!(instance_2.get_map::<String, String>("str-str").is_some());
-
-        assert!(instance_1.get_map::<String, String>("wrong").is_none());
-        assert!(instance_2.get_map::<String, String>("wrong").is_none());
-
-        assert!(instance_1.get_map::<u64, String>("str-str").is_none());
-        assert!(instance_2.get_map::<String, u64>("str-str").is_none());
-        Ok(())
-    }
-
-    #[test]
-    pub fn should_put_and_get_map_successfully() -> io::Result<()> {
-        let (instance_1, instance_2) = setup()?;
-
-        let map_1 = instance_1.get_map::<String, String>("str-str").unwrap();
-        let map_2 = instance_2.get_map::<String, String>("str-str").unwrap();
-
-        // Local write
-        map_1.put("key-1".to_string(), "value-1".to_string())?;
-        // Local read
-        assert_eq!(Some("value-1".to_string()), map_1.get("key-1".to_string())?);
-        // Remote read
-        assert_eq!(Some("value-1".to_string()), map_2.get("key-1".to_string())?);
-
-        // Remote Write
-        map_1.put("key-2".to_string(), "value-2".to_string())?;
-        // Remote read
-        assert_eq!(Some("value-2".to_string()), map_1.get("key-2".to_string())?);
-        // Local read
-        assert_eq!(Some("value-2".to_string()), map_2.get("key-2".to_string())?);
-
-        Ok(())
-    }
-
-    fn setup() -> io::Result<(Instance, Instance)> {
-        let subscriber = FmtSubscriber::new();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-
-        let id_1 = Uuid::from_u128(1);
-        let id_2 = Uuid::from_u128(2);
-
-        let instance_1 = instance::Builder::new()
-            .with_id(Uuid::from_u128(1))
-            .with_config(Config {
-                network: network::Config {
-                    addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                    hb: network::HeartbeatConfig {
-                        poll_interval: Duration::from_secs(1),
-                        tolerance: Duration::from_secs(3),
-                    },
-                    ..Default::default()
-                },
-            })
-            .with_discovery(Discovery::List {
-                addresses: vec![
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-                ],
-            })
-            .with_map::<String, String>("str-str")
-            .build()?;
-
-        let instance_2 = instance::Builder::new()
-            .with_id(Uuid::from_u128(2))
-            .with_config(Config {
-                network: network::Config {
-                    addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-                    hb: network::HeartbeatConfig {
-                        poll_interval: Duration::from_secs(1),
-                        tolerance: Duration::from_secs(3),
-                    },
-                    ..Default::default()
-                },
-            })
-            .with_discovery(Discovery::List {
-                addresses: vec![
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-                ],
-            })
-            .with_map::<String, String>("str-str")
-            .build()?;
-
-        wait_until(
-            || instance_1.members().iter().any(|id| id.eq(&id_2)),
-            Duration::from_millis(100),
-            Duration::from_secs(5),
-        );
-
-        wait_until(
-            || instance_2.members().iter().any(|id| id.eq(&id_1)),
-            Duration::from_millis(100),
-            Duration::from_secs(5),
-        );
-
-        Ok((instance_1, instance_2))
-    }
-
-    pub fn wait_until<F>(f: F, poll_interval: Duration, timeout: Duration)
-    where
-        F: Fn() -> bool,
-    {
-        let start = Instant::now();
-
-        loop {
-            if f() {
-                return;
-            }
-
-            if start.elapsed() >= timeout {
-                assert!(false, "Max wait time to be ready elapsed")
-            }
-
-            sleep(poll_interval);
         }
     }
 }

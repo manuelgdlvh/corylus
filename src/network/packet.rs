@@ -299,10 +299,7 @@ impl From<&[u8]> for Packet {
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
-                let ok = match value[offset] {
-                    0 => false,
-                    _ => true,
-                };
+                let ok = !matches!(value[offset], 0);
 
                 Packet::WriteOpReply { corr_id, ok }
             }
@@ -364,11 +361,7 @@ impl From<&[u8]> for Packet {
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
-                let ok = match value[offset] {
-                    0 => false,
-                    _ => true,
-                };
-
+                let ok = !matches!(value[offset], 0);
                 offset += 1;
 
                 let result = if offset >= value.len() {
