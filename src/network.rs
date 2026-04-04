@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     instance::{
-        Instance,
+        self,
         task::{self, Task},
     },
     network::{
@@ -152,13 +152,19 @@ impl Receiver {
         }
     }
 
-    pub fn start(self, instance: Instance) -> io::Result<JoinHandle<()>> {
+    pub fn start(self, instance: instance::Weak) -> io::Result<JoinHandle<()>> {
         let task_executor = task::Executor::new();
 
+        let id = instance
+            .as_ref()
+            .upgrade()
+            .expect("No possibility to be destroyed yet")
+            .id;
+
         thread::Builder::new()
-            .name(format!("pckt-receiver-{}", instance.as_ref().id))
+            .name(format!("pckt-receiver-{}", id))
             .spawn(move || {
-                info!(id = %instance.as_ref().id, "pckt-receiver started");
+                info!(id = %id, "pckt-receiver started");
                 loop {
                     if self.sigterm.load(Ordering::Acquire) {
                         break;
@@ -194,19 +200,25 @@ impl Receiver {
                             }
                             Message::Event { val } => match val {
                                 Event::PeerAdded { id } => {
-                                    instance.add_member(id);
-                                    task_executor.spawn(instance.clone(), Task::PartitionRebalance);
+                                    if let Some(ref_) = instance.as_ref().upgrade() {
+                                        ref_.add_member(id);
+                                        task_executor
+                                            .spawn(instance.clone(), Task::PartitionRebalance);
+                                    }
                                 }
                                 Event::PeerRemoved { id } => {
-                                    instance.remove_member(id);
-                                    task_executor.spawn(instance.clone(), Task::PartitionRebalance);
+                                    if let Some(ref_) = instance.as_ref().upgrade() {
+                                        ref_.remove_member(id);
+                                        task_executor
+                                            .spawn(instance.clone(), Task::PartitionRebalance);
+                                    }
                                 }
                             },
                         }
                     }
                 }
 
-                info!(id = %instance.as_ref().id, "pckt-receiver destroyed");
+                info!(id = %id, "pckt-receiver destroyed");
             })
     }
 }

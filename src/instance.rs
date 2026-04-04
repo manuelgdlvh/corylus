@@ -3,19 +3,17 @@ use std::{
     hash::Hash,
     io,
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::{self, Mutex},
     time::Duration,
 };
 
 use uuid::Uuid;
 
 use crate::{
+    Instance,
     instance::operation::{Deserializer, Serializer},
     network::{self, packet::Packet},
-    object::{
-        DistributedMap,
-        map::{Get, Put},
-    },
+    object::map::{Get, Put},
     partition::{self, Segment},
 };
 
@@ -119,7 +117,7 @@ impl Builder<Ready> {
         let partition = partition::Group::new(id, self.segments.as_slice());
         let instance = Instance::new(id, net_sender, partition);
 
-        net_receiver.start(instance.clone())?;
+        net_receiver.start(instance.downgrade())?;
 
         Ok(instance)
     }
@@ -129,36 +127,42 @@ pub struct Config {
 }
 
 #[derive(Clone)]
-pub struct Instance {
-    inner: Arc<Inner>,
+pub struct Weak {
+    inner: sync::Weak<Inner>,
 }
 
-impl Instance {
-    fn new(id: Uuid, net: network::Sender, partition: partition::Group) -> Self {
-        let mut members = HashSet::new();
-        members.insert(id);
-        let inner = Arc::new(Inner {
-            id,
-            net,
-            partition,
-            members: Mutex::new(members),
-        });
-
+impl Weak {
+    pub fn new(inner: sync::Weak<Inner>) -> Self {
         Self { inner }
     }
+}
+
+impl AsRef<sync::Weak<Inner>> for Weak {
+    fn as_ref(&self) -> &sync::Weak<Inner> {
+        &self.inner
+    }
+}
+
+pub struct Inner {
+    pub(crate) id: Uuid,
+    pub(crate) net: network::Sender,
+    pub(crate) partition: partition::Group,
+    pub(crate) members: Mutex<HashSet<Uuid>>,
+}
+
+impl Inner {
     pub(crate) fn remove_member(&self, id: Uuid) {
-        let mut members = self.as_ref().members.lock().expect("Cannot be poisoned");
+        let mut members = self.members.lock().expect("Cannot be poisoned");
         members.remove(&id);
     }
 
     pub(crate) fn add_member(&self, id: Uuid) {
-        let mut members = self.as_ref().members.lock().expect("Cannot be poisoned");
+        let mut members = self.members.lock().expect("Cannot be poisoned");
         members.insert(id);
     }
 
     pub(crate) fn members(&self) -> Vec<Uuid> {
-        self.inner
-            .members
+        self.members
             .lock()
             .expect("Cannot be poisoned")
             .iter()
@@ -168,12 +172,11 @@ impl Instance {
 
     pub(crate) fn write<O: operation::Write>(&self, s_id: &str, mut op: O) -> io::Result<()> {
         let key = op.partition_key();
-        let p_id = self.as_ref().partition.partition_of(&key);
-        let owner = self.as_ref().partition.owner_of(p_id);
+        let p_id = self.partition.partition_of(&key);
+        let owner = self.partition.owner_of(p_id);
 
-        if self.as_ref().id.eq(&owner) {
-            self.as_ref()
-                .partition
+        if self.id.eq(&owner) {
+            self.partition
                 .with_segment_write(p_id as usize, s_id, |segment| {
                     op.execute(&mut *segment.data);
                 })
@@ -181,7 +184,7 @@ impl Instance {
             Ok(())
         } else {
             let raw_op = op.serialize();
-            let response = self.as_ref().net.sync_send(
+            let response = self.net.sync_send(
                 owner,
                 network::packet::Packet::WriteOp {
                     corr_id: Uuid::new_v4(),
@@ -212,18 +215,17 @@ impl Instance {
 
     pub(crate) fn read<O: operation::Read>(&self, s_id: &str, op: O) -> io::Result<Vec<u8>> {
         let key = op.partition_key();
-        let p_id = self.as_ref().partition.partition_of(&key);
-        let owner = self.as_ref().partition.owner_of(p_id);
-        if self.as_ref().id.eq(&owner) {
+        let p_id = self.partition.partition_of(&key);
+        let owner = self.partition.owner_of(p_id);
+        if self.id.eq(&owner) {
             let result = self
-                .as_ref()
                 .partition
                 .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
                 .expect("As internal operation, partition and segment must always exist");
             Ok(result)
         } else {
             let raw_op = op.serialize();
-            let response = self.as_ref().net.sync_send(
+            let response = self.net.sync_send(
                 owner,
                 network::packet::Packet::GetOp {
                     corr_id: Uuid::new_v4(),
@@ -250,46 +252,6 @@ impl Instance {
                 Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
             }
         }
-    }
-
-    pub fn get_map<K, V>(&self, id: &str) -> Option<DistributedMap<K, V>>
-    where
-        K: Serializer + Deserializer + Hash + Eq + Clone + 'static,
-        V: Serializer + Deserializer + Clone + 'static,
-    {
-        let id = format!("map:{}", id);
-        let result = self
-            .as_ref()
-            .partition
-            .with_segment_read(0, &id, |segment| {
-                segment
-                    .data
-                    .as_any()
-                    .downcast_ref::<HashMap<K, V>>()
-                    .is_some()
-            });
-
-        if let Ok(val) = result
-            && val
-        {
-            let instance = self.clone();
-            Some(DistributedMap::new(id, instance))
-        } else {
-            None
-        }
-    }
-}
-
-pub(crate) struct Inner {
-    pub(crate) id: Uuid,
-    pub(crate) net: network::Sender,
-    partition: partition::Group,
-    members: Mutex<HashSet<Uuid>>,
-}
-
-impl AsRef<Inner> for Instance {
-    fn as_ref(&self) -> &Inner {
-        &self.inner
     }
 }
 

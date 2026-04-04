@@ -1,7 +1,7 @@
 use rayon::ThreadPoolBuilder;
 
 use crate::{
-    instance::Instance,
+    instance,
     network::packet::{InboundPacket, Packet},
 };
 
@@ -12,11 +12,13 @@ pub enum Task {
 }
 
 impl Task {
-    pub fn execute(self, instance: Instance) {
+    pub fn execute(self, instance: instance::Weak) {
         match self {
             Self::PartitionRebalance => {
-                let members = instance.members();
-                let _ = instance.as_ref().partition.update(members.as_slice());
+                if let Some(ref_) = instance.as_ref().upgrade() {
+                    let members = ref_.members();
+                    let _ = ref_.partition.update(members.as_slice());
+                }
             }
             Self::Read { packet } => {
                 let from = packet.from;
@@ -35,43 +37,45 @@ impl Task {
                         op_id,
                         raw_op,
                     } => {
-                        let ok;
-                        let result;
-                        if let Ok(Some(f)) = instance.as_ref().partition.with_segment_read(
-                            partition_id as usize,
-                            &segment_id,
-                            |segment| segment.op_reg.read_fn(&op_id),
-                        ) {
-                            match f(raw_op.as_slice()) {
-                                Ok(read_op) => match instance.read(&segment_id, read_op) {
-                                    Ok(val) => {
-                                        result = val;
-                                        ok = true;
-                                    }
+                        if let Some(ref_) = instance.as_ref().upgrade() {
+                            let ok;
+                            let result;
+                            if let Ok(Some(f)) = ref_.partition.with_segment_read(
+                                partition_id as usize,
+                                &segment_id,
+                                |segment| segment.op_reg.read_fn(&op_id),
+                            ) {
+                                match f(raw_op.as_slice()) {
+                                    Ok(read_op) => match ref_.read(&segment_id, read_op) {
+                                        Ok(val) => {
+                                            result = val;
+                                            ok = true;
+                                        }
+                                        Err(_) => {
+                                            result = vec![];
+                                            ok = false;
+                                        }
+                                    },
                                     Err(_) => {
                                         result = vec![];
                                         ok = false;
                                     }
-                                },
-                                Err(_) => {
-                                    result = vec![];
-                                    ok = false;
                                 }
+                            } else {
+                                ok = false;
+                                result = vec![];
                             }
-                        } else {
-                            ok = false;
-                            result = vec![];
-                        }
 
-                        let _ = instance.as_ref().net.send(
-                            from,
-                            Packet::GetOpReply {
-                                corr_id,
-                                ok,
-                                result,
-                            },
-                            None,
-                        );
+                            let _ = ref_.net.send(
+                                from,
+                                Packet::GetOpReply {
+                                    corr_id,
+                                    ok,
+                                    result,
+                                },
+                                None,
+                            );
+                        }
                     }
                 }
             }
@@ -94,34 +98,34 @@ impl Task {
                         op_id,
                         raw_op,
                     } => {
-                        let ok;
-                        if let Ok(Some(f)) = instance.as_ref().partition.with_segment_read(
-                            partition_id as usize,
-                            &segment_id,
-                            |segment| segment.op_reg.write_fn(&op_id),
-                        ) {
-                            match f(raw_op.as_slice()) {
-                                Ok(write_op) => match instance.write(&segment_id, write_op) {
-                                    Ok(_) => {
-                                        ok = true;
-                                    }
+                        if let Some(ref_) = instance.as_ref().upgrade() {
+                            let ok;
+                            if let Ok(Some(f)) = ref_.partition.with_segment_read(
+                                partition_id as usize,
+                                &segment_id,
+                                |segment| segment.op_reg.write_fn(&op_id),
+                            ) {
+                                match f(raw_op.as_slice()) {
+                                    Ok(write_op) => match ref_.write(&segment_id, write_op) {
+                                        Ok(_) => {
+                                            ok = true;
+                                        }
+                                        Err(_) => {
+                                            ok = false;
+                                        }
+                                    },
                                     Err(_) => {
                                         ok = false;
                                     }
-                                },
-                                Err(_) => {
-                                    ok = false;
                                 }
+                            } else {
+                                ok = false;
                             }
-                        } else {
-                            ok = false;
-                        }
 
-                        let _ = instance.as_ref().net.send(
-                            from,
-                            Packet::WriteOpReply { corr_id, ok },
-                            None,
-                        );
+                            let _ = ref_
+                                .net
+                                .send(from, Packet::WriteOpReply { corr_id, ok }, None);
+                        }
                     }
                 }
             }
@@ -163,7 +167,7 @@ impl Executor {
             write,
         }
     }
-    pub fn spawn(&self, instance: Instance, task: Task) {
+    pub fn spawn(&self, instance: instance::Weak, task: Task) {
         let pool = match task {
             Task::PartitionRebalance => &self.vacuum,
             Task::Read { .. } => &self.read,
