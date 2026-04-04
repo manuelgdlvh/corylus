@@ -6,7 +6,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     sync::{
         Arc, Mutex, RwLock, RwLockReadGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -16,9 +16,12 @@ use std::{
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::network::{
-    self, Message,
-    packet::{Event, InboundPacket, PACKET_LENGTH, Packet},
+use crate::{
+    instance::Shutdown,
+    network::{
+        self, Message,
+        packet::{Event, InboundPacket, PACKET_LENGTH, Packet},
+    },
 };
 
 const CONN_STRIPES_LEN: usize = 8;
@@ -78,7 +81,7 @@ pub(crate) struct Inner {
     pub(crate) id: Uuid,
     pub(crate) config: network::Config,
     tx_msg: SyncSender<Message>,
-    pub(crate) sigterm: Arc<AtomicBool>,
+    pub(crate) sigterm: Arc<Shutdown>,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
     writers: RwLock<HashMap<Uuid, PeerWrite>>,
     acks: Mutex<HashMap<Uuid, SyncSender<Packet>>>,
@@ -96,7 +99,7 @@ impl Registry {
         id: Uuid,
         config: network::Config,
         tx_msg: SyncSender<Message>,
-        sigterm: Arc<AtomicBool>,
+        sigterm: Arc<Shutdown>,
     ) -> Self {
         let inner = Arc::new(Inner {
             id,
@@ -219,7 +222,16 @@ impl Registry {
                 Packet::WhoIsReply { id } => {
                     let v = w.v;
                     self.register(id, peer_addr, w);
-                    r.start(self.clone(), id, v).map(|_| ())
+                    match r.start(self.clone(), id, v) {
+                        Ok(h) => {
+                            self.as_ref().sigterm.register(h);
+                            Ok(())
+                        }
+                        Err(err) => {
+                            self.unregister(id, v);
+                            Err(err)
+                        }
+                    }
                 }
                 _ => Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -374,7 +386,7 @@ impl PeerRead {
                         _ => break,
                     }
 
-                    if registry.as_ref().sigterm.load(Ordering::Acquire) {
+                    if !registry.as_ref().sigterm.checkpoint(None) {
                         break;
                     }
 

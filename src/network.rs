@@ -3,7 +3,6 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
         mpsc::{self},
     },
     thread::{self, JoinHandle},
@@ -15,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     instance::{
-        self,
+        self, Shutdown,
         task::{self, Task},
     },
     network::{
@@ -137,7 +136,6 @@ pub enum Message {
 pub struct Receiver {
     rx_msg: mpsc::Receiver<Message>,
     registry: Registry,
-    sigterm: Arc<AtomicBool>,
 }
 
 impl Receiver {
@@ -166,7 +164,7 @@ impl Receiver {
             .spawn(move || {
                 info!(id = %id, "pckt-receiver started");
                 loop {
-                    if self.sigterm.load(Ordering::Acquire) {
+                    if !self.registry.as_ref().sigterm.checkpoint(None) {
                         break;
                     }
 
@@ -223,12 +221,6 @@ impl Receiver {
     }
 }
 
-impl Drop for Receiver {
-    fn drop(&mut self) {
-        self.sigterm.store(true, Ordering::Release);
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct Config {
     pub addr: SocketAddr,
@@ -280,23 +272,23 @@ impl Default for HeartbeatConfig {
     }
 }
 
-pub fn handle(id: Uuid, d: Discovery, c: network::Config) -> io::Result<(Sender, Receiver)> {
+pub fn handle(
+    id: Uuid,
+    d: Discovery,
+    shutdown: Arc<Shutdown>,
+    c: network::Config,
+) -> io::Result<(Sender, Receiver)> {
     let (tx_msg, rx_msg) = mpsc::sync_channel(c.msg_buf_len);
 
-    let sigterm = Arc::new(AtomicBool::new(false));
-    let registry = Registry::new(id, c, tx_msg, Arc::clone(&sigterm));
+    let registry = Registry::new(id, c, tx_msg, Arc::clone(&shutdown));
 
-    sched::listener(c, registry.clone())?;
-    sched::hb(c, d, registry.clone())?;
+    shutdown.register(sched::listener(c, registry.clone())?);
+    shutdown.register(sched::hb(c, d, registry.clone())?);
 
     let net_tx = Sender {
         registry: registry.clone(),
     };
-    let net_rx = Receiver {
-        rx_msg,
-        registry,
-        sigterm,
-    };
+    let net_rx = Receiver { rx_msg, registry };
 
     Ok((net_tx, net_rx))
 }
@@ -306,19 +298,22 @@ mod tests {
     use std::{
         io,
         net::{Ipv4Addr, SocketAddr},
+        sync::Arc,
         time::Duration,
     };
 
     use tracing_subscriber::FmtSubscriber;
     use uuid::Uuid;
 
-    use crate::network::{self, Discovery, Event, Message, Receiver, Sender, handle};
+    use crate::{
+        instance::Shutdown,
+        network::{self, Discovery, Event, Message, Receiver, Sender, handle},
+    };
 
     #[test]
     pub fn peers_dis_connect_successfully() -> io::Result<()> {
         let (net_1, net_2) = setup()?;
-
-        drop(net_2);
+        net_2.0.registry.as_ref().sigterm.destroy();
         assert_eq!(
             Some(Message::Event {
                 val: Event::PeerRemoved {
@@ -334,6 +329,9 @@ mod tests {
     fn setup() -> io::Result<((Sender, Receiver), (Sender, Receiver))> {
         let subscriber = FmtSubscriber::new();
         let _ = tracing::subscriber::set_global_default(subscriber);
+
+        let shutdown_1 = Shutdown::new();
+        let shutdown_2 = Shutdown::new();
 
         let id = Uuid::from_u128(1);
         let id_2 = Uuid::from_u128(2);
@@ -363,6 +361,7 @@ mod tests {
                     SocketAddr::from((Ipv4Addr::LOCALHOST, 8081)),
                 ],
             },
+            Arc::clone(&shutdown_1),
             config,
         )?;
 
@@ -374,6 +373,7 @@ mod tests {
                     SocketAddr::from((Ipv4Addr::LOCALHOST, 8081)),
                 ],
             },
+            Arc::clone(&shutdown_2),
             config_2,
         )?;
 

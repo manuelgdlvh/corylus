@@ -7,7 +7,10 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    instance::operation::{Deserializer, Serializer},
+    instance::{
+        Shutdown,
+        operation::{Deserializer, Serializer},
+    },
     object::DistributedMap,
 };
 
@@ -22,14 +25,21 @@ pub struct Instance {
 }
 
 impl Instance {
-    fn new(id: Uuid, net: network::Sender, partition: partition::Group) -> Self {
+    fn new(
+        id: Uuid,
+        net: network::Sender,
+        part_group: partition::Group,
+        shutdown: Arc<Shutdown>,
+    ) -> Self {
         let mut members = HashSet::new();
         members.insert(id);
+
         let inner = Arc::new(instance::Inner {
             id,
             net,
-            partition,
+            partition: part_group,
             members: Mutex::new(members),
+            shutdown,
         });
 
         Self { inner }

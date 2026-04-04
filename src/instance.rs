@@ -3,7 +3,8 @@ use std::{
     hash::Hash,
     io,
     marker::PhantomData,
-    sync::{self, Mutex},
+    sync::{self, Arc, Condvar, Mutex},
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -113,15 +114,76 @@ impl Builder<Ready> {
         let d = self.d.expect("Forced to always be filled");
         let c = self.c.expect("Forced to always be filled");
 
-        let (net_sender, net_receiver) = network::handle(id, d, c.network)?;
-        let partition = partition::Group::new(id, self.segments.as_slice());
-        let instance = Instance::new(id, net_sender, partition);
+        let shutdown = Shutdown::new();
 
-        net_receiver.start(instance.downgrade())?;
+        let (net_sender, net_receiver) = network::handle(id, d, Arc::clone(&shutdown), c.network)?;
+        let partition = partition::Group::new(id, self.segments.as_slice());
+        let instance = Instance::new(id, net_sender, partition, Arc::clone(&shutdown));
+
+        shutdown.register(net_receiver.start(instance.downgrade())?);
 
         Ok(instance)
     }
 }
+
+// --- Shutdown ---
+
+pub struct Shutdown {
+    flag: Mutex<bool>,
+    notify: Condvar,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Shutdown {
+    pub fn new() -> Arc<Self> {
+        let self_ = Self {
+            flag: Mutex::new(false),
+            notify: Condvar::new(),
+            handles: Mutex::new(Vec::new()),
+        };
+
+        Arc::new(self_)
+    }
+
+    pub fn register(&self, h: JoinHandle<()>) {
+        self.handles.lock().expect("Cannot be poisoned").push(h);
+    }
+
+    pub fn checkpoint(&self, timeout: Option<Duration>) -> bool {
+        let flag = self.flag.lock().expect("Cannot be poisoned");
+        if *flag {
+            return false;
+        }
+
+        match timeout {
+            Some(val) => match self.notify.wait_timeout(flag, val) {
+                Ok((_, res)) => res.timed_out(),
+                Err(_) => false,
+            },
+            None => true,
+        }
+    }
+
+    pub fn destroy(&self) {
+        {
+            let mut flag = self.flag.lock().expect("Cannot be poisoned");
+            *flag = true;
+        }
+
+        self.notify.notify_all();
+
+        let handles = self
+            .handles
+            .lock()
+            .expect("Cannot be poisoned")
+            .drain(..)
+            .collect::<Vec<_>>();
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
 pub struct Config {
     network: network::Config,
 }
@@ -148,6 +210,13 @@ pub struct Inner {
     pub(crate) net: network::Sender,
     pub(crate) partition: partition::Group,
     pub(crate) members: Mutex<HashSet<Uuid>>,
+    pub(crate) shutdown: Arc<Shutdown>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.shutdown.destroy();
+    }
 }
 
 impl Inner {
@@ -272,20 +341,20 @@ mod tests {
         network::{self, Discovery},
     };
 
-    // #[test]
-    // pub fn should_register_map_successfully() -> io::Result<()> {
-    //     let (instance_1, instance_2) = setup()?;
+    #[test]
+    pub fn should_register_map_successfully() -> io::Result<()> {
+        let (instance_1, instance_2) = setup()?;
 
-    //     assert!(instance_1.get_map::<String, String>("str-str").is_some());
-    //     assert!(instance_2.get_map::<String, String>("str-str").is_some());
+        assert!(instance_1.get_map::<String, String>("str-str").is_some());
+        assert!(instance_2.get_map::<String, String>("str-str").is_some());
 
-    //     assert!(instance_1.get_map::<String, String>("wrong").is_none());
-    //     assert!(instance_2.get_map::<String, String>("wrong").is_none());
+        assert!(instance_1.get_map::<String, String>("wrong").is_none());
+        assert!(instance_2.get_map::<String, String>("wrong").is_none());
 
-    //     assert!(instance_1.get_map::<u64, String>("str-str").is_none());
-    //     assert!(instance_2.get_map::<String, u64>("str-str").is_none());
-    //     Ok(())
-    // }
+        assert!(instance_1.get_map::<u64, String>("str-str").is_none());
+        assert!(instance_2.get_map::<String, u64>("str-str").is_none());
+        Ok(())
+    }
 
     #[test]
     pub fn should_put_and_get_map_successfully() -> io::Result<()> {
