@@ -6,20 +6,22 @@ use std::{
     net::{SocketAddr, TcpStream},
     sync::{
         Arc, Mutex, RwLock, RwLockReadGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
-    u64,
 };
 
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::network::{
-    self, Message,
-    packet::{Event, InboundPacket, PACKET_LENGTH, Packet},
+use crate::{
+    instance::Shutdown,
+    network::{
+        self, Message,
+        packet::{Event, InboundPacket, PACKET_LENGTH, Packet},
+    },
 };
 
 const CONN_STRIPES_LEN: usize = 8;
@@ -45,13 +47,13 @@ impl Limiter {
 }
 
 pub struct Response<'a> {
-    corr_id: u64,
+    corr_id: Uuid,
     reg: &'a Registry,
     receiver: mpsc::Receiver<Packet>,
 }
 
 impl<'a> Response<'a> {
-    fn new(corr_id: u64, reg: &'a Registry, receiver: mpsc::Receiver<Packet>) -> Self {
+    fn new(corr_id: Uuid, reg: &'a Registry, receiver: mpsc::Receiver<Packet>) -> Self {
         Self {
             corr_id,
             reg,
@@ -66,7 +68,7 @@ impl<'a> Response<'a> {
 
 impl Drop for Response<'_> {
     fn drop(&mut self) {
-        self.reg.remove_ack(self.corr_id);
+        self.reg.unregister_ack(self.corr_id);
     }
 }
 
@@ -79,10 +81,10 @@ pub(crate) struct Inner {
     pub(crate) id: Uuid,
     pub(crate) config: network::Config,
     tx_msg: SyncSender<Message>,
-    pub(crate) sigterm: Arc<AtomicBool>,
+    pub(crate) sigterm: Arc<Shutdown>,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
     writers: RwLock<HashMap<Uuid, PeerWrite>>,
-    acks: Mutex<HashMap<u64, SyncSender<Packet>>>,
+    acks: Mutex<HashMap<Uuid, SyncSender<Packet>>>,
     limiter: Limiter,
 }
 
@@ -97,7 +99,7 @@ impl Registry {
         id: Uuid,
         config: network::Config,
         tx_msg: SyncSender<Message>,
-        sigterm: Arc<AtomicBool>,
+        sigterm: Arc<Shutdown>,
     ) -> Self {
         let inner = Arc::new(Inner {
             id,
@@ -149,7 +151,9 @@ impl Registry {
 
                 entry.remove_entry();
             }
-            std::collections::hash_map::Entry::Vacant(_) => {}
+            std::collections::hash_map::Entry::Vacant(_) => {
+                return;
+            }
         }
 
         self.as_ref()
@@ -218,7 +222,16 @@ impl Registry {
                 Packet::WhoIsReply { id } => {
                     let v = w.v;
                     self.register(id, peer_addr, w);
-                    r.start(self.clone(), id, v).map(|_| ())
+                    match r.start(self.clone(), id, v) {
+                        Ok(h) => {
+                            self.as_ref().sigterm.register(h);
+                            Ok(())
+                        }
+                        Err(err) => {
+                            self.unregister(id, v);
+                            Err(err)
+                        }
+                    }
                 }
                 _ => Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -280,8 +293,8 @@ impl Registry {
         f(guard)
     }
 
-    pub(crate) fn register_ack(&self, corr_id: u64) -> Response<'_> {
-        let (tx, rx) = mpsc::sync_channel(0);
+    pub(crate) fn register_ack(&self, corr_id: Uuid) -> Response<'_> {
+        let (tx, rx) = mpsc::sync_channel(1);
         self.as_ref()
             .acks
             .lock()
@@ -291,7 +304,7 @@ impl Registry {
         Response::new(corr_id, self, rx)
     }
 
-    pub(crate) fn remove_ack(&self, corr_id: u64) -> Option<mpsc::SyncSender<Packet>> {
+    pub(crate) fn unregister_ack(&self, corr_id: Uuid) -> Option<mpsc::SyncSender<Packet>> {
         self.as_ref()
             .acks
             .lock()
@@ -373,7 +386,7 @@ impl PeerRead {
                         _ => break,
                     }
 
-                    if registry.as_ref().sigterm.load(Ordering::Acquire) {
+                    if !registry.as_ref().sigterm.checkpoint(None) {
                         break;
                     }
 

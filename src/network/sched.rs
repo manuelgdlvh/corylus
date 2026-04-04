@@ -3,7 +3,6 @@ use std::{
     collections::HashMap,
     io,
     net::TcpListener,
-    sync::atomic::Ordering,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -30,14 +29,13 @@ pub(crate) fn hb(
 
             info!(id = %registry.as_ref().id, "Heartbeat scheduler initialized");
             loop {
-                if registry.as_ref().sigterm.load(Ordering::Acquire) {
-                    break;
-                }
 
                 let rng = rand::rng().random_range(0.75..=1.0);
                 let millis = poll_interval.as_millis() as f64;
                 let jitter = millis * rng;
-                thread::sleep(Duration::from_millis(jitter as u64));
+                if !registry.as_ref().sigterm.checkpoint(Some(Duration::from_millis(jitter as u64))) {
+                    break;
+                }
 
                 match &d {
                     Discovery::Dns { .. } => {
@@ -118,7 +116,7 @@ pub(crate) fn listener(config: network::Config, registry: Registry) -> io::Resul
 
             info!(id = %registry.as_ref().id, "Listener scheduler initialized");
             loop {
-                if registry.as_ref().sigterm.load(Ordering::Acquire) {
+                if !registry.as_ref().sigterm.checkpoint(Some(Duration::from_millis(50))) {
                     break;
                 }
 
@@ -162,12 +160,22 @@ pub(crate) fn listener(config: network::Config, registry: Registry) -> io::Resul
 
                         let v = w.v;
                         registry.register(peer_id, &peer_addr, w);
-                        let _ = r.start(registry.clone(), peer_id, v);
+
+
+                    match r.start(registry.clone(), peer_id, v) {
+                        Ok(h) => {
+                            registry.as_ref().sigterm.register(h);
+                        }
+                        Err(err) => {
+                            registry.unregister(peer_id, v);
+
+                                error!(id = %registry.as_ref().id, err = %err ,"Peer connection accept failed");
+                        }
+                    }
 
                         info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %v, "Peer connection accept successfully");
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(50));
                     }
                     Err(err) => {
                         error!(id = %registry.as_ref().id, err = %err, "Listener threw an error");

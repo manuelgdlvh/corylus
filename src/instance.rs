@@ -1,197 +1,325 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    hash::Hash,
     io,
-    sync::{Arc, Mutex},
+    marker::PhantomData,
+    sync::{self, Arc, Condvar, Mutex},
+    thread::JoinHandle,
+    time::Duration,
 };
 
 use uuid::Uuid;
 
-use crate::{network, partition};
+use crate::{
+    Instance,
+    instance::operation::{Deserializer, Serializer},
+    network::{self, packet::Packet},
+    object::map::{Get, Put},
+    partition::{self, Segment},
+};
 
+pub mod operation;
 pub mod task;
 
-pub struct Config {
-    network: network::Config,
+// --- State markers ---
+
+pub struct NeedsId;
+pub struct NeedsConfig;
+pub struct NeedsDiscovery;
+pub struct Ready;
+
+// --- Builder ---
+
+pub struct Builder<S> {
+    id: Option<Uuid>,
+    c: Option<Config>,
+    d: Option<network::Discovery>,
+    segments: Vec<Box<dyn Fn() -> Segment>>,
+    _state: PhantomData<S>,
 }
 
-pub fn new_instance(id: Uuid, d: network::Discovery, c: Config) -> io::Result<Instance> {
-    let (net_sender, net_receiver) = network::handle(id, d, c.network)?;
-    let partition = partition::Group::new(id);
-    let instance = Instance::new(id, net_sender, partition);
+impl Default for Builder<NeedsId> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    net_receiver.start(instance.clone())?;
+impl Builder<NeedsId> {
+    pub fn new() -> Self {
+        Self {
+            id: None,
+            c: None,
+            d: None,
+            segments: Vec::new(),
+            _state: PhantomData,
+        }
+    }
+    pub fn with_id(self, id: Uuid) -> Builder<NeedsConfig> {
+        Builder {
+            id: Some(id),
+            c: self.c,
+            d: self.d,
+            segments: self.segments,
+            _state: PhantomData,
+        }
+    }
+}
 
-    Ok(instance)
+impl Builder<NeedsConfig> {
+    pub fn with_config(self, c: Config) -> Builder<NeedsDiscovery> {
+        Builder {
+            id: self.id,
+            c: Some(c),
+            d: self.d,
+            segments: self.segments,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl Builder<NeedsDiscovery> {
+    pub fn with_discovery(self, d: network::Discovery) -> Builder<Ready> {
+        Builder {
+            id: self.id,
+            c: self.c,
+            d: Some(d),
+            segments: self.segments,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl Builder<Ready> {
+    pub fn with_map<K, V>(mut self, id: &str) -> Self
+    where
+        K: Serializer + Deserializer + Send + Sync + Hash + Eq + Clone + 'static,
+        V: Serializer + Deserializer + Send + Sync + Clone + 'static,
+    {
+        let id = format!("map:{}", id);
+
+        let op_reg = operation::Registry::new()
+            .with_read_op::<Get<K, V>>()
+            .with_write_op::<Put<K, V>>();
+
+        self.segments.push(Box::new(move || {
+            let data: HashMap<K, V> = HashMap::new();
+            Segment::new(id.to_string(), data, op_reg.clone())
+        }));
+
+        self
+    }
+
+    pub fn build(self) -> io::Result<Instance> {
+        let id = self.id.expect("Forced to always be filled");
+        let d = self.d.expect("Forced to always be filled");
+        let c = self.c.expect("Forced to always be filled");
+
+        let shutdown = Shutdown::new();
+
+        let (net_sender, net_receiver) = network::handle(id, d, Arc::clone(&shutdown), c.network)?;
+        let partition = partition::Group::new(id, self.segments.as_slice());
+        let instance = Instance::new(id, net_sender, partition, Arc::clone(&shutdown));
+
+        shutdown.register(net_receiver.start(instance.downgrade())?);
+
+        Ok(instance)
+    }
+}
+
+// --- Shutdown ---
+
+pub struct Shutdown {
+    flag: Mutex<bool>,
+    notify: Condvar,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Shutdown {
+    pub fn new() -> Arc<Self> {
+        let self_ = Self {
+            flag: Mutex::new(false),
+            notify: Condvar::new(),
+            handles: Mutex::new(Vec::new()),
+        };
+
+        Arc::new(self_)
+    }
+
+    pub fn register(&self, h: JoinHandle<()>) {
+        self.handles.lock().expect("Cannot be poisoned").push(h);
+    }
+
+    pub fn checkpoint(&self, timeout: Option<Duration>) -> bool {
+        let flag = self.flag.lock().expect("Cannot be poisoned");
+        if *flag {
+            return false;
+        }
+
+        match timeout {
+            Some(val) => match self.notify.wait_timeout(flag, val) {
+                Ok((_, res)) => res.timed_out(),
+                Err(_) => false,
+            },
+            None => true,
+        }
+    }
+
+    pub fn destroy(&self) {
+        {
+            let mut flag = self.flag.lock().expect("Cannot be poisoned");
+            *flag = true;
+        }
+
+        self.notify.notify_all();
+
+        let handles = self
+            .handles
+            .lock()
+            .expect("Cannot be poisoned")
+            .drain(..)
+            .collect::<Vec<_>>();
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
+pub struct Config {
+    pub network: network::Config,
 }
 
 #[derive(Clone)]
-pub struct Instance {
-    inner: Arc<Inner>,
+pub struct Weak {
+    inner: sync::Weak<Inner>,
 }
 
-impl Instance {
-    pub fn new(id: Uuid, net: network::Sender, partition: partition::Group) -> Self {
-        let mut members = HashSet::new();
-        members.insert(id);
-        let inner = Arc::new(Inner {
-            id,
-            net,
-            partition,
-            members: Mutex::new(members),
-        });
-
+impl Weak {
+    pub fn new(inner: sync::Weak<Inner>) -> Self {
         Self { inner }
     }
-    pub fn remove_member(&self, id: Uuid) {
-        let mut members = self.as_ref().members.lock().expect("Cannot be poisoned");
+}
+
+impl AsRef<sync::Weak<Inner>> for Weak {
+    fn as_ref(&self) -> &sync::Weak<Inner> {
+        &self.inner
+    }
+}
+
+pub struct Inner {
+    pub(crate) id: Uuid,
+    pub(crate) net: network::Sender,
+    pub(crate) part_group: partition::Group,
+    pub(crate) members: Mutex<HashSet<Uuid>>,
+    pub(crate) shutdown: Arc<Shutdown>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.shutdown.destroy();
+    }
+}
+
+impl Inner {
+    pub(crate) fn remove_member(&self, id: Uuid) {
+        let mut members = self.members.lock().expect("Cannot be poisoned");
         members.remove(&id);
     }
 
-    pub fn add_member(&self, id: Uuid) {
-        let mut members = self.as_ref().members.lock().expect("Cannot be poisoned");
+    pub(crate) fn add_member(&self, id: Uuid) {
+        let mut members = self.members.lock().expect("Cannot be poisoned");
         members.insert(id);
     }
 
-    pub fn members(&self) -> Vec<Uuid> {
-        self.inner
-            .members
+    pub(crate) fn members(&self) -> Vec<Uuid> {
+        self.members
             .lock()
             .expect("Cannot be poisoned")
             .iter()
             .copied()
             .collect()
     }
-}
 
-pub(crate) struct Inner {
-    pub(crate) id: Uuid,
-    pub(crate) net: network::Sender,
-    partition: partition::Group,
-    members: Mutex<HashSet<Uuid>>,
-}
+    pub(crate) fn write<O: operation::Write>(&self, s_id: &str, mut op: O) -> io::Result<()> {
+        let key = op.partition_key();
+        let p_id = self.part_group.partition_of(&key);
+        let owner = self.part_group.owner_of(p_id);
 
-impl AsRef<Inner> for Instance {
-    fn as_ref(&self) -> &Inner {
-        &self.inner
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        io,
-        net::{Ipv4Addr, SocketAddr},
-        thread::sleep,
-        time::{Duration, Instant},
-    };
-
-    use tracing_subscriber::FmtSubscriber;
-    use uuid::Uuid;
-
-    use crate::{
-        instance::{Config, Instance, new_instance},
-        network::{self, Discovery, packet::Packet},
-    };
-
-    #[test]
-    pub fn should_recv_response_when_sync_send() -> io::Result<()> {
-        let (instance_1, instance_2) = setup()?;
-
-        let response = instance_1.as_ref().net.sync_send(
-            Uuid::from_u128(2),
-            Packet::NoOp { corr_id: 1 },
-            None,
-        )?;
-
-        assert!(matches!(
-            response.get(Duration::from_secs(1)),
-            Ok(Packet::NoOpReply { corr_id: 1 })
-        ));
-        Ok(())
-    }
-
-    fn setup() -> io::Result<(Instance, Instance)> {
-        let subscriber = FmtSubscriber::new();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-
-        let id_1 = Uuid::from_u128(1);
-        let id_2 = Uuid::from_u128(2);
-
-        let config_1 = Config {
-            network: network::Config {
-                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                hb: network::HeartbeatConfig {
-                    poll_interval: Duration::from_secs(1),
-                    tolerance: Duration::from_secs(3),
+        if self.id.eq(&owner) {
+            self.part_group
+                .with_segment_write(p_id as usize, s_id, |segment| {
+                    op.execute(&mut *segment.data);
+                })
+                .expect("As internal operation, partition and segment must always exist");
+            Ok(())
+        } else {
+            let raw_op = op.serialize();
+            let response = self.net.sync_send(
+                owner,
+                network::packet::Packet::WriteOp {
+                    corr_id: Uuid::new_v4(),
+                    partition_id: p_id as u16,
+                    segment_id: s_id.to_string(),
+                    op_id: op.id().to_string(),
+                    raw_op,
                 },
-                ..Default::default()
-            },
-        };
+                None,
+            )?;
 
-        let config_2 = Config {
-            network: network::Config {
-                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-                hb: network::HeartbeatConfig {
-                    poll_interval: Duration::from_secs(1),
-                    tolerance: Duration::from_secs(3),
-                },
-                ..Default::default()
-            },
-        };
-
-        let instance_1 = new_instance(
-            id_1,
-            Discovery::List {
-                addresses: vec![
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-                ],
-            },
-            config_1,
-        )?;
-
-        let instance_2 = new_instance(
-            id_2,
-            Discovery::List {
-                addresses: vec![
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-                ],
-            },
-            config_2,
-        )?;
-
-        wait_until(
-            || instance_1.members().iter().any(|id| id.eq(&id_2)),
-            Duration::from_millis(100),
-            Duration::from_secs(5),
-        );
-
-        wait_until(
-            || instance_2.members().iter().any(|id| id.eq(&id_1)),
-            Duration::from_millis(100),
-            Duration::from_secs(5),
-        );
-
-        Ok((instance_1, instance_2))
+            if let Ok(packet) = response.get(Duration::from_secs(1)) {
+                match packet {
+                    Packet::WriteOpReply { ok, .. } => {
+                        if ok {
+                            Ok(())
+                        } else {
+                            Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input"))
+                        }
+                    }
+                    _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")),
+                }
+            } else {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
+            }
+        }
     }
 
-    pub fn wait_until<F>(f: F, poll_interval: Duration, timeout: Duration)
-    where
-        F: Fn() -> bool,
-    {
-        let start = Instant::now();
+    pub(crate) fn read<O: operation::Read>(&self, s_id: &str, op: O) -> io::Result<Vec<u8>> {
+        let key = op.partition_key();
+        let p_id = self.part_group.partition_of(&key);
+        let owner = self.part_group.owner_of(p_id);
+        if self.id.eq(&owner) {
+            let result = self
+                .part_group
+                .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
+                .expect("As internal operation, partition and segment must always exist");
+            Ok(result)
+        } else {
+            let raw_op = op.serialize();
+            let response = self.net.sync_send(
+                owner,
+                network::packet::Packet::GetOp {
+                    corr_id: Uuid::new_v4(),
+                    partition_id: p_id as u16,
+                    segment_id: s_id.to_string(),
+                    op_id: op.id().to_string(),
+                    raw_op,
+                },
+                None,
+            )?;
 
-        loop {
-            if f() {
-                return;
+            if let Ok(packet) = response.get(Duration::from_secs(1)) {
+                match packet {
+                    Packet::GetOpReply { ok, result, .. } => {
+                        if ok {
+                            Ok(result)
+                        } else {
+                            Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input"))
+                        }
+                    }
+                    _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")),
+                }
+            } else {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
             }
-
-            if start.elapsed() >= timeout {
-                assert!(false, "Max wait time to be ready elapsed")
-            }
-
-            sleep(poll_interval);
         }
     }
 }

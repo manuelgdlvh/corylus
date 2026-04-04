@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, u64};
+use std::net::SocketAddr;
 
 use uuid::Uuid;
 
@@ -23,11 +23,39 @@ impl InboundPacket {
 // Request packets
 #[derive(Debug, Eq, PartialEq)]
 pub enum Packet {
-    WhoIs { id: Uuid, addr: SocketAddr },
-    WhoIsReply { id: Uuid },
+    WhoIs {
+        id: Uuid,
+        addr: SocketAddr,
+    },
+    WhoIsReply {
+        id: Uuid,
+    },
     HeartBeat,
-    NoOp { corr_id: u64 },
-    NoOpReply { corr_id: u64 },
+    WriteOp {
+        corr_id: Uuid,
+        // Just to check inconsistences in the partition tables to reject
+        partition_id: u16,
+        segment_id: String,
+        op_id: String,
+        raw_op: Vec<u8>,
+    },
+    WriteOpReply {
+        corr_id: Uuid,
+        ok: bool,
+    },
+    GetOp {
+        corr_id: Uuid,
+        // Just to check inconsistences in the partition tables to reject
+        partition_id: u16,
+        segment_id: String,
+        op_id: String,
+        raw_op: Vec<u8>,
+    },
+    GetOpReply {
+        corr_id: Uuid,
+        ok: bool,
+        result: Vec<u8>,
+    },
 }
 
 pub(crate) const DISCRIMINANT: usize = 1;
@@ -39,25 +67,44 @@ impl Packet {
             Self::WhoIs { .. } => 1,
             Self::WhoIsReply { .. } => 2,
             Self::HeartBeat => 3,
-            Self::NoOp { .. } => 4,
-            Self::NoOpReply { .. } => 5,
+            Self::WriteOp { .. } => 6,
+            Self::WriteOpReply { .. } => 7,
+            Self::GetOp { .. } => 8,
+            Self::GetOpReply { .. } => 9,
         }
     }
 
-    pub fn is_request(&self) -> bool {
+    pub fn is_read(&self) -> bool {
         match self {
             Self::WhoIs { .. }
             | Self::WhoIsReply { .. }
             | Self::HeartBeat
-            | Self::NoOpReply { .. } => false,
-            Self::NoOp { .. } => true,
+            | Self::GetOpReply { .. }
+            | Self::WriteOpReply { .. }
+            | Self::WriteOp { .. } => false,
+            Self::GetOp { .. } => true,
         }
     }
 
-    pub fn correlation_id(&self) -> Option<u64> {
+    pub fn is_write(&self) -> bool {
+        match self {
+            Self::WhoIs { .. }
+            | Self::WhoIsReply { .. }
+            | Self::HeartBeat
+            | Self::GetOpReply { .. }
+            | Self::WriteOpReply { .. }
+            | Self::GetOp { .. } => false,
+            Self::WriteOp { .. } => true,
+        }
+    }
+
+    pub fn correlation_id(&self) -> Option<Uuid> {
         match self {
             Self::WhoIs { .. } | Self::WhoIsReply { .. } | Self::HeartBeat => None,
-            Self::NoOp { corr_id } | Self::NoOpReply { corr_id } => Some(*corr_id),
+            Self::GetOp { corr_id, .. }
+            | Self::GetOpReply { corr_id, .. }
+            | Self::WriteOp { corr_id, .. }
+            | Self::WriteOpReply { corr_id, .. } => Some(*corr_id),
         }
     }
 
@@ -66,8 +113,10 @@ impl Packet {
             1 => None,
             2 => Some(16),
             3 => Some(0),
-            4 => Some(8),
-            5 => Some(8),
+            6 => None,
+            7 => Some(17),
+            8 => None,
+            9 => None,
             _ => None,
         }
     }
@@ -102,11 +151,67 @@ impl From<&Packet> for Vec<u8> {
                 buffer.extend_from_slice(id.as_bytes());
             }
             Packet::HeartBeat => {}
-            Packet::NoOp { corr_id } => {
-                buffer.extend_from_slice(corr_id.to_le_bytes().as_slice());
+            Packet::WriteOp {
+                corr_id,
+                partition_id,
+                segment_id,
+                op_id,
+                raw_op,
+            } => {
+                buffer.extend_from_slice(corr_id.as_bytes());
+                buffer.extend_from_slice(partition_id.to_le_bytes().as_slice());
+
+                let segment_id_len: u16 = segment_id.len() as u16;
+                buffer.extend_from_slice(segment_id_len.to_le_bytes().as_slice());
+                buffer.extend_from_slice(segment_id.as_bytes());
+
+                let op_id_len: u16 = op_id.len() as u16;
+                buffer.extend_from_slice(op_id_len.to_le_bytes().as_slice());
+                buffer.extend_from_slice(op_id.as_bytes());
+
+                if !raw_op.is_empty() {
+                    buffer.extend_from_slice(raw_op.as_slice());
+                }
             }
-            Packet::NoOpReply { corr_id } => {
-                buffer.extend_from_slice(corr_id.to_le_bytes().as_slice());
+            Packet::WriteOpReply { corr_id, ok } => {
+                buffer.extend_from_slice(corr_id.as_bytes().as_slice());
+                buffer.push(*ok as u8);
+            }
+
+            Packet::GetOp {
+                corr_id,
+                partition_id,
+                segment_id,
+                op_id,
+                raw_op,
+            } => {
+                buffer.extend_from_slice(corr_id.as_bytes().as_slice());
+                buffer.extend_from_slice(partition_id.to_le_bytes().as_slice());
+
+                let segment_id_len: u16 = segment_id.len() as u16;
+                buffer.extend_from_slice(segment_id_len.to_le_bytes().as_slice());
+                buffer.extend_from_slice(segment_id.as_bytes());
+
+                let op_id_len: u16 = op_id.len() as u16;
+                buffer.extend_from_slice(op_id_len.to_le_bytes().as_slice());
+                buffer.extend_from_slice(op_id.as_bytes());
+
+                if !raw_op.is_empty() {
+                    buffer.extend_from_slice(raw_op.as_slice());
+                }
+            }
+
+            Packet::GetOpReply {
+                corr_id,
+                ok,
+                result,
+            } => {
+                buffer.extend_from_slice(corr_id.as_bytes().as_slice());
+                buffer.push(*ok as u8);
+
+                if !result.is_empty() {
+                    buffer.extend_from_slice(result.as_slice());
+                }
             }
         }
 
@@ -136,16 +241,139 @@ impl From<&[u8]> for Packet {
                 id: Uuid::from_slice(&value[1..]).unwrap(),
             },
             3 => Packet::HeartBeat,
-            4 => {
-                let buff: [u8; 8] = value[1..].try_into().unwrap();
-                Packet::NoOp {
-                    corr_id: u64::from_le_bytes(buff),
+            6 => {
+                let mut offset = 1;
+
+                // corr_id (Uuid)
+                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
+                offset += 16;
+
+                // partition_id (u16)
+                let partition_id =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+                offset += 2;
+
+                // segment_id length
+                let segment_id_len =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2;
+
+                // segment_id bytes
+                let segment_id = std::str::from_utf8(&value[offset..offset + segment_id_len])
+                    .unwrap()
+                    .to_string();
+
+                offset += segment_id_len;
+
+                // op_id length
+                let op_id_len =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2;
+
+                // op_id bytes
+                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len])
+                    .unwrap()
+                    .to_string();
+
+                offset += op_id_len;
+
+                // raw_op (no extra extend needed)
+                let raw_op = if offset >= value.len() {
+                    vec![]
+                } else {
+                    value[offset..].to_vec()
+                };
+
+                Packet::WriteOp {
+                    corr_id,
+                    partition_id,
+                    segment_id,
+                    op_id,
+                    raw_op,
                 }
             }
-            5 => {
-                let buff: [u8; 8] = value[1..].try_into().unwrap();
-                Packet::NoOpReply {
-                    corr_id: u64::from_le_bytes(buff),
+            7 => {
+                let mut offset = 1;
+
+                // corr_id (Uuid)
+                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
+                offset += 16;
+
+                let ok = !matches!(value[offset], 0);
+
+                Packet::WriteOpReply { corr_id, ok }
+            }
+            8 => {
+                let mut offset = 1;
+
+                // corr_id (Uuid)
+                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
+                offset += 16;
+
+                // partition_id (u16)
+                let partition_id =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+                offset += 2;
+
+                // segment_id length
+                let segment_id_len =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2;
+
+                // segment_id bytes
+                let segment_id = std::str::from_utf8(&value[offset..offset + segment_id_len])
+                    .unwrap()
+                    .to_string();
+
+                offset += segment_id_len;
+
+                // op_id length
+                let op_id_len =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2;
+
+                // op_id bytes
+                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len])
+                    .unwrap()
+                    .to_string();
+
+                offset += op_id_len;
+
+                // raw_op (no extra extend needed)
+                let raw_op = if offset >= value.len() {
+                    vec![]
+                } else {
+                    value[offset..].to_vec()
+                };
+
+                Packet::GetOp {
+                    corr_id,
+                    partition_id,
+                    segment_id,
+                    op_id,
+                    raw_op,
+                }
+            }
+            9 => {
+                let mut offset = 1;
+
+                // corr_id (Uuid)
+                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
+                offset += 16;
+
+                let ok = !matches!(value[offset], 0);
+                offset += 1;
+
+                let result = if offset >= value.len() {
+                    vec![]
+                } else {
+                    value[offset..].to_vec()
+                };
+
+                Packet::GetOpReply {
+                    corr_id,
+                    ok,
+                    result,
                 }
             }
             _ => {
