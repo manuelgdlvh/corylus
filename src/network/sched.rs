@@ -12,7 +12,7 @@ use tracing::{error, info};
 
 use crate::network::{
     self, Discovery,
-    packet::Packet,
+    packet::{self, Packet},
     registry::{PeerRead, PeerWrite, Registry},
 };
 
@@ -58,7 +58,8 @@ pub(crate) fn hb(
                     let (v, reconnect) = registry.with_writers_read(|writers| {
                         let writer = writers.get(id).expect("Checked existence before");
                         let reconnect =
-                            match writer.write(&Packet::HeartBeat, Some(config.timeout.write)) {
+                            match writer.write(&Packet::Request(packet::Request::Write(packet::Write::HeartBeat))
+                                , Some(config.timeout.write)) {
                                 Err(err)
                                     if matches!(
                                         err.kind(),
@@ -141,26 +142,19 @@ pub(crate) fn listener(config: network::Config, registry: Registry) -> io::Resul
                             }
                         };
 
-                        let (peer_id, peer_addr) = match who_is_req {
-                            Packet::WhoIs { id, addr } => (id, addr),
-                            _ => {
-                                continue;
-                            }
+                        let (peer_id, peer_addr) =match who_is_req {
+                             Packet::Request(packet::Request::Read(packet::Read::WhoIs { id, addr })) => (id, addr),
+                            _ => continue,
                         };
 
-                        if let Err(err) = w.write(
-                            &Packet::WhoIsReply {
-                                id: registry.as_ref().id,
-                            },
-                            Some(config.timeout.write)) {
-                            error!(id = %registry.as_ref().id, peer_id = %peer_id, err = %err ,"Peer connection accept failed sending own identity");
+                        if let Err(err) = w.write(&Packet::Reply(packet::Reply::WhoIs {id: registry.as_ref().id,})
+                            ,Some(config.timeout.write),) {
+                            error!(id = %registry.as_ref().id, peer_id = %peer_id, err = %err, "Peer connection accept failed sending own identity");
                             continue;
                         }
 
-
                         let v = w.v;
                         registry.register(peer_id, &peer_addr, w);
-
 
                     match r.start(registry.clone(), peer_id, v) {
                         Ok(h) => {

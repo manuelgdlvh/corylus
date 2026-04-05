@@ -20,7 +20,7 @@ use crate::{
     instance::Shutdown,
     network::{
         self, Message,
-        packet::{Event, InboundPacket, PACKET_LENGTH, Packet},
+        packet::{self, Event, InboundPacket, PACKET_LENGTH, Packet},
     },
 };
 
@@ -210,16 +210,17 @@ impl Registry {
                 TcpStream::connect_timeout(peer_addr, self.as_ref().config.timeout.connect)?;
             let mut r = PeerRead::new(stream.try_clone()?);
             let w = PeerWrite::new(stream);
+
             w.write(
-                &Packet::WhoIs {
+                &Packet::Request(packet::Request::Read(packet::Read::WhoIs {
                     id: self.as_ref().id,
                     addr: self.as_ref().config.addr,
-                },
+                })),
                 Some(self.as_ref().config.timeout.write),
             )?;
 
             match r.read(Some(self.as_ref().config.timeout.read))? {
-                Packet::WhoIsReply { id } => {
+                Packet::Reply(packet::Reply::WhoIs { id }) => {
                     let v = w.v;
                     self.register(id, peer_addr, w);
                     match r.start(self.clone(), id, v) {
@@ -235,7 +236,7 @@ impl Registry {
                 }
                 _ => Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    "Who Is reply don't received",
+                    "Who Is reply not received",
                 )),
             }
         })
@@ -393,7 +394,7 @@ impl PeerRead {
                     match self.read(Some(registry.as_ref().config.timeout.read)) {
                         Ok(packet) => {
                             let kind = packet.kind();
-                            if matches!(packet, Packet::HeartBeat) {
+                            if matches!(packet, Packet::Request(packet::Request::Write(packet::Write::HeartBeat))) {
                                 info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "Heartbeat packet received");
                                 registry.update_hb(peer_id);
                             } else if let Err(err) =

@@ -13,7 +13,10 @@ use uuid::Uuid;
 use crate::{
     Instance,
     instance::operation::{Deserializer, Serializer},
-    network::{self, packet::Packet},
+    network::{
+        self,
+        packet::{self, Packet},
+    },
     object::map::{Get, Put},
     partition::{self, Segment},
 };
@@ -140,6 +143,12 @@ mod shutdown {
         handles: Mutex<Vec<JoinHandle<()>>>,
     }
 
+    impl Default for Inner {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl Inner {
         pub fn new() -> Self {
             Self {
@@ -163,7 +172,7 @@ mod shutdown {
             F: FnOnce(&mut Vec<JoinHandle<()>>) -> O,
         {
             let mut handles = self.handles.lock().expect("Cannot be poisoned");
-            f(&mut *handles)
+            f(&mut handles)
         }
 
         pub fn checkpoint(&self, timeout: Option<Duration>) -> bool {
@@ -198,6 +207,12 @@ impl AsRef<shutdown::Inner> for Shutdown {
     }
 }
 
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Shutdown {
     pub fn new() -> Self {
         Self {
@@ -219,9 +234,7 @@ impl Shutdown {
         self.as_ref().set_flag(true);
         self.as_ref().notify_all();
 
-        let handles = self
-            .as_ref()
-            .with_handles_write(|handles| handles.drain(..).collect::<Vec<_>>());
+        let handles = self.as_ref().with_handles_write(std::mem::take);
         for h in handles {
             let _ = h.join();
         }
@@ -299,30 +312,29 @@ impl Inner {
             let raw_op = op.serialize();
             let response = self.net.sync_send(
                 owner,
-                network::packet::Packet::WriteOp {
+                Packet::Request(packet::Request::Write(packet::Write::WriteOp {
                     corr_id: Uuid::new_v4(),
                     partition_id: p_id as u16,
                     segment_id: s_id.to_string(),
                     op_id: op.id().to_string(),
                     raw_op,
-                },
+                })),
                 None,
             )?;
 
-            if let Ok(packet) = response.get(Duration::from_secs(1)) {
-                match packet {
-                    Packet::WriteOpReply { ok, .. } => {
-                        if ok {
-                            Ok(())
-                        } else {
-                            Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input"))
-                        }
+            response
+                .get(Duration::from_secs(1))
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
+                .and_then(|packet| match packet {
+                    Packet::Reply(packet::Reply::WriteOp { ok, .. }) => {
+                        ok.then_some(()).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "Invalid input")
+                        })
                     }
-                    _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")),
-                }
-            } else {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
-            }
+                    Packet::Reply(_) | Packet::Request(_) => {
+                        Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data"))
+                    }
+                })
         }
     }
 
@@ -340,30 +352,29 @@ impl Inner {
             let raw_op = op.serialize();
             let response = self.net.sync_send(
                 owner,
-                network::packet::Packet::GetOp {
+                Packet::Request(packet::Request::Read(packet::Read::GetOp {
                     corr_id: Uuid::new_v4(),
                     partition_id: p_id as u16,
                     segment_id: s_id.to_string(),
                     op_id: op.id().to_string(),
                     raw_op,
-                },
+                })),
                 None,
             )?;
 
-            if let Ok(packet) = response.get(Duration::from_secs(1)) {
-                match packet {
-                    Packet::GetOpReply { ok, result, .. } => {
-                        if ok {
-                            Ok(result)
-                        } else {
-                            Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input"))
-                        }
+            response
+                .get(Duration::from_secs(1))
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
+                .and_then(|packet| match packet {
+                    Packet::Reply(packet::Reply::GetOp { ok, result, .. }) => {
+                        ok.then_some(result).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "Invalid input")
+                        })
                     }
-                    _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")),
-                }
-            } else {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
-            }
+                    Packet::Reply(_) | Packet::Request(_) => {
+                        Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data"))
+                    }
+                })
         }
     }
 }

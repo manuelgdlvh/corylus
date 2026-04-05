@@ -167,32 +167,35 @@ impl Receiver {
 
                     if let Some(message) = self.recv(Some(Duration::from_secs(1))) {
                         match message {
-                            Message::Packet { val } => {
-                                if val.p.is_read() {
-                                    task_executor
-                                        .spawn(instance.clone(), Task::Read { packet: val });
-                                } else if val.p.is_write() {
-                                    task_executor
-                                        .spawn(instance.clone(), Task::Write { packet: val });
-                                } else {
-                                    match val.p {
-                                        Packet::WhoIs { .. }
-                                        | Packet::WhoIsReply { .. }
-                                        | Packet::HeartBeat
-                                        | Packet::WriteOp { .. }
-                                        | Packet::GetOp { .. } => {}
-
-                                        Packet::WriteOpReply { corr_id, .. }
-                                        | Packet::GetOpReply { corr_id, .. } => {
-                                            if let Some(entry) =
-                                                self.registry.unregister_ack(corr_id)
-                                            {
-                                                let _ = entry.try_send(val.p);
-                                            }
-                                        }
+                            Message::Packet { val } => match val.p {
+                                Packet::Request(req) => match req {
+                                    packet::Request::Read(r) => {
+                                        task_executor.spawn(
+                                            instance.clone(),
+                                            Task::Read {
+                                                from: val.from,
+                                                packet: r,
+                                            },
+                                        );
+                                    }
+                                    packet::Request::Write(w) => {
+                                        task_executor.spawn(
+                                            instance.clone(),
+                                            Task::Write {
+                                                from: val.from,
+                                                packet: w,
+                                            },
+                                        );
+                                    }
+                                },
+                                Packet::Reply(_) => {
+                                    if let Some(corr_id) = val.p.correlation_id()
+                                        && let Some(entry) = self.registry.unregister_ack(corr_id)
+                                    {
+                                        let _ = entry.try_send(val.p);
                                     }
                                 }
-                            }
+                            },
                             Message::Event { val } => match val {
                                 Event::PeerAdded { id } => {
                                     if let Some(ref_) = instance.as_ref().upgrade() {
