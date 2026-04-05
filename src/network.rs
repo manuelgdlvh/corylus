@@ -1,10 +1,7 @@
 use std::{
     io::{self},
     net::{Ipv4Addr, SocketAddr},
-    sync::{
-        Arc,
-        mpsc::{self},
-    },
+    sync::mpsc::{self},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -275,12 +272,12 @@ impl Default for HeartbeatConfig {
 pub fn handle(
     id: Uuid,
     d: Discovery,
-    shutdown: Arc<Shutdown>,
+    shutdown: Shutdown,
     c: network::Config,
 ) -> io::Result<(Sender, Receiver)> {
     let (tx_msg, rx_msg) = mpsc::sync_channel(c.msg_buf_len);
 
-    let registry = Registry::new(id, c, tx_msg, Arc::clone(&shutdown));
+    let registry = Registry::new(id, c, tx_msg, shutdown.clone());
 
     shutdown.register(sched::listener(c, registry.clone())?);
     shutdown.register(sched::hb(c, d, registry.clone())?);

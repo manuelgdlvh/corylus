@@ -29,7 +29,7 @@ impl Instance {
         id: Uuid,
         net: network::Sender,
         part_group: partition::Group,
-        shutdown: Arc<Shutdown>,
+        shutdown: Shutdown,
     ) -> Self {
         let mut members = HashSet::new();
         members.insert(id);

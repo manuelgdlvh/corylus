@@ -3,7 +3,7 @@ use std::{
     hash::Hash,
     io,
     marker::PhantomData,
-    sync::{self, Arc, Condvar, Mutex},
+    sync::{self, Arc, Mutex},
     thread::JoinHandle,
     time::Duration,
 };
@@ -116,9 +116,9 @@ impl Builder<Ready> {
 
         let shutdown = Shutdown::new();
 
-        let (net_sender, net_receiver) = network::handle(id, d, Arc::clone(&shutdown), c.network)?;
+        let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
         let partition = partition::Group::new(id, self.segments.as_slice());
-        let instance = Instance::new(id, net_sender, partition, Arc::clone(&shutdown));
+        let instance = Instance::new(id, net_sender, partition, shutdown.clone());
 
         shutdown.register(net_receiver.start(instance.downgrade())?);
 
@@ -127,57 +127,101 @@ impl Builder<Ready> {
 }
 
 // --- Shutdown ---
+mod shutdown {
+    use std::{
+        sync::{Condvar, Mutex},
+        thread::JoinHandle,
+        time::Duration,
+    };
 
+    pub struct Inner {
+        flag: Mutex<bool>,
+        notify: Condvar,
+        handles: Mutex<Vec<JoinHandle<()>>>,
+    }
+
+    impl Inner {
+        pub fn new() -> Self {
+            Self {
+                flag: Mutex::new(false),
+                notify: Condvar::new(),
+                handles: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn set_flag(&self, val: bool) {
+            let mut flag = self.flag.lock().expect("Cannot be poisoned");
+            *flag = val;
+        }
+
+        pub fn flag(&self) -> bool {
+            *self.flag.lock().expect("Cannot be poisoned")
+        }
+
+        pub fn with_handles_write<F, O>(&self, f: F) -> O
+        where
+            F: FnOnce(&mut Vec<JoinHandle<()>>) -> O,
+        {
+            let mut handles = self.handles.lock().expect("Cannot be poisoned");
+            f(&mut *handles)
+        }
+
+        pub fn checkpoint(&self, timeout: Option<Duration>) -> bool {
+            let flag = self.flag.lock().expect("Cannot be poisoned");
+            if *flag {
+                return false;
+            }
+
+            match timeout {
+                Some(val) => match self.notify.wait_timeout(flag, val) {
+                    Ok((_, res)) => res.timed_out(),
+                    Err(_) => false,
+                },
+                None => true,
+            }
+        }
+
+        pub fn notify_all(&self) {
+            self.notify.notify_all();
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Shutdown {
-    flag: Mutex<bool>,
-    notify: Condvar,
-    handles: Mutex<Vec<JoinHandle<()>>>,
+    inner: Arc<shutdown::Inner>,
+}
+
+impl AsRef<shutdown::Inner> for Shutdown {
+    fn as_ref(&self) -> &shutdown::Inner {
+        &self.inner
+    }
 }
 
 impl Shutdown {
-    pub fn new() -> Arc<Self> {
-        let self_ = Self {
-            flag: Mutex::new(false),
-            notify: Condvar::new(),
-            handles: Mutex::new(Vec::new()),
-        };
-
-        Arc::new(self_)
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(shutdown::Inner::new()),
+        }
     }
 
     pub fn register(&self, h: JoinHandle<()>) {
-        self.handles.lock().expect("Cannot be poisoned").push(h);
+        self.as_ref().with_handles_write(|handles| {
+            handles.push(h);
+        })
     }
 
     pub fn checkpoint(&self, timeout: Option<Duration>) -> bool {
-        let flag = self.flag.lock().expect("Cannot be poisoned");
-        if *flag {
-            return false;
-        }
-
-        match timeout {
-            Some(val) => match self.notify.wait_timeout(flag, val) {
-                Ok((_, res)) => res.timed_out(),
-                Err(_) => false,
-            },
-            None => true,
-        }
+        self.as_ref().checkpoint(timeout)
     }
 
     pub fn destroy(&self) {
-        {
-            let mut flag = self.flag.lock().expect("Cannot be poisoned");
-            *flag = true;
-        }
-
-        self.notify.notify_all();
+        self.as_ref().set_flag(true);
+        self.as_ref().notify_all();
 
         let handles = self
-            .handles
-            .lock()
-            .expect("Cannot be poisoned")
-            .drain(..)
-            .collect::<Vec<_>>();
+            .as_ref()
+            .with_handles_write(|handles| handles.drain(..).collect::<Vec<_>>());
         for h in handles {
             let _ = h.join();
         }
@@ -210,7 +254,7 @@ pub struct Inner {
     pub(crate) net: network::Sender,
     pub(crate) part_group: partition::Group,
     pub(crate) members: Mutex<HashSet<Uuid>>,
-    pub(crate) shutdown: Arc<Shutdown>,
+    pub(crate) shutdown: Shutdown,
 }
 
 impl Drop for Inner {

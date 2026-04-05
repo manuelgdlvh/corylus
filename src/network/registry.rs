@@ -81,7 +81,7 @@ pub(crate) struct Inner {
     pub(crate) id: Uuid,
     pub(crate) config: network::Config,
     tx_msg: SyncSender<Message>,
-    pub(crate) sigterm: Arc<Shutdown>,
+    pub(crate) sigterm: Shutdown,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
     writers: RwLock<HashMap<Uuid, PeerWrite>>,
     acks: Mutex<HashMap<Uuid, SyncSender<Packet>>>,
@@ -99,7 +99,7 @@ impl Registry {
         id: Uuid,
         config: network::Config,
         tx_msg: SyncSender<Message>,
-        sigterm: Arc<Shutdown>,
+        sigterm: Shutdown,
     ) -> Self {
         let inner = Arc::new(Inner {
             id,
