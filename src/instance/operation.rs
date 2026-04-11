@@ -3,7 +3,7 @@ use std::{collections::HashMap, io, sync::Arc};
 use crate::partition;
 
 #[derive(thiserror::Error, Debug)]
-pub enum DeserializeError {
+pub enum Error {
     #[error("Invalid buffer size: expected {expected} bytes, got {got}")]
     InvalidBufferSize { expected: usize, got: usize },
     #[error("Invalid UTF-8: {0}")]
@@ -17,8 +17,7 @@ pub trait Serializer {
 }
 
 pub trait Deserializer: Sized {
-    type Error: std::error::Error + Send + Sync + 'static;
-    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error>;
+    fn deserialize(buffer: &[u8]) -> Result<Self, Error>;
 }
 
 pub trait Base: Serializer {

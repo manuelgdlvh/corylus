@@ -1,5 +1,4 @@
 use std::{
-    io,
     net::{Ipv4Addr, SocketAddr},
     sync::Mutex,
     thread::sleep,
@@ -7,8 +6,9 @@ use std::{
 };
 
 use corylus::{
-    Instance, instance,
+    CorylusResult, Instance, instance,
     network::{self, Discovery},
+    partition,
 };
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
@@ -17,7 +17,7 @@ mod map;
 
 pub static WITH_INSTANCES_LOCK: Mutex<()> = Mutex::new(());
 
-fn with_instances<F: FnOnce(Instance, Instance) -> io::Result<()>>(f: F) -> io::Result<()> {
+fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(f: F) -> CorylusResult<()> {
     let _guard = WITH_INSTANCES_LOCK.lock();
 
     let subscriber = FmtSubscriber::new();
@@ -25,6 +25,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> io::Result<()>>(f: F) -> io::
 
     let id_1 = Uuid::from_u128(1);
     let id_2 = Uuid::from_u128(2);
+    let version = partition::Group::compute_version(&[id_1, id_2]);
 
     let instance_1 = instance::Builder::new()
         .with_id(Uuid::from_u128(1))
@@ -71,7 +72,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> io::Result<()>>(f: F) -> io::
     wait_until(
         || {
             instance_1.members().iter().any(|id| id.eq(&id_2))
-                && instance_1.part_group_version() == 1
+                && instance_1.part_group_version() == version
         },
         Duration::from_millis(100),
         Duration::from_secs(5),
@@ -80,7 +81,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> io::Result<()>>(f: F) -> io::
     wait_until(
         || {
             instance_2.members().iter().any(|id| id.eq(&id_1))
-                && instance_2.part_group_version() == 1
+                && instance_2.part_group_version() == version
         },
         Duration::from_millis(100),
         Duration::from_secs(5),
@@ -110,16 +111,17 @@ where
 
 mod tests {
     mod map {
-        use std::io;
+
+        use corylus::CorylusResult;
 
         use crate::{map, with_instances};
         #[test]
-        pub fn should_register_map_successfully() -> io::Result<()> {
+        pub fn should_register_map_successfully() -> CorylusResult<()> {
             with_instances(map::should_register_map_successfully)
         }
 
         #[test]
-        pub fn should_put_and_get_map_successfully() -> io::Result<()> {
+        pub fn should_put_and_get_map_successfully() -> CorylusResult<()> {
             with_instances(map::should_put_and_get_map_successfully)
         }
     }

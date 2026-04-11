@@ -2,10 +2,7 @@ use std::{
     any::Any,
     array,
     collections::{BinaryHeap, HashMap, HashSet},
-    sync::{
-        RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Mutex, RwLock},
 };
 
 use thiserror::Error;
@@ -18,11 +15,13 @@ const RING_CAPACITY: usize = 1024;
 const PARTITION_HASH_SEED: u64 = 1234;
 
 #[derive(Error, Debug)]
-pub enum Error<'a> {
-    #[error("Partition not found. Id: {id}")]
-    PartitionNotFound { id: usize },
-    #[error("Segment not found. Id: {id}")]
-    SegmentNotFound { id: &'a str },
+pub enum Error {
+    #[error("Partition not found ")]
+    PartitionNotFound,
+    #[error("Segment not found ")]
+    SegmentNotFound,
+    #[error("Invalid version")]
+    InvalidVersion,
 }
 
 pub trait RawSegment: Send + Sync + Any {
@@ -53,7 +52,7 @@ impl Segment {
 
 pub struct Group {
     partitions: [Partition; RING_CAPACITY],
-    version: AtomicU64,
+    version: Mutex<u128>,
 }
 
 impl Group {
@@ -63,7 +62,7 @@ impl Group {
 
         Self {
             partitions,
-            version: AtomicU64::new(0),
+            version: Mutex::new(Self::compute_version(&[member_id])),
         }
     }
 
@@ -109,21 +108,34 @@ impl Group {
             }
         }
 
-        self.version.fetch_add(1, Ordering::Relaxed);
+        let mut version = self.version.lock().expect("Cannot be poisoned");
+        *version = Self::compute_version(member_ids);
         result
     }
 
-    pub fn with_segment_read<'a, F, O>(
+    pub fn compute_version(member_ids: &[Uuid]) -> u128 {
+        const COUNT_BITS: u32 = 16;
+        const COUNT_MASK: u128 = (1u128 << COUNT_BITS) - 1;
+        const HASH_MASK: u128 = !COUNT_MASK;
+        let mut hasher = XxHash3_128::with_seed(PARTITION_HASH_SEED);
+        for member_id in member_ids {
+            hasher.write(member_id.as_bytes());
+        }
+
+        (hasher.finish_128() & HASH_MASK) | (member_ids.len() as u128 & COUNT_MASK)
+    }
+
+    pub fn with_segment_read<F, O>(
         &self,
         p_id: usize,
-        s_id: &'a str,
+        s_id: &str,
         f: F,
-    ) -> Result<O, partition::Error<'a>>
+    ) -> Result<O, partition::Error>
     where
         F: FnOnce(&Segment) -> O,
     {
         if p_id >= RING_CAPACITY {
-            return Err(Error::PartitionNotFound { id: p_id });
+            return Err(Error::PartitionNotFound);
         }
 
         let partition = &self.partitions[p_id];
@@ -131,21 +143,21 @@ impl Group {
             let guard = segment.read().expect("Cannot be poisoned");
             Ok(f(&guard))
         } else {
-            Err(Error::SegmentNotFound { id: s_id })
+            Err(Error::SegmentNotFound)
         }
     }
 
-    pub fn with_segment_write<'a, F>(
+    pub fn with_segment_write<F>(
         &self,
         p_id: usize,
-        s_id: &'a str,
+        s_id: &str,
         f: F,
-    ) -> Result<(), partition::Error<'a>>
+    ) -> Result<(), partition::Error>
     where
         F: FnOnce(&mut Segment),
     {
         if p_id >= RING_CAPACITY {
-            return Err(Error::PartitionNotFound { id: p_id });
+            return Err(Error::PartitionNotFound);
         }
 
         let partition = &self.partitions[p_id];
@@ -154,12 +166,12 @@ impl Group {
             f(&mut guard);
             Ok(())
         } else {
-            Err(Error::SegmentNotFound { id: s_id })
+            Err(Error::SegmentNotFound)
         }
     }
 
-    pub fn version(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
+    pub fn version(&self) -> u128 {
+        *self.version.lock().expect("Cannot be poisoned")
     }
 }
 

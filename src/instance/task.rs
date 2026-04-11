@@ -2,7 +2,7 @@ use rayon::ThreadPoolBuilder;
 use uuid::Uuid;
 
 use crate::{
-    instance,
+    CorylusError, instance,
     network::packet::{self, Packet},
 };
 
@@ -24,6 +24,7 @@ impl Task {
             Self::Read { from, packet } => match packet {
                 packet::Read::WhoIs { .. } => {}
                 packet::Read::GetOp {
+                    v,
                     corr_id,
                     partition_id,
                     segment_id,
@@ -31,39 +32,37 @@ impl Task {
                     raw_op,
                 } => {
                     if let Some(ref_) = instance.as_ref().upgrade() {
-                        let ok;
-                        let result;
-                        if let Ok(Some(f)) = ref_.part_group.with_segment_read(
-                            partition_id as usize,
-                            &segment_id,
-                            |segment| segment.op_reg.read_fn(&op_id),
-                        ) {
-                            match f(raw_op.as_slice()) {
-                                Ok(read_op) => match ref_.read(&segment_id, read_op) {
-                                    Ok(val) => {
-                                        result = val;
-                                        ok = true;
-                                    }
-                                    Err(_) => {
-                                        result = vec![];
-                                        ok = false;
+                        let (status, result) = ref_
+                            .part_group
+                            .with_segment_read(partition_id as usize, &segment_id, |segment| {
+                                segment.op_reg.read_fn(&op_id)
+                            })
+                            .map(|opt_f| match opt_f {
+                                Some(f) => match f(raw_op.as_slice()) {
+                                    Ok(read_op) => match ref_.remote_read(
+                                        &segment_id,
+                                        partition_id,
+                                        v,
+                                        read_op,
+                                    ) {
+                                        Ok(val) => (packet::Status::Success, val),
+                                        Err(err) => (packet::Status::from(err), vec![]),
+                                    },
+                                    Err(err) => {
+                                        (packet::Status::from(CorylusError::from(err)), vec![])
                                     }
                                 },
-                                Err(_) => {
-                                    result = vec![];
-                                    ok = false;
-                                }
-                            }
-                        } else {
-                            ok = false;
-                            result = vec![];
-                        }
+                                None => (packet::Status::OperationNotFound, vec![]),
+                            })
+                            .unwrap_or_else(|err| {
+                                (packet::Status::from(CorylusError::from(err)), vec![])
+                            });
 
                         let _ = ref_.net.send(
                             from,
                             Packet::Reply(packet::Reply::GetOp {
                                 corr_id,
-                                ok,
+                                status,
                                 result,
                             }),
                             None,
@@ -74,6 +73,7 @@ impl Task {
             Self::Write { from, packet } => match packet {
                 packet::Write::HeartBeat => {}
                 packet::Write::WriteOp {
+                    v,
                     corr_id,
                     partition_id,
                     segment_id,
@@ -81,32 +81,31 @@ impl Task {
                     raw_op,
                 } => {
                     if let Some(ref_) = instance.as_ref().upgrade() {
-                        let ok;
-                        if let Ok(Some(f)) = ref_.part_group.with_segment_read(
-                            partition_id as usize,
-                            &segment_id,
-                            |segment| segment.op_reg.write_fn(&op_id),
-                        ) {
-                            match f(raw_op.as_slice()) {
-                                Ok(write_op) => match ref_.write(&segment_id, write_op) {
-                                    Ok(_) => {
-                                        ok = true;
-                                    }
-                                    Err(_) => {
-                                        ok = false;
-                                    }
+                        let status = ref_
+                            .part_group
+                            .with_segment_read(partition_id as usize, &segment_id, |segment| {
+                                segment.op_reg.write_fn(&op_id)
+                            })
+                            .map(|opt_f| match opt_f {
+                                Some(f) => match f(raw_op.as_slice()) {
+                                    Ok(write_op) => match ref_.remote_write(
+                                        &segment_id,
+                                        partition_id,
+                                        v,
+                                        write_op,
+                                    ) {
+                                        Ok(_) => packet::Status::Success,
+                                        Err(err) => packet::Status::from(err),
+                                    },
+                                    Err(err) => packet::Status::from(CorylusError::from(err)),
                                 },
-                                Err(_) => {
-                                    ok = false;
-                                }
-                            }
-                        } else {
-                            ok = false;
-                        }
+                                None => packet::Status::OperationNotFound,
+                            })
+                            .unwrap_or_else(|err| packet::Status::from(CorylusError::from(err)));
 
                         let _ = ref_.net.send(
                             from,
-                            Packet::Reply(packet::Reply::WriteOp { corr_id, ok }),
+                            Packet::Reply(packet::Reply::WriteOp { corr_id, status }),
                             None,
                         );
                     }

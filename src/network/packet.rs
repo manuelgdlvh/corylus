@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 
 use uuid::Uuid;
 
+use crate::CorylusError;
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Event {
     PeerAdded { id: Uuid },
@@ -36,6 +38,7 @@ pub enum Request {
 pub enum Write {
     HeartBeat,
     WriteOp {
+        v: u128,
         corr_id: Uuid,
         // Just to check inconsistences in the partition tables to reject
         partition_id: u16,
@@ -52,6 +55,7 @@ pub enum Read {
         addr: SocketAddr,
     },
     GetOp {
+        v: u128,
         corr_id: Uuid,
         // Just to check inconsistences in the partition tables to reject
         partition_id: u16,
@@ -61,6 +65,37 @@ pub enum Read {
     },
 }
 
+#[repr(u8)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum Status {
+    Success = 0,
+    InvalidPartitionVersion = 1,
+    OperationNotFound = 2,
+}
+
+// TODO: Fix these mappings
+impl From<CorylusError> for Status {
+    fn from(value: CorylusError) -> Self {
+        match value {
+            CorylusError::Io(_) => Status::Success,
+            CorylusError::Partition(_) => Status::Success,
+            CorylusError::Operation(_) => Status::Success,
+        }
+    }
+}
+
+impl TryFrom<u8> for Status {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Status::Success),
+            1 => Ok(Status::Success),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Reply {
     WhoIs {
@@ -68,11 +103,11 @@ pub enum Reply {
     },
     WriteOp {
         corr_id: Uuid,
-        ok: bool,
+        status: Status,
     },
     GetOp {
         corr_id: Uuid,
-        ok: bool,
+        status: Status,
         result: Vec<u8>,
     },
 }
@@ -179,12 +214,14 @@ impl From<&Packet> for Vec<u8> {
                     }
 
                     Read::GetOp {
+                        v,
                         corr_id,
                         partition_id,
                         segment_id,
                         op_id,
                         raw_op,
                     } => {
+                        buffer.extend_from_slice(&v.to_le_bytes());
                         buffer.extend_from_slice(corr_id.as_bytes());
                         buffer.extend_from_slice(&partition_id.to_le_bytes());
 
@@ -206,12 +243,14 @@ impl From<&Packet> for Vec<u8> {
                     Write::HeartBeat => {}
 
                     Write::WriteOp {
+                        v,
                         corr_id,
                         partition_id,
                         segment_id,
                         op_id,
                         raw_op,
                     } => {
+                        buffer.extend_from_slice(&v.to_le_bytes());
                         buffer.extend_from_slice(corr_id.as_bytes());
                         buffer.extend_from_slice(&partition_id.to_le_bytes());
 
@@ -235,18 +274,17 @@ impl From<&Packet> for Vec<u8> {
                     buffer.extend_from_slice(id.as_bytes());
                 }
 
-                Reply::WriteOp { corr_id, ok } => {
+                Reply::WriteOp { corr_id, status } => {
                     buffer.extend_from_slice(corr_id.as_bytes());
-                    buffer.push(*ok as u8);
+                    buffer.push(*status as u8);
                 }
-
                 Reply::GetOp {
                     corr_id,
-                    ok,
+                    status,
                     result,
                 } => {
                     buffer.extend_from_slice(corr_id.as_bytes());
-                    buffer.push(*ok as u8);
+                    buffer.push(*status as u8);
 
                     if !result.is_empty() {
                         buffer.extend_from_slice(result.as_slice());
@@ -289,6 +327,9 @@ impl From<&[u8]> for Packet {
             6 => {
                 let mut offset = 1;
 
+                let v = u128::from_le_bytes(value[offset..offset + 16].try_into().unwrap());
+                offset += 16;
+
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
@@ -323,6 +364,7 @@ impl From<&[u8]> for Packet {
                 };
 
                 Packet::Request(Request::Write(Write::WriteOp {
+                    v,
                     corr_id,
                     partition_id,
                     segment_id,
@@ -338,14 +380,17 @@ impl From<&[u8]> for Packet {
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
-                let ok = value[offset] != 0;
+                let status = Status::try_from(value[offset]).unwrap();
 
-                Packet::Reply(Reply::WriteOp { corr_id, ok })
+                Packet::Reply(Reply::WriteOp { corr_id, status })
             }
 
             // GetOp (Request::Read)
             8 => {
                 let mut offset = 1;
+
+                let v = u128::from_le_bytes(value[offset..offset + 16].try_into().unwrap());
+                offset += 16;
 
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
@@ -381,6 +426,7 @@ impl From<&[u8]> for Packet {
                 };
 
                 Packet::Request(Request::Read(Read::GetOp {
+                    v,
                     corr_id,
                     partition_id,
                     segment_id,
@@ -396,7 +442,7 @@ impl From<&[u8]> for Packet {
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
-                let ok = value[offset] != 0;
+                let status = Status::try_from(value[offset]).unwrap();
                 offset += 1;
 
                 let result = if offset >= value.len() {
@@ -407,7 +453,7 @@ impl From<&[u8]> for Packet {
 
                 Packet::Reply(Reply::GetOp {
                     corr_id,
-                    ok,
+                    status,
                     result,
                 })
             }

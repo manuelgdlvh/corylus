@@ -7,7 +7,7 @@ use std::{
     sync::{
         Arc, Mutex, RwLock, RwLockReadGuard,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, RecvTimeoutError, SyncSender},
+        mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -61,8 +61,10 @@ impl<'a> Response<'a> {
         }
     }
 
-    pub fn get(&self, timeout: Duration) -> Result<Packet, RecvTimeoutError> {
-        self.receiver.recv_timeout(timeout)
+    pub fn get(&self, timeout: Duration) -> Result<Packet, io::Error> {
+        self.receiver
+            .recv_timeout(timeout)
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
     }
 }
 

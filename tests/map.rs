@@ -1,11 +1,9 @@
-use std::io;
-
-use corylus::Instance;
+use corylus::{CorylusResult, Instance};
 
 pub fn should_register_map_successfully(
     instance_1: Instance,
     instance_2: Instance,
-) -> io::Result<()> {
+) -> CorylusResult<()> {
     assert!(instance_1.get_map::<String, String>("str-str").is_some());
     assert!(instance_2.get_map::<String, String>("str-str").is_some());
 
@@ -21,7 +19,7 @@ pub fn should_register_map_successfully(
 pub fn should_put_and_get_map_successfully(
     instance_1: Instance,
     instance_2: Instance,
-) -> io::Result<()> {
+) -> CorylusResult<()> {
     let map_1 = instance_1.get_map::<String, String>("str-str").unwrap();
     let map_2 = instance_2.get_map::<String, String>("str-str").unwrap();
 

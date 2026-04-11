@@ -1,9 +1,10 @@
-use std::{hash::Hash, io, marker::PhantomData};
+use std::{hash::Hash, marker::PhantomData, result};
 
 use crate::{
+    CorylusResult,
     instance::{
         self,
-        operation::{DeserializeError, Deserializer, Serializer},
+        operation::{self, Deserializer, Serializer},
     },
     object::map::{Get, Put},
 };
@@ -33,7 +34,7 @@ where
         }
     }
 
-    pub fn put(&self, k: K, v: V) -> io::Result<()> {
+    pub fn put(&self, k: K, v: V) -> CorylusResult<()> {
         let op = Put::<K, V> { key: k, value: v };
 
         if let Some(ref_) = self.instance.as_ref().upgrade() {
@@ -43,7 +44,7 @@ where
         }
     }
 
-    pub fn get(&self, k: K) -> io::Result<Option<V>> {
+    pub fn get(&self, k: K) -> CorylusResult<Option<V>> {
         let op = Get::<K, V> {
             key: k,
             _value: Default::default(),
@@ -54,9 +55,8 @@ where
             if result.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(V::deserialize(result.as_slice()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, e)
-                })?))
+                let value = V::deserialize(result.as_slice())?;
+                Ok(Some(value))
             }
         } else {
             panic!("Instance was destroyed")
@@ -73,10 +73,8 @@ impl Serializer for String {
 }
 
 impl Deserializer for String {
-    type Error = DeserializeError;
-
-    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
-        String::from_utf8(buffer.to_vec()).map_err(DeserializeError::InvalidUtf8)
+    fn deserialize(buffer: &[u8]) -> result::Result<Self, operation::Error> {
+        String::from_utf8(buffer.to_vec()).map_err(operation::Error::InvalidUtf8)
     }
 }
 
@@ -87,9 +85,7 @@ impl Serializer for Vec<u8> {
 }
 
 impl Deserializer for Vec<u8> {
-    type Error = DeserializeError;
-
-    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
+    fn deserialize(buffer: &[u8]) -> result::Result<Self, operation::Error> {
         Ok(buffer.to_vec())
     }
 }
@@ -101,11 +97,9 @@ impl Serializer for bool {
 }
 
 impl Deserializer for bool {
-    type Error = DeserializeError;
-
-    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
+    fn deserialize(buffer: &[u8]) -> result::Result<Self, operation::Error> {
         if buffer.len() != 1 {
-            return Err(DeserializeError::InvalidBufferSize {
+            return Err(operation::Error::InvalidBufferSize {
                 expected: 1,
                 got: buffer.len(),
             });
@@ -113,7 +107,7 @@ impl Deserializer for bool {
         match buffer[0] {
             0 => Ok(false),
             1 => Ok(true),
-            v => Err(DeserializeError::Unknown(format!("Invalid bool byte: {v}"))),
+            v => Err(operation::Error::Unknown(format!("Invalid bool byte: {v}"))),
         }
     }
 }
@@ -127,12 +121,10 @@ macro_rules! impl_fixed_serde {
         }
 
         impl Deserializer for $t {
-            type Error = DeserializeError;
-
-            fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
+            fn deserialize(buffer: &[u8]) -> result::Result<Self, operation::Error> {
                 const N: usize = std::mem::size_of::<$t>();
                 if buffer.len() != N {
-                    return Err(DeserializeError::InvalidBufferSize {
+                    return Err(operation::Error::InvalidBufferSize {
                         expected: N,
                         got: buffer.len(),
                     });

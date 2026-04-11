@@ -11,7 +11,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    Instance,
+    CorylusResult, Instance,
     instance::operation::{Deserializer, Serializer},
     network::{
         self,
@@ -288,15 +288,61 @@ impl Inner {
     }
 
     pub(crate) fn members(&self) -> Vec<Uuid> {
-        self.members
+        let mut member_ids = self
+            .members
             .lock()
             .expect("Cannot be poisoned")
             .iter()
             .copied()
-            .collect()
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable();
+        member_ids
     }
 
-    pub(crate) fn write<O: operation::Write>(&self, s_id: &str, mut op: O) -> io::Result<()> {
+    pub(crate) fn remote_write<O: operation::Write>(
+        &self,
+        s_id: &str,
+        p_id: u16,
+        v: u128,
+        mut op: O,
+    ) -> CorylusResult<()> {
+        // If partition version is correct is ensured that this node is master or replica.
+        if !self.part_group.version().eq(&v) {
+            return Err(partition::Error::InvalidVersion.into());
+        }
+
+        // Implement double check of part group version inside lock.
+        // Implement await of status change if not ready and tryLock.
+        self.part_group
+            .with_segment_write(p_id as usize, s_id, |segment| {
+                // TODO: Double check of conditionals above
+                op.execute(&mut *segment.data);
+            })
+            .map_err(|err| err.into())
+
+        // Implement check if master to do replication or not.
+    }
+
+    pub(crate) fn remote_read<O: operation::Read>(
+        &self,
+        s_id: &str,
+        p_id: u16,
+        v: u128,
+        op: O,
+    ) -> CorylusResult<Vec<u8>> {
+        // If partition version is correct is ensured that this node is master or replica.
+        if !self.part_group.version().eq(&v) {
+            return Err(partition::Error::InvalidVersion.into());
+        }
+
+        // Implement double check of part group version inside lock.
+        // Implement await of status change if not ready and tryLock.
+        self.part_group
+            .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
+            .map_err(|err| err.into())
+    }
+
+    pub(crate) fn write<O: operation::Write>(&self, s_id: &str, mut op: O) -> CorylusResult<()> {
         let key = op.partition_key();
         let p_id = self.part_group.partition_of(&key);
         let owner = self.part_group.owner_of(p_id);
@@ -304,15 +350,16 @@ impl Inner {
         if self.id.eq(&owner) {
             self.part_group
                 .with_segment_write(p_id as usize, s_id, |segment| {
+                    // TODO: Double check of still owner of id
                     op.execute(&mut *segment.data);
                 })
-                .expect("As internal operation, partition and segment must always exist");
-            Ok(())
+                .map_err(|err| err.into())
         } else {
             let raw_op = op.serialize();
             let response = self.net.sync_send(
                 owner,
                 Packet::Request(packet::Request::Write(packet::Write::WriteOp {
+                    v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
                     partition_id: p_id as u16,
                     segment_id: s_id.to_string(),
@@ -322,37 +369,35 @@ impl Inner {
                 None,
             )?;
 
-            response
-                .get(Duration::from_secs(1))
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
-                .and_then(|packet| match packet {
-                    Packet::Reply(packet::Reply::WriteOp { ok, .. }) => {
-                        ok.then_some(()).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "Invalid input")
-                        })
+            match response.get(Duration::from_secs(1))? {
+                Packet::Reply(packet::Reply::WriteOp { status, .. }) => {
+                    if packet::Status::Success.eq(&status) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input").into())
                     }
-                    Packet::Reply(_) | Packet::Request(_) => {
-                        Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data"))
-                    }
-                })
+                }
+                Packet::Reply(_) | Packet::Request(_) => {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into())
+                }
+            }
         }
     }
 
-    pub(crate) fn read<O: operation::Read>(&self, s_id: &str, op: O) -> io::Result<Vec<u8>> {
+    pub(crate) fn read<O: operation::Read>(&self, s_id: &str, op: O) -> CorylusResult<Vec<u8>> {
         let key = op.partition_key();
         let p_id = self.part_group.partition_of(&key);
         let owner = self.part_group.owner_of(p_id);
         if self.id.eq(&owner) {
-            let result = self
-                .part_group
+            self.part_group
                 .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
-                .expect("As internal operation, partition and segment must always exist");
-            Ok(result)
+                .map_err(|err| err.into())
         } else {
             let raw_op = op.serialize();
             let response = self.net.sync_send(
                 owner,
                 Packet::Request(packet::Request::Read(packet::Read::GetOp {
+                    v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
                     partition_id: p_id as u16,
                     segment_id: s_id.to_string(),
@@ -362,19 +407,18 @@ impl Inner {
                 None,
             )?;
 
-            response
-                .get(Duration::from_secs(1))
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
-                .and_then(|packet| match packet {
-                    Packet::Reply(packet::Reply::GetOp { ok, result, .. }) => {
-                        ok.then_some(result).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "Invalid input")
-                        })
+            match response.get(Duration::from_secs(1))? {
+                Packet::Reply(packet::Reply::GetOp { status, result, .. }) => {
+                    if packet::Status::Success.eq(&status) {
+                        Ok(result)
+                    } else {
+                        Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input").into())
                     }
-                    Packet::Reply(_) | Packet::Request(_) => {
-                        Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data"))
-                    }
-                })
+                }
+                Packet::Reply(_) | Packet::Request(_) => {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into())
+                }
+            }
         }
     }
 }

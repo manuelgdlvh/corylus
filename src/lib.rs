@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
+    io, result,
     sync::{Arc, Mutex},
 };
 
@@ -9,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     instance::{
         Shutdown,
-        operation::{Deserializer, Serializer},
+        operation::{self, Deserializer, Serializer},
     },
     object::DistributedMap,
 };
@@ -18,6 +19,20 @@ pub mod instance;
 pub mod network;
 pub mod object;
 pub mod partition;
+
+pub type CorylusResult<T> = result::Result<T, CorylusError>;
+
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum CorylusError {
+    #[error("IO error")]
+    Io(#[from] io::Error),
+    #[error("Partition error")]
+    Partition(#[from] partition::Error),
+    #[error("Operation error")]
+    Operation(#[from] operation::Error),
+}
 
 #[derive(Clone)]
 pub struct Instance {
@@ -53,7 +68,7 @@ impl Instance {
         self.inner.members()
     }
 
-    pub fn part_group_version(&self) -> u64 {
+    pub fn part_group_version(&self) -> u128 {
         self.inner.part_group.version()
     }
 
