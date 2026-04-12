@@ -34,7 +34,8 @@ impl Task {
                     if let Some(ref_) = instance.as_ref().upgrade() {
                         let (status, result) = ref_
                             .part_group
-                            .metadata(&segment_id)
+                            // TODO: Change segment to object id
+                            .obj_metadata(&segment_id)
                             .map_err(CorylusError::from)
                             .and_then(|m| m.read_fn(&op_id).map_err(CorylusError::from))
                             .and_then(|f| f(raw_op.as_slice()).map_err(CorylusError::from))
@@ -67,7 +68,7 @@ impl Task {
                     if let Some(ref_) = instance.as_ref().upgrade() {
                         let status = ref_
                             .part_group
-                            .metadata(&segment_id)
+                            .obj_metadata(&segment_id)
                             .map_err(CorylusError::from)
                             .and_then(|m| m.write_fn(&op_id).map_err(CorylusError::from))
                             .and_then(|f| f(raw_op.as_slice()).map_err(CorylusError::from))

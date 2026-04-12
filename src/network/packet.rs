@@ -77,6 +77,7 @@ pub enum Status {
     SerdeInvalidBufferSize = 6,
     SerdeUnknown = 7,
     SerdeInvalidUtf8 = 8,
+    NotEnoughReplicas = 9,
 }
 impl From<CorylusError> for Status {
     fn from(value: CorylusError) -> Self {
@@ -86,6 +87,7 @@ impl From<CorylusError> for Status {
                 partition::Error::PartitionNotFound => Status::PartitionNotFound,
                 partition::Error::SegmentNotFound => Status::SegmentNotFound,
                 partition::Error::Rebalance => Status::Rebalance,
+                partition::Error::NotEnoughReplicas => Status::NotEnoughReplicas,
             },
             CorylusError::Operation(err) => match err {
                 operation::Error::OperationNotFound => Status::OperationNotFound,
@@ -123,6 +125,9 @@ impl TryFrom<Status> for CorylusError {
                 Ok(CorylusError::Serde(serde::Error::InvalidBufferSize))
             }
             Status::SerdeInvalidUtf8 => Ok(CorylusError::Serde(serde::Error::InvalidUtf8)),
+            Status::NotEnoughReplicas => {
+                Ok(CorylusError::Partition(partition::Error::NotEnoughReplicas))
+            }
         }
     }
 }

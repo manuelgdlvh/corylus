@@ -16,8 +16,11 @@ use crate::{
         self,
         packet::{self, Packet},
     },
-    object::map::{Get, Put},
-    partition::{self, Replication, Segment, segment},
+    object::{
+        self,
+        map::{Get, Put},
+    },
+    partition::{self, Segment},
     serde::{Deserializer, Serializer},
 };
 
@@ -37,7 +40,7 @@ pub struct Builder<S> {
     id: Option<Uuid>,
     c: Option<Config>,
     d: Option<network::Discovery>,
-    segment_metadata: HashMap<String, segment::Metadata>,
+    objs_metadata: HashMap<String, object::Metadata>,
     segment_fns: Vec<Box<dyn Fn() -> Segment>>,
     _state: PhantomData<S>,
 }
@@ -54,7 +57,7 @@ impl Builder<NeedsId> {
             id: None,
             c: None,
             d: None,
-            segment_metadata: HashMap::new(),
+            objs_metadata: HashMap::new(),
             segment_fns: Vec::new(),
             _state: PhantomData,
         }
@@ -64,7 +67,7 @@ impl Builder<NeedsId> {
             id: Some(id),
             c: self.c,
             d: self.d,
-            segment_metadata: self.segment_metadata,
+            objs_metadata: self.objs_metadata,
             segment_fns: self.segment_fns,
             _state: PhantomData,
         }
@@ -77,7 +80,7 @@ impl Builder<NeedsConfig> {
             id: self.id,
             c: Some(c),
             d: self.d,
-            segment_metadata: self.segment_metadata,
+            objs_metadata: self.objs_metadata,
             segment_fns: self.segment_fns,
             _state: PhantomData,
         }
@@ -90,7 +93,8 @@ impl Builder<NeedsDiscovery> {
             id: self.id,
             c: self.c,
             d: Some(d),
-            segment_metadata: self.segment_metadata,
+
+            objs_metadata: self.objs_metadata,
             segment_fns: self.segment_fns,
             _state: PhantomData,
         }
@@ -98,7 +102,7 @@ impl Builder<NeedsDiscovery> {
 }
 
 impl Builder<Ready> {
-    pub fn with_map<K, V>(mut self, id: &str, repl: Replication, repl_factor: usize) -> Self
+    pub fn with_map<K, V>(mut self, id: &str, repl_config: object::ReplicationConfig) -> Self
     where
         K: Serializer + Deserializer + Send + Sync + Hash + Eq + Clone + 'static,
         V: Serializer + Deserializer + Send + Sync + Clone + 'static,
@@ -108,10 +112,8 @@ impl Builder<Ready> {
         let op_reg = operation::Registry::new()
             .with_read_op::<Get<K, V>>()
             .with_write_op::<Put<K, V>>();
-        self.segment_metadata.insert(
-            id.to_string(),
-            segment::Metadata::new(op_reg, repl_factor, repl),
-        );
+        self.objs_metadata
+            .insert(id.to_string(), object::Metadata::new(op_reg, repl_config));
         self.segment_fns.push(Box::new(move || {
             let data: HashMap<K, V> = HashMap::new();
             Segment::new(id.to_string(), data)
@@ -128,8 +130,7 @@ impl Builder<Ready> {
         let shutdown = Shutdown::new();
 
         let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
-        let partition =
-            partition::Group::new(id, self.segment_metadata, self.segment_fns.as_slice());
+        let partition = partition::Group::new(id, self.objs_metadata, self.segment_fns.as_slice());
         let instance = Instance::new(id, net_sender, partition, shutdown.clone());
 
         shutdown.register(net_receiver.start(instance.downgrade())?);
@@ -305,6 +306,10 @@ impl Membership {
         member_ids.sort_unstable();
         member_ids
     }
+
+    pub(crate) fn size(&self) -> usize {
+        self.0.lock().expect("Cannot be poisoned").len()
+    }
 }
 
 pub struct Inner {
@@ -336,6 +341,7 @@ impl Inner {
 
         // Implement double check of part group version inside lock.
         // Implement await of status change if not ready and tryLock.
+        // Implement replication here
         self.part_group
             .with_segment_write(p_id as usize, s_id, |segment| {
                 op.execute(&mut *segment.data);
@@ -370,11 +376,76 @@ impl Inner {
         let owner = self.part_group.owner_of(p_id);
 
         if self.id.eq(&owner) {
+            let obj_metadata = self.part_group.obj_metadata(s_id)?;
+            let repl_factor = obj_metadata.repl_factor();
+            if repl_factor > (self.membership.size() - 1) {
+                return Err(CorylusError::from(partition::Error::NotEnoughReplicas));
+            }
+
             self.part_group
                 .with_segment_write(p_id as usize, s_id, |segment| {
                     op.execute(&mut *segment.data);
-                })
-                .map_err(|err| err.into())
+                })?;
+
+            if repl_factor != 0 {
+                let raw_op = op.serialize();
+                let replica_ids = self.part_group.replicas_of(p_id, repl_factor);
+
+                match obj_metadata.repl() {
+                    object::Replication::Sync => {
+                        let mut responses = Vec::with_capacity(replica_ids.len());
+                        for replica_id in replica_ids {
+                            let response = self.net.sync_send(
+                                replica_id,
+                                Packet::Request(packet::Request::Write(packet::Write::WriteOp {
+                                    v: self.part_group.version(),
+                                    corr_id: Uuid::new_v4(),
+                                    partition_id: p_id as u16,
+                                    segment_id: s_id.to_string(),
+                                    op_id: op.id().to_string(),
+                                    raw_op: raw_op.clone(),
+                                })),
+                                None,
+                            )?;
+                            responses.push(response);
+                        }
+
+                        for response in responses {
+                            match response.get(Duration::from_secs(3))? {
+                                Packet::Reply(packet::Reply::WriteOp { status, .. }) => {
+                                    match status {
+                                        packet::Status::Success => Ok(()),
+                                        s => Err(CorylusError::try_from(s).unwrap()),
+                                    }
+                                }
+                                Packet::Reply(_) | Packet::Request(_) => {
+                                    Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")
+                                        .into())
+                                }
+                            }?;
+                        }
+                    }
+                    object::Replication::Async => {
+                        for replica_id in replica_ids {
+                            self.net.send(
+                                replica_id,
+                                Packet::Request(packet::Request::Write(packet::Write::WriteOp {
+                                    v: self.part_group.version(),
+                                    corr_id: Uuid::new_v4(),
+                                    partition_id: p_id as u16,
+                                    segment_id: s_id.to_string(),
+                                    op_id: op.id().to_string(),
+                                    raw_op: raw_op.clone(),
+                                })),
+                                None,
+                            )?;
+                        }
+                    }
+                    object::Replication::None => {}
+                }
+            }
+
+            Ok(())
         } else {
             let raw_op = op.serialize();
             let response = self.net.sync_send(
@@ -406,7 +477,11 @@ impl Inner {
         let key = op.partition_key();
         let p_id = self.part_group.partition_of(&key);
         let owner = self.part_group.owner_of(p_id);
-        if self.id.eq(&owner) {
+
+        let local_exec = self.id.eq(&owner)
+            || (self.part_group.obj_metadata(s_id)?.repl_read()
+                && self.part_group.is_replica(self.id, s_id, p_id));
+        if local_exec {
             self.part_group
                 .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
                 .map_err(|err| err.into())

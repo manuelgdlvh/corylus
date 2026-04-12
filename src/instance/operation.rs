@@ -2,6 +2,8 @@ use std::{collections::HashMap, io};
 
 use crate::{partition, serde};
 
+// TODO: Move this to object module
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Operation not found")]

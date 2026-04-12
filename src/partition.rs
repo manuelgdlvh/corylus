@@ -9,7 +9,7 @@ use thiserror::Error;
 use twox_hash::{XxHash3_64, XxHash3_128};
 use uuid::Uuid;
 
-use crate::partition;
+use crate::{object, partition};
 
 const RING_CAPACITY: usize = 1024;
 const PARTITION_HASH_SEED: u64 = 1234;
@@ -22,6 +22,8 @@ pub enum Error {
     SegmentNotFound,
     #[error("Rebalance in progress")]
     Rebalance,
+    #[error("Not enough replicas")]
+    NotEnoughReplicas,
 }
 
 pub trait RawSegment: Send + Sync + Any {
@@ -48,61 +50,17 @@ impl Segment {
     }
 }
 
-#[derive(Copy, Clone)]
-pub enum Replication {
-    Sync,
-    Async,
-    None,
-}
-
-pub mod segment {
-    use crate::{
-        instance::operation::{self, ReadBuilder, WriteBuilder},
-        partition::Replication,
-    };
-
-    pub struct Metadata {
-        ops: operation::Registry,
-        repl_factor: usize,
-        repl: Replication,
-    }
-
-    impl Metadata {
-        pub fn new(ops: operation::Registry, repl_factor: usize, repl: Replication) -> Self {
-            Self {
-                ops,
-                repl_factor,
-                repl,
-            }
-        }
-        pub fn read_fn(&self, op_id: &str) -> Result<ReadBuilder, operation::Error> {
-            self.ops.read_fn(op_id)
-        }
-
-        pub fn write_fn(&self, op_id: &str) -> Result<WriteBuilder, operation::Error> {
-            self.ops.write_fn(op_id)
-        }
-
-        pub fn repl_factor(&self) -> usize {
-            self.repl_factor
-        }
-
-        pub fn repl(&self) -> Replication {
-            self.repl
-        }
-    }
-}
-
 pub struct Group {
     partitions: [Partition; RING_CAPACITY],
-    s_metadata: HashMap<String, segment::Metadata>,
+    // TODO: Decouple from partition this
+    objs_metadata: HashMap<String, object::Metadata>,
     version: Mutex<u128>,
 }
 
 impl Group {
     pub fn new<F: Fn() -> Segment>(
         member_id: Uuid,
-        s_metadata: HashMap<String, segment::Metadata>,
+        objs_metadata: HashMap<String, object::Metadata>,
         segment_fns: &[F],
     ) -> Self {
         let partitions: [Partition; RING_CAPACITY] =
@@ -110,7 +68,7 @@ impl Group {
 
         Self {
             partitions,
-            s_metadata,
+            objs_metadata,
             version: Mutex::new(Self::compute_version(&[member_id])),
         }
     }
@@ -133,17 +91,42 @@ impl Group {
         metadata.master_id
     }
 
-    pub fn is_replica(&self, member_id: Uuid, partition_id: u64) -> bool {
+    pub fn replicas_of(&self, partition_id: u64, size: usize) -> Vec<Uuid> {
         if partition_id >= RING_CAPACITY as u64 {
             panic!("Partition id out of range");
         }
+
         let partition = &self.partitions[partition_id as usize];
         let metadata = partition
             .metadata
             .read()
             .expect("Critical section cannot be poisoned");
 
-        metadata.replica_ids.contains(&member_id)
+        metadata.replica_ids[0..size].to_vec()
+    }
+
+    pub fn is_replica(&self, member_id: Uuid, s_id: &str, p_id: u64) -> bool {
+        if p_id >= RING_CAPACITY as u64 {
+            panic!("Partition id out of range");
+        }
+        match self.objs_metadata.get(s_id) {
+            Some(m) => {
+                let repl_factor = m.repl_factor();
+                if repl_factor == 0 {
+                    false
+                } else {
+                    let partition = &self.partitions[p_id as usize];
+                    let p_metadata = partition
+                        .metadata
+                        .read()
+                        .expect("Critical section cannot be poisoned");
+
+                    p_metadata.replica_ids[0..repl_factor].contains(&member_id)
+                }
+            }
+
+            None => false,
+        }
     }
 
     pub fn update(&self, member_ids: &[Uuid]) -> HashMap<usize, Vec<MembershipChange>> {
@@ -218,8 +201,8 @@ impl Group {
         }
     }
 
-    pub fn metadata(&self, s_id: &str) -> Result<&segment::Metadata, partition::Error> {
-        self.s_metadata.get(s_id).ok_or(Error::SegmentNotFound)
+    pub fn obj_metadata(&self, s_id: &str) -> Result<&object::Metadata, partition::Error> {
+        self.objs_metadata.get(s_id).ok_or(Error::SegmentNotFound)
     }
 
     pub fn version(&self) -> u128 {

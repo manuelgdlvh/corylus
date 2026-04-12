@@ -7,7 +7,88 @@ use crate::{
     serde::{Deserializer, Serializer},
 };
 
+use crate::instance::operation::{self, ReadBuilder, WriteBuilder};
+
 pub mod map;
+
+#[derive(Copy, Clone)]
+pub enum Replication {
+    Sync,
+    Async,
+    None,
+}
+
+pub struct Metadata {
+    ops: operation::Registry,
+    repl_config: ReplicationConfig,
+}
+
+#[derive(Copy, Clone)]
+pub struct ReplicationConfig {
+    repl_factor: usize,
+    repl: Replication,
+    repl_read: bool,
+}
+
+impl ReplicationConfig {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn synchronous(factor: usize, repl_read: bool) -> Self {
+        assert!(factor > 0);
+        Self {
+            repl_factor: factor,
+            repl: Replication::Sync,
+            repl_read,
+        }
+    }
+
+    pub fn asynchronous(factor: usize, repl_read: bool) -> Self {
+        assert!(factor > 0);
+        Self {
+            repl_factor: factor,
+            repl: Replication::Async,
+            repl_read,
+        }
+    }
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            repl_factor: 0,
+            repl: Replication::None,
+            repl_read: false,
+        }
+    }
+}
+
+impl Metadata {
+    pub fn new(ops: operation::Registry, repl_config: ReplicationConfig) -> Self {
+        Self { ops, repl_config }
+    }
+
+    pub fn read_fn(&self, op_id: &str) -> Result<ReadBuilder, operation::Error> {
+        self.ops.read_fn(op_id)
+    }
+
+    pub fn write_fn(&self, op_id: &str) -> Result<WriteBuilder, operation::Error> {
+        self.ops.write_fn(op_id)
+    }
+
+    pub fn repl_factor(&self) -> usize {
+        self.repl_config.repl_factor
+    }
+
+    pub fn repl(&self) -> Replication {
+        self.repl_config.repl
+    }
+
+    pub fn repl_read(&self) -> bool {
+        self.repl_config.repl_read
+    }
+}
 
 pub struct DistributedMap<K, V>
 where
@@ -59,5 +140,22 @@ where
         } else {
             panic!("Instance was destroyed")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::object::ReplicationConfig;
+
+    #[test]
+    #[should_panic]
+    pub fn should_fail_when_sync_repl_and_zero_factor() {
+        ReplicationConfig::synchronous(0, false);
+    }
+
+    #[test]
+    #[should_panic]
+    pub fn should_fail_when_async_repl_and_zero_factor() {
+        ReplicationConfig::asynchronous(0, false);
     }
 }
