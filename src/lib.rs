@@ -10,15 +10,17 @@ use uuid::Uuid;
 use crate::{
     instance::{
         Shutdown,
-        operation::{self, Deserializer, Serializer},
+        operation::{self},
     },
     object::DistributedMap,
+    serde::{Deserializer, Serializer},
 };
 
 pub mod instance;
 pub mod network;
 pub mod object;
 pub mod partition;
+pub mod serde;
 
 pub type CorylusResult<T> = result::Result<T, CorylusError>;
 
@@ -32,6 +34,8 @@ pub enum CorylusError {
     Partition(#[from] partition::Error),
     #[error("Operation error")]
     Operation(#[from] operation::Error),
+    #[error("Serde error")]
+    Serde(#[from] serde::Error),
 }
 
 #[derive(Clone)]

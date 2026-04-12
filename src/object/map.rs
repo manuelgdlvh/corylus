@@ -1,8 +1,9 @@
 use std::{any::Any, collections::HashMap, hash::Hash, io, marker::PhantomData};
 
 use crate::{
-    instance::operation::{self, Deserializer, GenericRead, GenericWrite, Read, Serializer, Write},
+    instance::operation::{self, GenericRead, GenericWrite, Read, Write},
     partition::{self, RawSegment},
+    serde::{self, Deserializer, Serializer},
 };
 
 use std::convert::TryInto;
@@ -32,7 +33,7 @@ where
     pub(crate) value: V,
 }
 
-impl<K, V> operation::Serializer for Put<K, V>
+impl<K, V> serde::Serializer for Put<K, V>
 where
     K: Serializer + Deserializer + Hash + Eq,
     V: Serializer + Deserializer,
@@ -143,7 +144,7 @@ where
     pub(crate) _value: PhantomData<V>,
 }
 
-impl<K, V> operation::Serializer for Get<K, V>
+impl<K, V> Serializer for Get<K, V>
 where
     K: Serializer + Deserializer + Hash + Eq,
     V: Serializer + Deserializer,

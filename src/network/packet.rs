@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use uuid::Uuid;
 
-use crate::CorylusError;
+use crate::{CorylusError, instance::operation, partition, serde};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Event {
@@ -71,15 +71,52 @@ pub enum Status {
     Success = 0,
     InvalidPartitionVersion = 1,
     OperationNotFound = 2,
+    PartitionNotFound = 3,
+    SegmentNotFound = 4,
+    IoError = 5,
+    SerdeError = 6,
 }
 
 // TODO: Fix these mappings
 impl From<CorylusError> for Status {
     fn from(value: CorylusError) -> Self {
         match value {
-            CorylusError::Io(_) => Status::Success,
-            CorylusError::Partition(_) => Status::Success,
-            CorylusError::Operation(_) => Status::Success,
+            CorylusError::Io(_) => Status::IoError,
+            CorylusError::Partition(err) => match err {
+                partition::Error::PartitionNotFound => Status::PartitionNotFound,
+                partition::Error::SegmentNotFound => Status::SegmentNotFound,
+                partition::Error::InvalidVersion => Status::InvalidPartitionVersion,
+            },
+            CorylusError::Operation(err) => match err {
+                operation::Error::OperationNotFound => Status::OperationNotFound,
+            },
+            CorylusError::Serde(_) => Status::SerdeError,
+        }
+    }
+}
+
+use std::convert::TryFrom;
+
+impl TryFrom<Status> for CorylusError {
+    type Error = ();
+
+    fn try_from(value: Status) -> Result<Self, Self::Error> {
+        match value {
+            Status::Success => Err(()),
+            Status::InvalidPartitionVersion => {
+                Ok(CorylusError::Partition(partition::Error::InvalidVersion))
+            }
+            Status::OperationNotFound => {
+                Ok(CorylusError::Operation(operation::Error::OperationNotFound))
+            }
+            Status::PartitionNotFound => {
+                Ok(CorylusError::Partition(partition::Error::PartitionNotFound))
+            }
+            Status::SegmentNotFound => {
+                Ok(CorylusError::Partition(partition::Error::SegmentNotFound))
+            }
+            Status::IoError => Ok(CorylusError::Io(std::io::Error::other("IO error"))),
+            Status::SerdeError => Ok(CorylusError::Serde(serde::Error::Unknown)),
         }
     }
 }

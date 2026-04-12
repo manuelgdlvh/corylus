@@ -1,26 +1,14 @@
 use std::{collections::HashMap, io, sync::Arc};
 
-use crate::partition;
+use crate::{partition, serde};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("Invalid buffer size: expected {expected} bytes, got {got}")]
-    InvalidBufferSize { expected: usize, got: usize },
-    #[error("Invalid UTF-8: {0}")]
-    InvalidUtf8(#[from] std::string::FromUtf8Error),
-    #[error("{0}")]
-    Unknown(String),
+    #[error("Operation not found")]
+    OperationNotFound,
 }
 
-pub trait Serializer {
-    fn serialize(&self) -> Vec<u8>;
-}
-
-pub trait Deserializer: Sized {
-    fn deserialize(buffer: &[u8]) -> Result<Self, Error>;
-}
-
-pub trait Base: Serializer {
+pub trait Base: serde::Serializer {
     fn static_id() -> &'static str
     where
         Self: Sized;
@@ -48,7 +36,7 @@ pub struct GenericRead {
     pub(crate) inner: Box<dyn Read>,
 }
 
-impl Serializer for GenericRead {
+impl serde::Serializer for GenericRead {
     fn serialize(&self) -> Vec<u8> {
         self.inner.serialize()
     }
@@ -88,7 +76,7 @@ pub struct GenericWrite {
     pub(crate) inner: Box<dyn Write>,
 }
 
-impl Serializer for GenericWrite {
+impl serde::Serializer for GenericWrite {
     fn serialize(&self) -> Vec<u8> {
         self.inner.serialize()
     }
@@ -177,11 +165,19 @@ impl Registry {
         self
     }
 
-    pub fn read_fn(&self, op_id: &str) -> Option<ReadBuilder> {
-        self.inner.read_fns.get(op_id).copied()
+    pub fn read_fn(&self, op_id: &str) -> Result<ReadBuilder, Error> {
+        self.inner
+            .read_fns
+            .get(op_id)
+            .ok_or(Error::OperationNotFound)
+            .copied()
     }
 
-    pub fn write_fn(&self, op_id: &str) -> Option<WriteBuilder> {
-        self.inner.write_fns.get(op_id).copied()
+    pub fn write_fn(&self, op_id: &str) -> Result<WriteBuilder, Error> {
+        self.inner
+            .write_fns
+            .get(op_id)
+            .ok_or(Error::OperationNotFound)
+            .copied()
     }
 }

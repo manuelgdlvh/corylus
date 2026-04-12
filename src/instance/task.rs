@@ -37,26 +37,12 @@ impl Task {
                             .with_segment_read(partition_id as usize, &segment_id, |segment| {
                                 segment.op_reg.read_fn(&op_id)
                             })
-                            .map(|opt_f| match opt_f {
-                                Some(f) => match f(raw_op.as_slice()) {
-                                    Ok(read_op) => match ref_.remote_read(
-                                        &segment_id,
-                                        partition_id,
-                                        v,
-                                        read_op,
-                                    ) {
-                                        Ok(val) => (packet::Status::Success, val),
-                                        Err(err) => (packet::Status::from(err), vec![]),
-                                    },
-                                    Err(err) => {
-                                        (packet::Status::from(CorylusError::from(err)), vec![])
-                                    }
-                                },
-                                None => (packet::Status::OperationNotFound, vec![]),
-                            })
-                            .unwrap_or_else(|err| {
-                                (packet::Status::from(CorylusError::from(err)), vec![])
-                            });
+                            .map_err(CorylusError::from)
+                            .and_then(|inner| inner.map_err(CorylusError::from))
+                            .and_then(|f| f(raw_op.as_slice()).map_err(CorylusError::from))
+                            .and_then(|op| ref_.remote_read(&segment_id, partition_id, v, op))
+                            .map(|val| (packet::Status::Success, val))
+                            .unwrap_or_else(|err| (packet::Status::from(err), vec![]));
 
                         let _ = ref_.net.send(
                             from,
@@ -86,22 +72,12 @@ impl Task {
                             .with_segment_read(partition_id as usize, &segment_id, |segment| {
                                 segment.op_reg.write_fn(&op_id)
                             })
-                            .map(|opt_f| match opt_f {
-                                Some(f) => match f(raw_op.as_slice()) {
-                                    Ok(write_op) => match ref_.remote_write(
-                                        &segment_id,
-                                        partition_id,
-                                        v,
-                                        write_op,
-                                    ) {
-                                        Ok(_) => packet::Status::Success,
-                                        Err(err) => packet::Status::from(err),
-                                    },
-                                    Err(err) => packet::Status::from(CorylusError::from(err)),
-                                },
-                                None => packet::Status::OperationNotFound,
-                            })
-                            .unwrap_or_else(|err| packet::Status::from(CorylusError::from(err)));
+                            .map_err(CorylusError::from)
+                            .and_then(|inner| inner.map_err(CorylusError::from))
+                            .and_then(|f| f(raw_op.as_slice()).map_err(CorylusError::from))
+                            .and_then(|op| ref_.remote_write(&segment_id, partition_id, v, op))
+                            .map(|_| packet::Status::Success)
+                            .unwrap_or_else(packet::Status::from);
 
                         let _ = ref_.net.send(
                             from,

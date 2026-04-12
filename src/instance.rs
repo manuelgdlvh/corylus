@@ -11,14 +11,14 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    CorylusResult, Instance,
-    instance::operation::{Deserializer, Serializer},
+    CorylusError, CorylusResult, Instance,
     network::{
         self,
         packet::{self, Packet},
     },
     object::map::{Get, Put},
     partition::{self, Segment},
+    serde::{Deserializer, Serializer},
 };
 
 pub mod operation;
@@ -370,13 +370,10 @@ impl Inner {
             )?;
 
             match response.get(Duration::from_secs(1))? {
-                Packet::Reply(packet::Reply::WriteOp { status, .. }) => {
-                    if packet::Status::Success.eq(&status) {
-                        Ok(())
-                    } else {
-                        Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input").into())
-                    }
-                }
+                Packet::Reply(packet::Reply::WriteOp { status, .. }) => match status {
+                    packet::Status::Success => Ok(()),
+                    s => Err(CorylusError::try_from(s).unwrap()),
+                },
                 Packet::Reply(_) | Packet::Request(_) => {
                     Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into())
                 }
@@ -408,13 +405,10 @@ impl Inner {
             )?;
 
             match response.get(Duration::from_secs(1))? {
-                Packet::Reply(packet::Reply::GetOp { status, result, .. }) => {
-                    if packet::Status::Success.eq(&status) {
-                        Ok(result)
-                    } else {
-                        Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input").into())
-                    }
-                }
+                Packet::Reply(packet::Reply::GetOp { status, result, .. }) => match status {
+                    packet::Status::Success => Ok(result),
+                    s => Err(CorylusError::try_from(s).unwrap()),
+                },
                 Packet::Reply(_) | Packet::Request(_) => {
                     Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into())
                 }
