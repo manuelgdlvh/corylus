@@ -267,11 +267,47 @@ impl AsRef<sync::Weak<Inner>> for Weak {
     }
 }
 
+pub struct Membership(Mutex<HashSet<Uuid>>);
+
+impl Default for Membership {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Membership {
+    pub fn new() -> Self {
+        Self(Mutex::new(HashSet::new()))
+    }
+
+    pub(crate) fn remove(&self, id: Uuid) {
+        let mut members = self.0.lock().expect("Cannot be poisoned");
+        members.remove(&id);
+    }
+
+    pub(crate) fn add(&self, id: Uuid) {
+        let mut members = self.0.lock().expect("Cannot be poisoned");
+        members.insert(id);
+    }
+
+    pub(crate) fn all(&self) -> Vec<Uuid> {
+        let mut member_ids = self
+            .0
+            .lock()
+            .expect("Cannot be poisoned")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable();
+        member_ids
+    }
+}
+
 pub struct Inner {
     pub(crate) id: Uuid,
     pub(crate) net: network::Sender,
     pub(crate) part_group: partition::Group,
-    pub(crate) members: Mutex<HashSet<Uuid>>,
+    pub(crate) membership: Membership,
     pub(crate) shutdown: Shutdown,
 }
 
@@ -282,28 +318,6 @@ impl Drop for Inner {
 }
 
 impl Inner {
-    pub(crate) fn remove_member(&self, id: Uuid) {
-        let mut members = self.members.lock().expect("Cannot be poisoned");
-        members.remove(&id);
-    }
-
-    pub(crate) fn add_member(&self, id: Uuid) {
-        let mut members = self.members.lock().expect("Cannot be poisoned");
-        members.insert(id);
-    }
-
-    pub(crate) fn members(&self) -> Vec<Uuid> {
-        let mut member_ids = self
-            .members
-            .lock()
-            .expect("Cannot be poisoned")
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        member_ids.sort_unstable();
-        member_ids
-    }
-
     pub(crate) fn remote_write<O: operation::Write>(
         &self,
         s_id: &str,

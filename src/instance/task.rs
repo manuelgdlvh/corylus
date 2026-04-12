@@ -17,7 +17,7 @@ impl Task {
         match self {
             Self::PartitionRebalance => {
                 if let Some(ref_) = instance.as_ref().upgrade() {
-                    let members = ref_.members();
+                    let members = ref_.membership.all();
                     let _ = ref_.part_group.update(members.as_slice());
                 }
             }

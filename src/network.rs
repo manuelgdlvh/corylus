@@ -199,14 +199,14 @@ impl Receiver {
                             Message::Event { val } => match val {
                                 Event::PeerAdded { id } => {
                                     if let Some(ref_) = instance.as_ref().upgrade() {
-                                        ref_.add_member(id);
+                                        ref_.membership.add(id);
                                         task_executor
                                             .spawn(instance.clone(), Task::PartitionRebalance);
                                     }
                                 }
                                 Event::PeerRemoved { id } => {
                                     if let Some(ref_) = instance.as_ref().upgrade() {
-                                        ref_.remove_member(id);
+                                        ref_.membership.remove(id);
                                         task_executor
                                             .spawn(instance.clone(), Task::PartitionRebalance);
                                     }

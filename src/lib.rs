@@ -1,15 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    hash::Hash,
-    io, result,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, hash::Hash, io, result, sync::Arc};
 
 use uuid::Uuid;
 
 use crate::{
     instance::{
-        Shutdown,
+        Membership, Shutdown,
         operation::{self},
     },
     object::DistributedMap,
@@ -50,14 +45,14 @@ impl Instance {
         part_group: partition::Group,
         shutdown: Shutdown,
     ) -> Self {
-        let mut members = HashSet::new();
-        members.insert(id);
+        let membership = Membership::new();
+        membership.add(id);
 
         let inner = Arc::new(instance::Inner {
             id,
             net,
             part_group,
-            members: Mutex::new(members),
+            membership,
             shutdown,
         });
 
@@ -69,7 +64,7 @@ impl Instance {
     }
 
     pub fn members(&self) -> Vec<Uuid> {
-        self.inner.members()
+        self.inner.membership.all()
     }
 
     pub fn part_group_version(&self) -> u128 {
