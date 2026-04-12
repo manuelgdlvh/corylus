@@ -20,8 +20,8 @@ pub enum Error {
     PartitionNotFound,
     #[error("Segment not found ")]
     SegmentNotFound,
-    #[error("Invalid version")]
-    InvalidVersion,
+    #[error("Rebalance in progress")]
+    Rebalance,
 }
 
 pub trait RawSegment: Send + Sync + Any {

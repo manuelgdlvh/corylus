@@ -69,15 +69,15 @@ pub enum Read {
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum Status {
     Success = 0,
-    InvalidPartitionVersion = 1,
+    Rebalance = 1,
     OperationNotFound = 2,
     PartitionNotFound = 3,
     SegmentNotFound = 4,
     IoError = 5,
-    SerdeError = 6,
+    SerdeInvalidBufferSize = 6,
+    SerdeUnknown = 7,
+    SerdeInvalidUtf8 = 8,
 }
-
-// TODO: Fix these mappings
 impl From<CorylusError> for Status {
     fn from(value: CorylusError) -> Self {
         match value {
@@ -85,12 +85,16 @@ impl From<CorylusError> for Status {
             CorylusError::Partition(err) => match err {
                 partition::Error::PartitionNotFound => Status::PartitionNotFound,
                 partition::Error::SegmentNotFound => Status::SegmentNotFound,
-                partition::Error::InvalidVersion => Status::InvalidPartitionVersion,
+                partition::Error::Rebalance => Status::Rebalance,
             },
             CorylusError::Operation(err) => match err {
                 operation::Error::OperationNotFound => Status::OperationNotFound,
             },
-            CorylusError::Serde(_) => Status::SerdeError,
+            CorylusError::Serde(err) => match err {
+                serde::Error::InvalidBufferSize => Status::SerdeInvalidBufferSize,
+                serde::Error::InvalidUtf8 => Status::SerdeInvalidUtf8,
+                serde::Error::Unknown => Status::SerdeUnknown,
+            },
         }
     }
 }
@@ -103,9 +107,7 @@ impl TryFrom<Status> for CorylusError {
     fn try_from(value: Status) -> Result<Self, Self::Error> {
         match value {
             Status::Success => Err(()),
-            Status::InvalidPartitionVersion => {
-                Ok(CorylusError::Partition(partition::Error::InvalidVersion))
-            }
+            Status::Rebalance => Ok(CorylusError::Partition(partition::Error::Rebalance)),
             Status::OperationNotFound => {
                 Ok(CorylusError::Operation(operation::Error::OperationNotFound))
             }
@@ -116,7 +118,11 @@ impl TryFrom<Status> for CorylusError {
                 Ok(CorylusError::Partition(partition::Error::SegmentNotFound))
             }
             Status::IoError => Ok(CorylusError::Io(std::io::Error::other("IO error"))),
-            Status::SerdeError => Ok(CorylusError::Serde(serde::Error::Unknown)),
+            Status::SerdeUnknown => Ok(CorylusError::Serde(serde::Error::Unknown)),
+            Status::SerdeInvalidBufferSize => {
+                Ok(CorylusError::Serde(serde::Error::InvalidBufferSize))
+            }
+            Status::SerdeInvalidUtf8 => Ok(CorylusError::Serde(serde::Error::InvalidUtf8)),
         }
     }
 }

@@ -9,7 +9,7 @@ impl Serializer for String {
 
 impl Deserializer for String {
     fn deserialize(buffer: &[u8]) -> result::Result<Self, serde::Error> {
-        String::from_utf8(buffer.to_vec()).map_err(serde::Error::InvalidUtf8)
+        String::from_utf8(buffer.to_vec()).map_err(|_| serde::Error::InvalidUtf8)
     }
 }
 
@@ -34,10 +34,7 @@ impl Serializer for bool {
 impl Deserializer for bool {
     fn deserialize(buffer: &[u8]) -> result::Result<Self, serde::Error> {
         if buffer.len() != 1 {
-            return Err(serde::Error::InvalidBufferSize {
-                expected: 1,
-                got: buffer.len(),
-            });
+            return Err(serde::Error::InvalidBufferSize);
         }
         match buffer[0] {
             0 => Ok(false),
@@ -59,10 +56,7 @@ macro_rules! impl_fixed_serde {
             fn deserialize(buffer: &[u8]) -> result::Result<Self, serde::Error> {
                 const N: usize = std::mem::size_of::<$t>();
                 if buffer.len() != N {
-                    return Err(serde::Error::InvalidBufferSize {
-                        expected: N,
-                        got: buffer.len(),
-                    });
+                    return Err(serde::Error::InvalidBufferSize);
                 }
                 Ok(<$t>::from_le_bytes(buffer.try_into().unwrap()))
             }

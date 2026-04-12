@@ -308,14 +308,13 @@ impl Inner {
     ) -> CorylusResult<()> {
         // If partition version is correct is ensured that this node is master or replica.
         if !self.part_group.version().eq(&v) {
-            return Err(partition::Error::InvalidVersion.into());
+            return Err(partition::Error::Rebalance.into());
         }
 
         // Implement double check of part group version inside lock.
         // Implement await of status change if not ready and tryLock.
         self.part_group
             .with_segment_write(p_id as usize, s_id, |segment| {
-                // TODO: Double check of conditionals above
                 op.execute(&mut *segment.data);
             })
             .map_err(|err| err.into())
@@ -332,7 +331,7 @@ impl Inner {
     ) -> CorylusResult<Vec<u8>> {
         // If partition version is correct is ensured that this node is master or replica.
         if !self.part_group.version().eq(&v) {
-            return Err(partition::Error::InvalidVersion.into());
+            return Err(partition::Error::Rebalance.into());
         }
 
         // Implement double check of part group version inside lock.
@@ -350,7 +349,6 @@ impl Inner {
         if self.id.eq(&owner) {
             self.part_group
                 .with_segment_write(p_id as usize, s_id, |segment| {
-                    // TODO: Double check of still owner of id
                     op.execute(&mut *segment.data);
                 })
                 .map_err(|err| err.into())
