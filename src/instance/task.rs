@@ -34,11 +34,7 @@ impl Task {
                     if let Some(ref_) = instance.as_ref().upgrade() {
                         let (status, result) = ref_
                             .part_group
-                            .with_segment_read(partition_id as usize, &segment_id, |segment| {
-                                segment.op_reg.read_fn(&op_id)
-                            })
-                            .map_err(CorylusError::from)
-                            .and_then(|inner| inner.map_err(CorylusError::from))
+                            .read_fn(&segment_id, &op_id)
                             .and_then(|f| f(raw_op.as_slice()).map_err(CorylusError::from))
                             .and_then(|op| ref_.remote_read(&segment_id, partition_id, v, op))
                             .map(|val| (packet::Status::Success, val))
@@ -69,11 +65,7 @@ impl Task {
                     if let Some(ref_) = instance.as_ref().upgrade() {
                         let status = ref_
                             .part_group
-                            .with_segment_read(partition_id as usize, &segment_id, |segment| {
-                                segment.op_reg.write_fn(&op_id)
-                            })
-                            .map_err(CorylusError::from)
-                            .and_then(|inner| inner.map_err(CorylusError::from))
+                            .write_fn(&segment_id, &op_id)
                             .and_then(|f| f(raw_op.as_slice()).map_err(CorylusError::from))
                             .and_then(|op| ref_.remote_write(&segment_id, partition_id, v, op))
                             .map(|_| packet::Status::Success)

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, io};
 
 use crate::{partition, serde};
 
@@ -118,64 +118,37 @@ pub type ReadBuilder = fn(&[u8]) -> Result<GenericRead, io::Error>;
 pub type WriteBuilder = fn(&[u8]) -> Result<GenericWrite, io::Error>;
 pub type OpId = &'static str;
 
-pub enum Type {
-    Read,
-    Write,
-}
-
-#[derive(Clone)]
-pub struct Registry {
-    inner: Arc<Inner>,
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Registry {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Default::default()),
-        }
-    }
-}
-
 #[derive(Default)]
-pub struct Inner {
-    types: HashMap<OpId, Type>,
+pub struct Registry {
     read_fns: HashMap<OpId, ReadBuilder>,
     write_fns: HashMap<OpId, WriteBuilder>,
 }
 
 impl Registry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Registry {
     pub fn with_read_op<O: Read>(mut self) -> Self {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.types.insert(O::static_id(), Type::Read);
-            inner.read_fns.insert(O::static_id(), O::deserialize);
-        }
+        self.read_fns.insert(O::static_id(), O::deserialize);
         self
     }
     pub fn with_write_op<O: Write>(mut self) -> Self {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.types.insert(O::static_id(), Type::Write);
-            inner.write_fns.insert(O::static_id(), O::deserialize);
-        }
+        self.write_fns.insert(O::static_id(), O::deserialize);
         self
     }
 
     pub fn read_fn(&self, op_id: &str) -> Result<ReadBuilder, Error> {
-        self.inner
-            .read_fns
+        self.read_fns
             .get(op_id)
             .ok_or(Error::OperationNotFound)
             .copied()
     }
 
     pub fn write_fn(&self, op_id: &str) -> Result<WriteBuilder, Error> {
-        self.inner
-            .write_fns
+        self.write_fns
             .get(op_id)
             .ok_or(Error::OperationNotFound)
             .copied()

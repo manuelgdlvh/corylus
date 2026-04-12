@@ -9,7 +9,11 @@ use thiserror::Error;
 use twox_hash::{XxHash3_64, XxHash3_128};
 use uuid::Uuid;
 
-use crate::{instance::operation, partition};
+use crate::{
+    CorylusError, CorylusResult,
+    instance::operation::{self, ReadBuilder, WriteBuilder},
+    partition,
+};
 
 const RING_CAPACITY: usize = 1024;
 const PARTITION_HASH_SEED: u64 = 1234;
@@ -32,18 +36,16 @@ pub trait RawSegment: Send + Sync + Any {
 pub struct Segment {
     id: String,
     pub(crate) data: Box<dyn RawSegment>,
-    pub(crate) op_reg: operation::Registry,
     // Useful for entropy process of partitions after membership changes or corruption detection
     seq: u64,
     checksum: u64,
 }
 
 impl Segment {
-    pub fn new<S: RawSegment + 'static>(id: String, data: S, op_reg: operation::Registry) -> Self {
+    pub fn new<S: RawSegment + 'static>(id: String, data: S) -> Self {
         Self {
             id,
             data: Box::new(data),
-            op_reg,
             seq: 0,
             checksum: 0,
         }
@@ -52,16 +54,22 @@ impl Segment {
 
 pub struct Group {
     partitions: [Partition; RING_CAPACITY],
+    ops: HashMap<String, operation::Registry>,
     version: Mutex<u128>,
 }
 
 impl Group {
-    pub fn new<F: Fn() -> Segment>(member_id: Uuid, segment_fns: &[F]) -> Self {
+    pub fn new<F: Fn() -> Segment>(
+        member_id: Uuid,
+        ops: HashMap<String, operation::Registry>,
+        segment_fns: &[F],
+    ) -> Self {
         let partitions: [Partition; RING_CAPACITY] =
             array::from_fn(|id| Partition::new(id, member_id, segment_fns));
 
         Self {
             partitions,
+            ops,
             version: Mutex::new(Self::compute_version(&[member_id])),
         }
     }
@@ -168,6 +176,22 @@ impl Group {
         } else {
             Err(Error::SegmentNotFound)
         }
+    }
+
+    pub fn read_fn(&self, s_id: &str, op_id: &str) -> CorylusResult<ReadBuilder> {
+        self.ops
+            .get(s_id)
+            .ok_or(CorylusError::from(Error::SegmentNotFound))?
+            .read_fn(op_id)
+            .map_err(CorylusError::from)
+    }
+
+    pub fn write_fn(&self, s_id: &str, op_id: &str) -> CorylusResult<WriteBuilder> {
+        self.ops
+            .get(s_id)
+            .ok_or(CorylusError::from(Error::SegmentNotFound))?
+            .write_fn(op_id)
+            .map_err(CorylusError::from)
     }
 
     pub fn version(&self) -> u128 {

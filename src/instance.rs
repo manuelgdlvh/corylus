@@ -37,6 +37,7 @@ pub struct Builder<S> {
     id: Option<Uuid>,
     c: Option<Config>,
     d: Option<network::Discovery>,
+    ops: HashMap<String, operation::Registry>,
     segments: Vec<Box<dyn Fn() -> Segment>>,
     _state: PhantomData<S>,
 }
@@ -53,6 +54,7 @@ impl Builder<NeedsId> {
             id: None,
             c: None,
             d: None,
+            ops: HashMap::new(),
             segments: Vec::new(),
             _state: PhantomData,
         }
@@ -62,6 +64,7 @@ impl Builder<NeedsId> {
             id: Some(id),
             c: self.c,
             d: self.d,
+            ops: self.ops,
             segments: self.segments,
             _state: PhantomData,
         }
@@ -74,6 +77,7 @@ impl Builder<NeedsConfig> {
             id: self.id,
             c: Some(c),
             d: self.d,
+            ops: self.ops,
             segments: self.segments,
             _state: PhantomData,
         }
@@ -86,6 +90,7 @@ impl Builder<NeedsDiscovery> {
             id: self.id,
             c: self.c,
             d: Some(d),
+            ops: self.ops,
             segments: self.segments,
             _state: PhantomData,
         }
@@ -103,10 +108,10 @@ impl Builder<Ready> {
         let op_reg = operation::Registry::new()
             .with_read_op::<Get<K, V>>()
             .with_write_op::<Put<K, V>>();
-
+        self.ops.insert(id.to_string(), op_reg);
         self.segments.push(Box::new(move || {
             let data: HashMap<K, V> = HashMap::new();
-            Segment::new(id.to_string(), data, op_reg.clone())
+            Segment::new(id.to_string(), data)
         }));
 
         self
@@ -120,7 +125,7 @@ impl Builder<Ready> {
         let shutdown = Shutdown::new();
 
         let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
-        let partition = partition::Group::new(id, self.segments.as_slice());
+        let partition = partition::Group::new(id, self.ops, self.segments.as_slice());
         let instance = Instance::new(id, net_sender, partition, shutdown.clone());
 
         shutdown.register(net_receiver.start(instance.downgrade())?);
