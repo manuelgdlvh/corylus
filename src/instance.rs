@@ -17,7 +17,7 @@ use crate::{
         packet::{self, Packet},
     },
     object::map::{Get, Put},
-    partition::{self, Segment},
+    partition::{self, Replication, Segment, segment},
     serde::{Deserializer, Serializer},
 };
 
@@ -37,8 +37,8 @@ pub struct Builder<S> {
     id: Option<Uuid>,
     c: Option<Config>,
     d: Option<network::Discovery>,
-    ops: HashMap<String, operation::Registry>,
-    segments: Vec<Box<dyn Fn() -> Segment>>,
+    segment_metadata: HashMap<String, segment::Metadata>,
+    segment_fns: Vec<Box<dyn Fn() -> Segment>>,
     _state: PhantomData<S>,
 }
 
@@ -54,8 +54,8 @@ impl Builder<NeedsId> {
             id: None,
             c: None,
             d: None,
-            ops: HashMap::new(),
-            segments: Vec::new(),
+            segment_metadata: HashMap::new(),
+            segment_fns: Vec::new(),
             _state: PhantomData,
         }
     }
@@ -64,8 +64,8 @@ impl Builder<NeedsId> {
             id: Some(id),
             c: self.c,
             d: self.d,
-            ops: self.ops,
-            segments: self.segments,
+            segment_metadata: self.segment_metadata,
+            segment_fns: self.segment_fns,
             _state: PhantomData,
         }
     }
@@ -77,8 +77,8 @@ impl Builder<NeedsConfig> {
             id: self.id,
             c: Some(c),
             d: self.d,
-            ops: self.ops,
-            segments: self.segments,
+            segment_metadata: self.segment_metadata,
+            segment_fns: self.segment_fns,
             _state: PhantomData,
         }
     }
@@ -90,15 +90,15 @@ impl Builder<NeedsDiscovery> {
             id: self.id,
             c: self.c,
             d: Some(d),
-            ops: self.ops,
-            segments: self.segments,
+            segment_metadata: self.segment_metadata,
+            segment_fns: self.segment_fns,
             _state: PhantomData,
         }
     }
 }
 
 impl Builder<Ready> {
-    pub fn with_map<K, V>(mut self, id: &str) -> Self
+    pub fn with_map<K, V>(mut self, id: &str, repl: Replication, repl_factor: usize) -> Self
     where
         K: Serializer + Deserializer + Send + Sync + Hash + Eq + Clone + 'static,
         V: Serializer + Deserializer + Send + Sync + Clone + 'static,
@@ -108,8 +108,11 @@ impl Builder<Ready> {
         let op_reg = operation::Registry::new()
             .with_read_op::<Get<K, V>>()
             .with_write_op::<Put<K, V>>();
-        self.ops.insert(id.to_string(), op_reg);
-        self.segments.push(Box::new(move || {
+        self.segment_metadata.insert(
+            id.to_string(),
+            segment::Metadata::new(op_reg, repl_factor, repl),
+        );
+        self.segment_fns.push(Box::new(move || {
             let data: HashMap<K, V> = HashMap::new();
             Segment::new(id.to_string(), data)
         }));
@@ -125,7 +128,8 @@ impl Builder<Ready> {
         let shutdown = Shutdown::new();
 
         let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
-        let partition = partition::Group::new(id, self.ops, self.segments.as_slice());
+        let partition =
+            partition::Group::new(id, self.segment_metadata, self.segment_fns.as_slice());
         let instance = Instance::new(id, net_sender, partition, shutdown.clone());
 
         shutdown.register(net_receiver.start(instance.downgrade())?);

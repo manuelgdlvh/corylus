@@ -45,7 +45,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(f: F) -> C
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
             ],
         })
-        .with_map::<String, String>("str-str")
+        .with_map::<String, String>("str-str", partition::Replication::None, 0)
         .build()?;
 
     let instance_2 = instance::Builder::new()
@@ -66,7 +66,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(f: F) -> C
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
             ],
         })
-        .with_map::<String, String>("str-str")
+        .with_map::<String, String>("str-str", partition::Replication::None, 0)
         .build()?;
 
     wait_until(

@@ -9,11 +9,7 @@ use thiserror::Error;
 use twox_hash::{XxHash3_64, XxHash3_128};
 use uuid::Uuid;
 
-use crate::{
-    CorylusError, CorylusResult,
-    instance::operation::{self, ReadBuilder, WriteBuilder},
-    partition,
-};
+use crate::partition;
 
 const RING_CAPACITY: usize = 1024;
 const PARTITION_HASH_SEED: u64 = 1234;
@@ -52,16 +48,61 @@ impl Segment {
     }
 }
 
+#[derive(Copy, Clone)]
+pub enum Replication {
+    Sync,
+    Async,
+    None,
+}
+
+pub mod segment {
+    use crate::{
+        instance::operation::{self, ReadBuilder, WriteBuilder},
+        partition::Replication,
+    };
+
+    pub struct Metadata {
+        ops: operation::Registry,
+        repl_factor: usize,
+        repl: Replication,
+    }
+
+    impl Metadata {
+        pub fn new(ops: operation::Registry, repl_factor: usize, repl: Replication) -> Self {
+            Self {
+                ops,
+                repl_factor,
+                repl,
+            }
+        }
+        pub fn read_fn(&self, op_id: &str) -> Result<ReadBuilder, operation::Error> {
+            self.ops.read_fn(op_id)
+        }
+
+        pub fn write_fn(&self, op_id: &str) -> Result<WriteBuilder, operation::Error> {
+            self.ops.write_fn(op_id)
+        }
+
+        pub fn repl_factor(&self) -> usize {
+            self.repl_factor
+        }
+
+        pub fn repl(&self) -> Replication {
+            self.repl
+        }
+    }
+}
+
 pub struct Group {
     partitions: [Partition; RING_CAPACITY],
-    ops: HashMap<String, operation::Registry>,
+    s_metadata: HashMap<String, segment::Metadata>,
     version: Mutex<u128>,
 }
 
 impl Group {
     pub fn new<F: Fn() -> Segment>(
         member_id: Uuid,
-        ops: HashMap<String, operation::Registry>,
+        s_metadata: HashMap<String, segment::Metadata>,
         segment_fns: &[F],
     ) -> Self {
         let partitions: [Partition; RING_CAPACITY] =
@@ -69,7 +110,7 @@ impl Group {
 
         Self {
             partitions,
-            ops,
+            s_metadata,
             version: Mutex::new(Self::compute_version(&[member_id])),
         }
     }
@@ -105,7 +146,6 @@ impl Group {
         metadata.replica_ids.contains(&member_id)
     }
 
-    // The algorithm should be after updated, i get as read lock all the states that i should migrate. Then i send to assigned peer the snapshot. When OK i clear and unlock.
     pub fn update(&self, member_ids: &[Uuid]) -> HashMap<usize, Vec<MembershipChange>> {
         let mut result = HashMap::with_capacity(RING_CAPACITY);
         for p_id in 0..RING_CAPACITY {
@@ -178,20 +218,8 @@ impl Group {
         }
     }
 
-    pub fn read_fn(&self, s_id: &str, op_id: &str) -> CorylusResult<ReadBuilder> {
-        self.ops
-            .get(s_id)
-            .ok_or(CorylusError::from(Error::SegmentNotFound))?
-            .read_fn(op_id)
-            .map_err(CorylusError::from)
-    }
-
-    pub fn write_fn(&self, s_id: &str, op_id: &str) -> CorylusResult<WriteBuilder> {
-        self.ops
-            .get(s_id)
-            .ok_or(CorylusError::from(Error::SegmentNotFound))?
-            .write_fn(op_id)
-            .map_err(CorylusError::from)
+    pub fn metadata(&self, s_id: &str) -> Result<&segment::Metadata, partition::Error> {
+        self.s_metadata.get(s_id).ok_or(Error::SegmentNotFound)
     }
 
     pub fn version(&self) -> u128 {
