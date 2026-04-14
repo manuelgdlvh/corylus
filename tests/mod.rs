@@ -86,7 +86,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
                 && instance_1.part_group_version() == version
         },
         Duration::from_millis(100),
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
 
     wait_until(
@@ -95,7 +95,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
                 && instance_2.part_group_version() == version
         },
         Duration::from_millis(100),
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
 
     f(instance_1, instance_2)

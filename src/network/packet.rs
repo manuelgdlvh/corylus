@@ -8,6 +8,7 @@ use crate::{CorylusError, instance::operation, partition, serde};
 pub enum Event {
     PeerAdded { id: Uuid },
     PeerRemoved { id: Uuid },
+    Checkpoint,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -46,6 +47,11 @@ pub enum Write {
         op_id: String,
         raw_op: Vec<u8>,
     },
+    PartitionFetchCompletion {
+        v: u128,
+        corr_id: Uuid,
+        partition_id: u16,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -63,6 +69,13 @@ pub enum Read {
         op_id: String,
         raw_op: Vec<u8>,
     },
+    FetchObject {
+        v: u128,
+        corr_id: Uuid,
+        // Just to check inconsistences in the partition tables to reject
+        partition_id: u16,
+        segment_id: String,
+    },
 }
 
 #[repr(u8)]
@@ -78,6 +91,7 @@ pub enum Status {
     SerdeUnknown = 7,
     SerdeInvalidUtf8 = 8,
     NotEnoughReplicas = 9,
+    PartitionNotReady = 10,
 }
 impl From<CorylusError> for Status {
     fn from(value: CorylusError) -> Self {
@@ -88,6 +102,7 @@ impl From<CorylusError> for Status {
                 partition::Error::SegmentNotFound => Status::SegmentNotFound,
                 partition::Error::Rebalance => Status::Rebalance,
                 partition::Error::NotEnoughReplicas => Status::NotEnoughReplicas,
+                partition::Error::PartitionNotReady => Status::PartitionNotReady,
             },
             CorylusError::Operation(err) => match err {
                 operation::Error::OperationNotFound => Status::OperationNotFound,
@@ -128,6 +143,9 @@ impl TryFrom<Status> for CorylusError {
             Status::NotEnoughReplicas => {
                 Ok(CorylusError::Partition(partition::Error::NotEnoughReplicas))
             }
+            Status::PartitionNotReady => {
+                Ok(CorylusError::Partition(partition::Error::PartitionNotReady))
+            }
         }
     }
 }
@@ -158,6 +176,16 @@ pub enum Reply {
         status: Status,
         result: Vec<u8>,
     },
+    FetchObject {
+        corr_id: Uuid,
+        status: Status,
+        result: Vec<u8>,
+    },
+
+    PartitionFetchCompletion {
+        corr_id: Uuid,
+        status: Status,
+    },
 }
 
 pub(crate) const DISCRIMINANT: usize = std::mem::size_of::<u8>();
@@ -183,16 +211,20 @@ impl Packet {
                 Request::Read(val) => match val {
                     Read::WhoIs { .. } => 1,
                     Read::GetOp { .. } => 8,
+                    Read::FetchObject { .. } => 10,
                 },
                 Request::Write(val) => match val {
                     Write::WriteOp { .. } => 6,
                     Write::HeartBeat => 3,
+                    Write::PartitionFetchCompletion { .. } => 12,
                 },
             },
             Self::Reply(val) => match val {
                 Reply::WhoIs { .. } => 2,
                 Reply::WriteOp { .. } => 7,
                 Reply::GetOp { .. } => 9,
+                Reply::FetchObject { .. } => 11,
+                Reply::PartitionFetchCompletion { .. } => 13,
             },
         }
     }
@@ -203,16 +235,20 @@ impl Packet {
                 Request::Read(val) => match val {
                     Read::WhoIs { .. } => None,
                     Read::GetOp { corr_id, .. } => Some(*corr_id),
+                    Read::FetchObject { corr_id, .. } => Some(*corr_id),
                 },
                 Request::Write(val) => match val {
                     Write::WriteOp { corr_id, .. } => Some(*corr_id),
                     Write::HeartBeat => None,
+                    Write::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
                 },
             },
             Self::Reply(val) => match val {
                 Reply::WhoIs { .. } => None,
                 Reply::WriteOp { corr_id, .. } => Some(*corr_id),
                 Reply::GetOp { corr_id, .. } => Some(*corr_id),
+                Reply::FetchObject { corr_id, .. } => Some(*corr_id),
+                Reply::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
             },
         }
     }
@@ -226,6 +262,10 @@ impl Packet {
             7 => Len::Exact(17),
             8 => Len::Hint(512),
             9 => Len::Hint(512),
+            10 => Len::Hint(128),
+            11 => Len::Hint(4096),
+            12 => Len::Exact(34),
+            13 => Len::Exact(17),
             _ => Len::Hint(256),
         }
     }
@@ -285,6 +325,20 @@ impl From<&Packet> for Vec<u8> {
                             buffer.extend_from_slice(raw_op.as_slice());
                         }
                     }
+                    Read::FetchObject {
+                        v,
+                        corr_id,
+                        partition_id,
+                        segment_id,
+                    } => {
+                        buffer.extend_from_slice(&v.to_le_bytes());
+                        buffer.extend_from_slice(corr_id.as_bytes());
+                        buffer.extend_from_slice(&partition_id.to_le_bytes());
+
+                        let segment_id_len: u16 = segment_id.len() as u16;
+                        buffer.extend_from_slice(&segment_id_len.to_le_bytes());
+                        buffer.extend_from_slice(segment_id.as_bytes());
+                    }
                 },
 
                 Request::Write(write) => match write {
@@ -314,6 +368,16 @@ impl From<&Packet> for Vec<u8> {
                             buffer.extend_from_slice(raw_op.as_slice());
                         }
                     }
+
+                    Write::PartitionFetchCompletion {
+                        v,
+                        corr_id,
+                        partition_id,
+                    } => {
+                        buffer.extend_from_slice(&v.to_le_bytes());
+                        buffer.extend_from_slice(corr_id.as_bytes());
+                        buffer.extend_from_slice(&partition_id.to_le_bytes());
+                    }
                 },
             },
 
@@ -337,6 +401,23 @@ impl From<&Packet> for Vec<u8> {
                     if !result.is_empty() {
                         buffer.extend_from_slice(result.as_slice());
                     }
+                }
+                Reply::FetchObject {
+                    corr_id,
+                    status,
+                    result,
+                } => {
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.push(*status as u8);
+
+                    if !result.is_empty() {
+                        buffer.extend_from_slice(result.as_slice());
+                    }
+                }
+
+                Reply::PartitionFetchCompletion { corr_id, status } => {
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.push(*status as u8);
                 }
             },
         }
@@ -504,6 +585,87 @@ impl From<&[u8]> for Packet {
                     status,
                     result,
                 })
+            }
+
+            10 => {
+                let mut offset = 1;
+
+                let v = u128::from_le_bytes(value[offset..offset + 16].try_into().unwrap());
+                offset += 16;
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
+                offset += 16;
+
+                let partition_id =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+                offset += 2;
+
+                let segment_id_len =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
+                offset += 2;
+
+                let segment_id = std::str::from_utf8(&value[offset..offset + segment_id_len])
+                    .unwrap()
+                    .to_string();
+
+                Packet::Request(Request::Read(Read::FetchObject {
+                    v,
+                    corr_id,
+                    partition_id,
+                    segment_id,
+                }))
+            }
+
+            11 => {
+                let mut offset = 1;
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
+                offset += 16;
+
+                let status = Status::try_from(value[offset]).unwrap();
+                offset += 1;
+
+                let result = if offset >= value.len() {
+                    vec![]
+                } else {
+                    value[offset..].to_vec()
+                };
+
+                Packet::Reply(Reply::FetchObject {
+                    corr_id,
+                    status,
+                    result,
+                })
+            }
+
+            12 => {
+                let mut offset = 1;
+
+                let v = u128::from_le_bytes(value[offset..offset + 16].try_into().unwrap());
+                offset += 16;
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
+                offset += 16;
+
+                let partition_id =
+                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+
+                Packet::Request(Request::Write(Write::PartitionFetchCompletion {
+                    v,
+                    corr_id,
+                    partition_id,
+                }))
+            }
+
+            13 => {
+                let mut offset = 1;
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
+                offset += 16;
+
+                let status = Status::try_from(value[offset]).unwrap();
+
+                Packet::Reply(Reply::PartitionFetchCompletion { corr_id, status })
             }
 
             _ => panic!("Unknown packet"),

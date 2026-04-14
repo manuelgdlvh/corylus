@@ -82,7 +82,7 @@ pub(crate) struct Registry {
 pub(crate) struct Inner {
     pub(crate) id: Uuid,
     pub(crate) config: network::Config,
-    tx_msg: SyncSender<Message>,
+    pub(crate) tx_msg: SyncSender<Message>,
     pub(crate) sigterm: Shutdown,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
     writers: RwLock<HashMap<Uuid, PeerWrite>>,

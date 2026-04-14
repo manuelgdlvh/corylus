@@ -19,10 +19,11 @@ use crate::{
         packet::{Event, InboundPacket, Packet},
         registry::{Registry, Response},
     },
+    partition,
 };
 
 pub mod packet;
-mod registry;
+pub mod registry;
 mod sched;
 
 pub enum Discovery {
@@ -200,15 +201,23 @@ impl Receiver {
                                 Event::PeerAdded { id } => {
                                     if let Some(ref_) = instance.as_ref().upgrade() {
                                         ref_.membership.add(id);
-                                        task_executor
-                                            .spawn(instance.clone(), Task::PartitionRebalance);
                                     }
                                 }
                                 Event::PeerRemoved { id } => {
                                     if let Some(ref_) = instance.as_ref().upgrade() {
                                         ref_.membership.remove(id);
-                                        task_executor
-                                            .spawn(instance.clone(), Task::PartitionRebalance);
+                                    }
+                                }
+                                Event::Checkpoint => {
+                                    if let Some(ref_) = instance.as_ref().upgrade() {
+                                        // TODO: What if just one peer? Partitions are initialized as Migration Lifecycle
+                                        let members = ref_.membership.all();
+                                        let expected_version =
+                                            partition::Group::compute_version(&members);
+                                        if !ref_.part_group.version().eq(&expected_version) {
+                                            task_executor
+                                                .spawn(instance.clone(), Task::PartitionRebalance);
+                                        }
                                     }
                                 }
                             },

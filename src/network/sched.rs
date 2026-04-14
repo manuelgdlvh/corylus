@@ -11,8 +11,8 @@ use rand::RngExt;
 use tracing::{error, info};
 
 use crate::network::{
-    self, Discovery,
-    packet::{self, Packet},
+    self, Discovery, Message,
+    packet::{self, Event, Packet},
     registry::{PeerRead, PeerWrite, Registry},
 };
 
@@ -100,6 +100,7 @@ pub(crate) fn hb(
                     }
                 });
 
+                let _ = registry.as_ref().tx_msg.send(Message::Event {val: Event::Checkpoint});
                 info!(id = %registry.as_ref().id, "Heartbeat tick finished");
             }
 

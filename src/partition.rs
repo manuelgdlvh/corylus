@@ -2,7 +2,11 @@ use std::{
     any::Any,
     array,
     collections::{BinaryHeap, HashMap, HashSet},
-    sync::{Mutex, RwLock},
+    sync::{
+        Condvar, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use thiserror::Error;
@@ -18,7 +22,9 @@ const PARTITION_HASH_SEED: u64 = 1234;
 pub enum Error {
     #[error("Partition not found ")]
     PartitionNotFound,
-    #[error("Segment not found ")]
+    #[error("Partition not ready")]
+    PartitionNotReady,
+    #[error("Segment not found")]
     SegmentNotFound,
     #[error("Rebalance in progress")]
     Rebalance,
@@ -55,6 +61,7 @@ pub struct Group {
     // TODO: Decouple from partition this
     objs_metadata: HashMap<String, object::Metadata>,
     version: Mutex<u128>,
+    initialized: AtomicBool,
 }
 
 impl Group {
@@ -70,7 +77,21 @@ impl Group {
             partitions,
             objs_metadata,
             version: Mutex::new(Self::compute_version(&[member_id])),
+            initialized: AtomicBool::new(false),
         }
+    }
+
+    pub fn await_ready(&self, p_id: usize, timeout: Option<Duration>) -> Result<(), Error> {
+        if p_id >= RING_CAPACITY {
+            return Err(Error::PartitionNotFound);
+        }
+
+        let partition = &self.partitions[p_id];
+        if !partition.await_ready(timeout) {
+            return Err(Error::PartitionNotReady);
+        }
+
+        Ok(())
     }
 
     pub fn partition_of(&self, key: &[u8]) -> u64 {
@@ -129,6 +150,17 @@ impl Group {
         }
     }
 
+    pub fn set_all_lifecycle(&self, lifecycle: Lifecycle) {
+        for p_id in 0..RING_CAPACITY {
+            self.set_lifecycle(p_id, lifecycle);
+        }
+    }
+
+    pub fn set_lifecycle(&self, p_id: usize, lifecycle: Lifecycle) {
+        let partition = &self.partitions[p_id];
+        partition.state.update(lifecycle);
+    }
+
     pub fn update(&self, member_ids: &[Uuid]) -> HashMap<usize, Vec<MembershipChange>> {
         let mut result = HashMap::with_capacity(RING_CAPACITY);
         for p_id in 0..RING_CAPACITY {
@@ -139,9 +171,12 @@ impl Group {
             }
         }
 
+        result
+    }
+
+    pub fn update_version(&self, member_ids: &[Uuid]) {
         let mut version = self.version.lock().expect("Cannot be poisoned");
         *version = Self::compute_version(member_ids);
-        result
     }
 
     pub fn compute_version(member_ids: &[Uuid]) -> u128 {
@@ -205,14 +240,27 @@ impl Group {
         self.objs_metadata.get(s_id).ok_or(Error::SegmentNotFound)
     }
 
+    pub fn objs_metadata(&self) -> &HashMap<String, object::Metadata> {
+        &self.objs_metadata
+    }
+
     pub fn version(&self) -> u128 {
         *self.version.lock().expect("Cannot be poisoned")
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::Acquire)
+    }
+
+    pub fn initialize(&self) {
+        self.initialized.store(true, Ordering::Release);
     }
 }
 
 pub struct Partition {
     metadata: RwLock<Metadata>,
     segments: HashMap<String, RwLock<Segment>>,
+    state: State<Lifecycle>,
 }
 
 impl Partition {
@@ -228,6 +276,7 @@ impl Partition {
         Self {
             metadata: RwLock::new(Metadata::new(id, master_id, replica_ids)),
             segments,
+            state: State::new(),
         }
     }
 
@@ -238,7 +287,7 @@ impl Partition {
     }
 
     fn compute_membership(partiton_id: usize, member_ids: &[Uuid]) -> (Uuid, Vec<Uuid>) {
-        if 0.eq(&member_ids.len()) {
+        if member_ids.is_empty() {
             panic!("Members cannot be empty");
         }
 
@@ -278,6 +327,10 @@ impl Partition {
             .expect("Critical section cannot be poisoned");
         let (master_id, replica_ids) = Partition::compute_membership(metadata.id, member_ids);
         metadata.update(master_id, replica_ids)
+    }
+
+    pub fn await_ready(&self, timeout: Option<Duration>) -> bool {
+        self.state.await_status(Lifecycle::Ready, timeout)
     }
 }
 
@@ -338,4 +391,55 @@ pub enum MembershipChange {
         added: Vec<Uuid>,
         removed: Vec<Uuid>,
     },
+}
+
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
+pub enum Lifecycle {
+    Ready,
+    #[default]
+    Migration,
+}
+
+pub struct State<T: Default + Eq + PartialEq> {
+    state: Mutex<T>,
+    cv: Condvar,
+}
+
+impl<T: Default + Eq + PartialEq> Default for State<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Default + Eq + PartialEq> State<T> {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(T::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub fn await_status(&self, status: T, timeout: Option<Duration>) -> bool {
+        let state = self.state.lock().expect("Cannot be poisoned");
+        if status.eq(&*state) {
+            return true;
+        }
+
+        match timeout {
+            Some(val) => match self.cv.wait_timeout(state, val) {
+                Ok((state, res)) => !res.timed_out() && status.eq(&*state),
+                Err(_) => false,
+            },
+            None => false,
+        }
+    }
+
+    pub fn update(&self, value: T) {
+        {
+            let mut state = self.state.lock().expect("Cannot be poisioned");
+            *state = value;
+        }
+
+        self.cv.notify_all();
+    }
 }
