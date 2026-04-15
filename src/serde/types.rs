@@ -8,7 +8,7 @@ impl Serializer for String {
 }
 
 impl Deserializer for String {
-    fn deserialize(buffer: &[u8]) -> result::Result<Self, serde::Error> {
+    fn deserialize(buffer: &[u8]) -> Result<Self, serde::Error> {
         String::from_utf8(buffer.to_vec()).map_err(|_| serde::Error::InvalidUtf8)
     }
 }
@@ -20,7 +20,7 @@ impl Serializer for Vec<u8> {
 }
 
 impl Deserializer for Vec<u8> {
-    fn deserialize(buffer: &[u8]) -> result::Result<Self, serde::Error> {
+    fn deserialize(buffer: &[u8]) -> Result<Self, serde::Error> {
         Ok(buffer.to_vec())
     }
 }
@@ -32,7 +32,7 @@ impl Serializer for bool {
 }
 
 impl Deserializer for bool {
-    fn deserialize(buffer: &[u8]) -> result::Result<Self, serde::Error> {
+    fn deserialize(buffer: &[u8]) -> Result<Self, serde::Error> {
         if buffer.len() != 1 {
             return Err(serde::Error::InvalidBufferSize);
         }

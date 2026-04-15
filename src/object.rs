@@ -1,15 +1,31 @@
-use std::{hash::Hash, marker::PhantomData};
-
+use crate::object::operation::{ReadBuilder, WriteBuilder};
 use crate::{
     CorylusResult,
     instance::{self},
     object::map::{Get, Put},
-    serde::{Deserializer, Serializer},
 };
-
-use crate::instance::operation::{self, ReadBuilder, WriteBuilder};
+use std::any::Any;
+use std::marker::PhantomData;
 
 pub mod map;
+pub mod operation;
+
+pub type Id = String;
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Operation not found")]
+    ObjectNotFound,
+    #[error("Operation not found")]
+    OperationNotFound,
+}
+
+pub trait Raw: Send + Sync + Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_mut_any(&mut self) -> &mut dyn Any;
+    fn as_raw(&self) -> Vec<u8>;
+    fn rebuild(&mut self, raw: Vec<u8>);
+}
 
 #[derive(Copy, Clone)]
 pub enum Replication {
@@ -69,12 +85,12 @@ impl Metadata {
         Self { ops, repl_config }
     }
 
-    pub fn read_fn(&self, op_id: &str) -> Result<ReadBuilder, operation::Error> {
-        self.ops.read_fn(op_id)
+    pub fn read_fn(&self, opart_id: &str) -> Result<ReadBuilder, Error> {
+        self.ops.read_fn(opart_id)
     }
 
-    pub fn write_fn(&self, op_id: &str) -> Result<WriteBuilder, operation::Error> {
-        self.ops.write_fn(op_id)
+    pub fn write_fn(&self, opart_id: &str) -> Result<WriteBuilder, Error> {
+        self.ops.write_fn(opart_id)
     }
 
     pub fn repl_factor(&self) -> usize {
@@ -92,8 +108,8 @@ impl Metadata {
 
 pub struct DistributedMap<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq + Clone,
-    V: Serializer + Deserializer + Clone,
+    K: map::Key,
+    V: map::Value,
 {
     instance: instance::Weak,
     id: String,
@@ -102,8 +118,8 @@ where
 
 impl<K, V> DistributedMap<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq + Clone + 'static,
-    V: Serializer + Deserializer + Clone + 'static,
+    K: map::Key,
+    V: map::Value,
 {
     pub fn new(id: String, instance: instance::Weak) -> Self {
         Self {

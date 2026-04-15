@@ -19,7 +19,6 @@ use crate::{
         packet::{Event, InboundPacket, Packet},
         registry::{Registry, Response},
     },
-    partition,
 };
 
 pub mod packet;
@@ -48,7 +47,7 @@ impl Sender {
             self.send(id, packet, timeout)?;
             Ok(response)
         } else {
-            todo!("Must return error if not informed correlation_id")
+            unreachable!("All packets must have informed correlation_id")
         }
     }
 
@@ -209,16 +208,7 @@ impl Receiver {
                                     }
                                 }
                                 Event::Checkpoint => {
-                                    if let Some(ref_) = instance.as_ref().upgrade() {
-                                        // TODO: What if just one peer? Partitions are initialized as Migration Lifecycle
-                                        let members = ref_.membership.all();
-                                        let expected_version =
-                                            partition::Group::compute_version(&members);
-                                        if !ref_.part_group.version().eq(&expected_version) {
-                                            task_executor
-                                                .spawn(instance.clone(), Task::PartitionRebalance);
-                                        }
-                                    }
+                                    task_executor.spawn(instance.clone(), Task::PartitionRebalance);
                                 }
                             },
                         }

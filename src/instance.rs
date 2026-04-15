@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    hash::Hash,
     io,
     marker::PhantomData,
     sync::{self, Arc, Mutex},
@@ -10,6 +9,7 @@ use std::{
 
 use uuid::Uuid;
 
+use crate::object::operation;
 use crate::{
     CorylusError, CorylusResult, Instance,
     network::{
@@ -21,10 +21,8 @@ use crate::{
         map::{Get, Put},
     },
     partition::{self, Segment},
-    serde::{Deserializer, Serializer},
 };
 
-pub mod operation;
 pub mod task;
 
 // --- State markers ---
@@ -40,7 +38,7 @@ pub struct Builder<S> {
     id: Option<Uuid>,
     c: Option<Config>,
     d: Option<network::Discovery>,
-    objs_metadata: HashMap<String, object::Metadata>,
+    objects: HashMap<object::Id, object::Metadata>,
     segment_fns: Vec<Box<dyn Fn() -> Segment>>,
     _state: PhantomData<S>,
 }
@@ -57,7 +55,7 @@ impl Builder<NeedsId> {
             id: None,
             c: None,
             d: None,
-            objs_metadata: HashMap::new(),
+            objects: HashMap::new(),
             segment_fns: Vec::new(),
             _state: PhantomData,
         }
@@ -67,7 +65,7 @@ impl Builder<NeedsId> {
             id: Some(id),
             c: self.c,
             d: self.d,
-            objs_metadata: self.objs_metadata,
+            objects: self.objects,
             segment_fns: self.segment_fns,
             _state: PhantomData,
         }
@@ -80,7 +78,7 @@ impl Builder<NeedsConfig> {
             id: self.id,
             c: Some(c),
             d: self.d,
-            objs_metadata: self.objs_metadata,
+            objects: self.objects,
             segment_fns: self.segment_fns,
             _state: PhantomData,
         }
@@ -94,7 +92,7 @@ impl Builder<NeedsDiscovery> {
             c: self.c,
             d: Some(d),
 
-            objs_metadata: self.objs_metadata,
+            objects: self.objects,
             segment_fns: self.segment_fns,
             _state: PhantomData,
         }
@@ -104,15 +102,15 @@ impl Builder<NeedsDiscovery> {
 impl Builder<Ready> {
     pub fn with_map<K, V>(mut self, id: &str, repl_config: object::ReplicationConfig) -> Self
     where
-        K: Serializer + Deserializer + Send + Sync + Hash + Eq + Clone + 'static,
-        V: Serializer + Deserializer + Send + Sync + Clone + 'static,
+        K: object::map::Key,
+        V: object::map::Value,
     {
         let id = format!("map:{}", id);
 
         let op_reg = operation::Registry::new()
             .with_read_op::<Get<K, V>>()
             .with_write_op::<Put<K, V>>();
-        self.objs_metadata
+        self.objects
             .insert(id.to_string(), object::Metadata::new(op_reg, repl_config));
         self.segment_fns.push(Box::new(move || {
             let data: HashMap<K, V> = HashMap::new();
@@ -130,8 +128,8 @@ impl Builder<Ready> {
         let shutdown = Shutdown::new();
 
         let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
-        let partition = partition::Group::new(id, self.objs_metadata, self.segment_fns.as_slice());
-        let instance = Instance::new(id, net_sender, partition, shutdown.clone());
+        let partition = partition::Group::new(id, self.segment_fns.as_slice());
+        let instance = Instance::new(id, net_sender, partition, self.objects, shutdown.clone());
 
         shutdown.register(net_receiver.start(instance.downgrade())?);
 
@@ -141,15 +139,11 @@ impl Builder<Ready> {
 
 // --- Shutdown ---
 mod shutdown {
-    use std::{
-        sync::{Condvar, Mutex},
-        thread::JoinHandle,
-        time::Duration,
-    };
+    use crate::sync::State;
+    use std::{sync::Mutex, thread::JoinHandle, time::Duration};
 
     pub struct Inner {
-        flag: Mutex<bool>,
-        notify: Condvar,
+        state: State<bool>,
         handles: Mutex<Vec<JoinHandle<()>>>,
     }
 
@@ -162,19 +156,13 @@ mod shutdown {
     impl Inner {
         pub fn new() -> Self {
             Self {
-                flag: Mutex::new(false),
-                notify: Condvar::new(),
+                state: State::new(),
                 handles: Mutex::new(Vec::new()),
             }
         }
 
-        pub fn set_flag(&self, val: bool) {
-            let mut flag = self.flag.lock().expect("Cannot be poisoned");
-            *flag = val;
-        }
-
-        pub fn flag(&self) -> bool {
-            *self.flag.lock().expect("Cannot be poisoned")
+        pub fn update(&self, val: bool) {
+            self.state.update(val);
         }
 
         pub fn with_handles_write<F, O>(&self, f: F) -> O
@@ -186,22 +174,7 @@ mod shutdown {
         }
 
         pub fn checkpoint(&self, timeout: Option<Duration>) -> bool {
-            let flag = self.flag.lock().expect("Cannot be poisoned");
-            if *flag {
-                return false;
-            }
-
-            match timeout {
-                Some(val) => match self.notify.wait_timeout(flag, val) {
-                    Ok((_, res)) => res.timed_out(),
-                    Err(_) => false,
-                },
-                None => true,
-            }
-        }
-
-        pub fn notify_all(&self) {
-            self.notify.notify_all();
+            !self.state.await_until(true, timeout)
         }
     }
 }
@@ -241,9 +214,7 @@ impl Shutdown {
     }
 
     pub fn destroy(&self) {
-        self.as_ref().set_flag(true);
-        self.as_ref().notify_all();
-
+        self.inner.update(true);
         let handles = self.as_ref().with_handles_write(std::mem::take);
         for h in handles {
             let _ = h.join();
@@ -316,6 +287,7 @@ pub struct Inner {
     pub(crate) id: Uuid,
     pub(crate) net: network::Sender,
     pub(crate) part_group: partition::Group,
+    pub(crate) objects: HashMap<object::Id, object::Metadata>,
     pub(crate) membership: Membership,
     pub(crate) shutdown: Shutdown,
 }
@@ -327,21 +299,44 @@ impl Drop for Inner {
 }
 
 impl Inner {
+    pub(crate) fn rebuild(&self, obj_id: &str, part_id: u16, raw: Vec<u8>) -> CorylusResult<()> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
+        self.part_group
+            .with_segment_write(part_id as usize, obj_id, |segment| {
+                (*segment.data).rebuild(raw)
+            })
+            .map_err(|err| err.into())
+    }
+
+    pub(crate) fn fetch(&self, obj_id: &str, part_id: u16) -> CorylusResult<Vec<u8>> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
+        self.part_group
+            .with_segment_read(part_id as usize, obj_id, |segment| (*segment.data).as_raw())
+            .map_err(|err| err.into())
+    }
+
     pub(crate) fn remote_write<O: operation::Write>(
         &self,
-        s_id: &str,
-        p_id: u16,
+        obj_id: &str,
+        part_id: u16,
         v: u128,
         mut op: O,
     ) -> CorylusResult<()> {
-        let owner = self.part_group.owner_of(p_id as u64);
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
+        let owner = self.part_group.owner_of(part_id as u64);
 
         if self.id.eq(&owner) {
-            self.check_repl_requirements(s_id)?;
+            self.check_repl_requirements(obj_id)?;
         }
 
         self.part_group
-            .await_ready(p_id as usize, Some(Duration::from_secs(3)))?;
+            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
         if !self.part_group.version().eq(&v) {
             return Err(partition::Error::Rebalance.into());
         }
@@ -349,12 +344,12 @@ impl Inner {
         // Implement double check of part group version inside lock.
         // Implement await of status change if not ready and tryLock.
         self.part_group
-            .with_segment_write(p_id as usize, s_id, |segment| {
+            .with_segment_write(part_id as usize, obj_id, |segment| {
                 op.execute(&mut *segment.data);
             })?;
 
         if self.id.eq(&owner) {
-            self.replicate(s_id, p_id as u64, op)
+            self.replicate(obj_id, part_id as u64, op)
         } else {
             Ok(())
         }
@@ -362,15 +357,18 @@ impl Inner {
 
     pub(crate) fn remote_read<O: operation::Read>(
         &self,
-        s_id: &str,
-        p_id: u16,
+        obj_id: &str,
+        part_id: u16,
         v: u128,
         op: O,
     ) -> CorylusResult<Vec<u8>> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
         // If partition version is correct is ensured that this node is master or replica.
 
         self.part_group
-            .await_ready(p_id as usize, Some(Duration::from_secs(3)))?;
+            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
         if !self.part_group.version().eq(&v) {
             return Err(partition::Error::Rebalance.into());
         }
@@ -378,25 +376,30 @@ impl Inner {
         // Implement double check of part group version inside lock.
         // Implement await of status change if not ready and tryLock.
         self.part_group
-            .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
+            .with_segment_read(part_id as usize, obj_id, |segment| {
+                op.execute(&*segment.data)
+            })
             .map_err(|err| err.into())
     }
 
-    pub(crate) fn write<O: operation::Write>(&self, s_id: &str, mut op: O) -> CorylusResult<()> {
+    pub(crate) fn write<O: operation::Write>(&self, obj_id: &str, mut op: O) -> CorylusResult<()> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
         let key = op.partition_key();
-        let p_id = self.part_group.partition_of(&key);
+        let part_id = self.part_group.partition_of(&key);
 
         self.part_group
-            .await_ready(p_id as usize, Some(Duration::from_secs(3)))?;
-        let owner = self.part_group.owner_of(p_id);
+            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+        let owner = self.part_group.owner_of(part_id);
 
         if self.id.eq(&owner) {
-            self.check_repl_requirements(s_id)?;
+            self.check_repl_requirements(obj_id)?;
             self.part_group
-                .with_segment_write(p_id as usize, s_id, |segment| {
+                .with_segment_write(part_id as usize, obj_id, |segment| {
                     op.execute(&mut *segment.data);
                 })?;
-            self.replicate(s_id, p_id, op)
+            self.replicate(obj_id, part_id, op)
         } else {
             let raw_op = op.serialize();
             let response = self.net.sync_send(
@@ -404,9 +407,9 @@ impl Inner {
                 Packet::Request(packet::Request::Write(packet::Write::WriteOp {
                     v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
-                    partition_id: p_id as u16,
-                    segment_id: s_id.to_string(),
-                    op_id: op.id().to_string(),
+                    part_id: part_id as u16,
+                    obj_id: obj_id.to_string(),
+                    opart_id: op.id().to_string(),
                     raw_op,
                 })),
                 None,
@@ -424,9 +427,12 @@ impl Inner {
         }
     }
 
-    fn check_repl_requirements(&self, s_id: &str) -> CorylusResult<()> {
-        let obj_metadata = self.part_group.obj_metadata(s_id)?;
-        let repl_factor = obj_metadata.repl_factor();
+    fn check_repl_requirements(&self, obj_id: &str) -> CorylusResult<()> {
+        let metadata = self
+            .objects
+            .get(obj_id)
+            .ok_or(object::Error::ObjectNotFound)?;
+        let repl_factor = metadata.repl_factor();
         if repl_factor != 0 && repl_factor > (self.membership.size() - 1) {
             return Err(CorylusError::from(partition::Error::NotEnoughReplicas));
         }
@@ -434,14 +440,22 @@ impl Inner {
         Ok(())
     }
 
-    fn replicate<O: operation::Write>(&self, s_id: &str, p_id: u64, op: O) -> CorylusResult<()> {
-        let obj_metadata = self.part_group.obj_metadata(s_id)?;
-        let repl_factor = obj_metadata.repl_factor();
+    fn replicate<O: operation::Write>(
+        &self,
+        obj_id: &str,
+        part_id: u64,
+        op: O,
+    ) -> CorylusResult<()> {
+        let metadata = self
+            .objects
+            .get(obj_id)
+            .ok_or(object::Error::ObjectNotFound)?;
+        let repl_factor = metadata.repl_factor();
         if repl_factor != 0 {
             let raw_op = op.serialize();
-            let replica_ids = self.part_group.replicas_of(p_id, repl_factor);
+            let replica_ids = self.part_group.replicas_of(part_id, repl_factor);
 
-            match obj_metadata.repl() {
+            match metadata.repl() {
                 object::Replication::Sync => {
                     let mut responses = Vec::with_capacity(replica_ids.len());
                     for replica_id in replica_ids {
@@ -450,9 +464,9 @@ impl Inner {
                             Packet::Request(packet::Request::Write(packet::Write::WriteOp {
                                 v: self.part_group.version(),
                                 corr_id: Uuid::new_v4(),
-                                partition_id: p_id as u16,
-                                segment_id: s_id.to_string(),
-                                op_id: op.id().to_string(),
+                                part_id: part_id as u16,
+                                obj_id: obj_id.to_string(),
+                                opart_id: op.id().to_string(),
                                 raw_op: raw_op.clone(),
                             })),
                             None,
@@ -480,9 +494,9 @@ impl Inner {
                             Packet::Request(packet::Request::Write(packet::Write::WriteOp {
                                 v: self.part_group.version(),
                                 corr_id: Uuid::new_v4(),
-                                partition_id: p_id as u16,
-                                segment_id: s_id.to_string(),
-                                op_id: op.id().to_string(),
+                                part_id: part_id as u16,
+                                obj_id: obj_id.to_string(),
+                                opart_id: op.id().to_string(),
                                 raw_op: raw_op.clone(),
                             })),
                             None,
@@ -496,20 +510,32 @@ impl Inner {
         Ok(())
     }
 
-    pub(crate) fn read<O: operation::Read>(&self, s_id: &str, op: O) -> CorylusResult<Vec<u8>> {
+    pub(crate) fn read<O: operation::Read>(&self, obj_id: &str, op: O) -> CorylusResult<Vec<u8>> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
         let key = op.partition_key();
-        let p_id = self.part_group.partition_of(&key);
+        let part_id = self.part_group.partition_of(&key);
 
         self.part_group
-            .await_ready(p_id as usize, Some(Duration::from_secs(3)))?;
-        let owner = self.part_group.owner_of(p_id);
+            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+        let owner = self.part_group.owner_of(part_id);
+
+        let metadata = self
+            .objects
+            .get(obj_id)
+            .ok_or(object::Error::ObjectNotFound)?;
 
         let local_exec = self.id.eq(&owner)
-            || (self.part_group.obj_metadata(s_id)?.repl_read()
-                && self.part_group.is_replica(self.id, s_id, p_id));
+            || (metadata.repl_read()
+                && self
+                    .part_group
+                    .is_replica(self.id, part_id, metadata.repl_factor()));
         if local_exec {
             self.part_group
-                .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
+                .with_segment_read(part_id as usize, obj_id, |segment| {
+                    op.execute(&*segment.data)
+                })
                 .map_err(|err| err.into())
         } else {
             let raw_op = op.serialize();
@@ -518,9 +544,9 @@ impl Inner {
                 Packet::Request(packet::Request::Read(packet::Read::GetOp {
                     v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
-                    partition_id: p_id as u16,
-                    segment_id: s_id.to_string(),
-                    op_id: op.id().to_string(),
+                    part_id: part_id as u16,
+                    obj_id: obj_id.to_string(),
+                    opart_id: op.id().to_string(),
                     raw_op,
                 })),
                 None,

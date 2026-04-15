@@ -1,4 +1,4 @@
-pub mod object;
+pub mod types;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {

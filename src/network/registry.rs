@@ -400,13 +400,13 @@ impl PeerRead {
                                 info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "Heartbeat packet received");
                                 registry.update_hb(peer_id);
                             } else if let Err(err) =
-                                registry.as_ref().tx_msg.send(Message::Packet{ val :InboundPacket::new(peer_id, packet)})
+                                registry.as_ref().tx_msg.send(Message::Packet { val: InboundPacket::new(peer_id, packet) })
                             {
-                            error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, kind = %kind, err = %err, "Packet enqueue failed");
+                                error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, kind = %kind, err = %err, "Packet enqueue failed");
                             }
                         }
                         Err(err)
-                            if matches!(
+                        if matches!(
                                 err.kind(),
                                 io::ErrorKind::BrokenPipe
                                     | io::ErrorKind::ConnectionReset
@@ -414,11 +414,15 @@ impl PeerRead {
                                     | io::ErrorKind::NotConnected
                                     | io::ErrorKind::UnexpectedEof
                             ) =>
-                        {
-                            break;
-                        }
+                            {
+                                break;
+                            }
                         Err(err) => {
-                            error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, err = %err, "Packet read failed");
+                            if !matches!(
+                                err.kind(),
+                                io::ErrorKind::WouldBlock) {
+                                error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, kind = %err.kind(), err = %err, "Packet read failed");
+                            }
                         }
                     }
                 }

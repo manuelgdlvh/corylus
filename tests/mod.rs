@@ -36,7 +36,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
 
     let id_1 = Uuid::from_u128(1);
     let id_2 = Uuid::from_u128(2);
-    let version = partition::Group::compute_version(&[id_1, id_2]);
+    let version = partition::version(&[id_1, id_2]);
 
     let instance_1 = instance::Builder::new()
         .with_id(Uuid::from_u128(1))
@@ -123,7 +123,6 @@ where
 // Tests under same parent module to avoid binary split
 mod tests {
     mod map {
-
         use corylus::CorylusResult;
 
         use crate::{map, with_instances_no_repl};

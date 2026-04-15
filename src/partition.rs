@@ -1,9 +1,8 @@
 use std::{
-    any::Any,
     array,
     collections::{BinaryHeap, HashMap, HashSet},
     sync::{
-        Condvar, Mutex, RwLock,
+        Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -13,6 +12,7 @@ use thiserror::Error;
 use twox_hash::{XxHash3_64, XxHash3_128};
 use uuid::Uuid;
 
+use crate::sync::State;
 use crate::{object, partition};
 
 const RING_CAPACITY: usize = 1024;
@@ -24,29 +24,22 @@ pub enum Error {
     PartitionNotFound,
     #[error("Partition not ready")]
     PartitionNotReady,
-    #[error("Segment not found")]
-    SegmentNotFound,
     #[error("Rebalance in progress")]
     Rebalance,
     #[error("Not enough replicas")]
     NotEnoughReplicas,
 }
 
-pub trait RawSegment: Send + Sync + Any {
-    fn as_any(&self) -> &dyn Any;
-    fn as_mut_any(&mut self) -> &mut dyn Any;
-}
-
 pub struct Segment {
     id: String,
-    pub(crate) data: Box<dyn RawSegment>,
+    pub(crate) data: Box<dyn object::Raw>,
     // Useful for entropy process of partitions after membership changes or corruption detection
     seq: u64,
     checksum: u64,
 }
 
 impl Segment {
-    pub fn new<S: RawSegment + 'static>(id: String, data: S) -> Self {
+    pub fn new<S: object::Raw + 'static>(id: String, data: S) -> Self {
         Self {
             id,
             data: Box::new(data),
@@ -58,35 +51,28 @@ impl Segment {
 
 pub struct Group {
     partitions: [Partition; RING_CAPACITY],
-    // TODO: Decouple from partition this
-    objs_metadata: HashMap<String, object::Metadata>,
     version: Mutex<u128>,
     initialized: AtomicBool,
 }
 
 impl Group {
-    pub fn new<F: Fn() -> Segment>(
-        member_id: Uuid,
-        objs_metadata: HashMap<String, object::Metadata>,
-        segment_fns: &[F],
-    ) -> Self {
+    pub fn new<F: Fn() -> Segment>(member_id: Uuid, segment_fns: &[F]) -> Self {
         let partitions: [Partition; RING_CAPACITY] =
             array::from_fn(|id| Partition::new(id, member_id, segment_fns));
 
         Self {
             partitions,
-            objs_metadata,
-            version: Mutex::new(Self::compute_version(&[member_id])),
+            version: Mutex::new(version(&[member_id])),
             initialized: AtomicBool::new(false),
         }
     }
 
-    pub fn await_ready(&self, p_id: usize, timeout: Option<Duration>) -> Result<(), Error> {
-        if p_id >= RING_CAPACITY {
+    pub fn await_ready(&self, part_id: usize, timeout: Option<Duration>) -> Result<(), Error> {
+        if part_id >= RING_CAPACITY {
             return Err(Error::PartitionNotFound);
         }
 
-        let partition = &self.partitions[p_id];
+        let partition = &self.partitions[part_id];
         if !partition.await_ready(timeout) {
             return Err(Error::PartitionNotReady);
         }
@@ -99,11 +85,11 @@ impl Group {
         hash & (RING_CAPACITY as u64 - 1)
     }
 
-    pub fn owner_of(&self, partition_id: u64) -> Uuid {
-        if partition_id >= RING_CAPACITY as u64 {
+    pub fn owner_of(&self, part_id: u64) -> Uuid {
+        if part_id >= RING_CAPACITY as u64 {
             panic!("Partition id out of range");
         }
-        let partition = &self.partitions[partition_id as usize];
+        let partition = &self.partitions[part_id as usize];
         let metadata = partition
             .metadata
             .read()
@@ -112,12 +98,12 @@ impl Group {
         metadata.master_id
     }
 
-    pub fn replicas_of(&self, partition_id: u64, size: usize) -> Vec<Uuid> {
-        if partition_id >= RING_CAPACITY as u64 {
+    pub fn replicas_of(&self, part_id: u64, size: usize) -> Vec<Uuid> {
+        if part_id >= RING_CAPACITY as u64 {
             panic!("Partition id out of range");
         }
 
-        let partition = &self.partitions[partition_id as usize];
+        let partition = &self.partitions[part_id as usize];
         let metadata = partition
             .metadata
             .read()
@@ -126,48 +112,42 @@ impl Group {
         metadata.replica_ids[0..size].to_vec()
     }
 
-    pub fn is_replica(&self, member_id: Uuid, s_id: &str, p_id: u64) -> bool {
-        if p_id >= RING_CAPACITY as u64 {
+    pub fn is_replica(&self, member_id: Uuid, part_id: u64, repl_factor: usize) -> bool {
+        if part_id >= RING_CAPACITY as u64 {
             panic!("Partition id out of range");
         }
-        match self.objs_metadata.get(s_id) {
-            Some(m) => {
-                let repl_factor = m.repl_factor();
-                if repl_factor == 0 {
-                    false
-                } else {
-                    let partition = &self.partitions[p_id as usize];
-                    let p_metadata = partition
-                        .metadata
-                        .read()
-                        .expect("Critical section cannot be poisoned");
 
-                    p_metadata.replica_ids[0..repl_factor].contains(&member_id)
-                }
-            }
+        if repl_factor == 0 {
+            false
+        } else {
+            let partition = &self.partitions[part_id as usize];
+            let p_metadata = partition
+                .metadata
+                .read()
+                .expect("Critical section cannot be poisoned");
 
-            None => false,
+            p_metadata.replica_ids[0..repl_factor].contains(&member_id)
         }
     }
 
     pub fn set_all_lifecycle(&self, lifecycle: Lifecycle) {
-        for p_id in 0..RING_CAPACITY {
-            self.set_lifecycle(p_id, lifecycle);
+        for part_id in 0..RING_CAPACITY {
+            self.set_lifecycle(part_id, lifecycle);
         }
     }
 
-    pub fn set_lifecycle(&self, p_id: usize, lifecycle: Lifecycle) {
-        let partition = &self.partitions[p_id];
+    pub fn set_lifecycle(&self, part_id: usize, lifecycle: Lifecycle) {
+        let partition = &self.partitions[part_id];
         partition.state.update(lifecycle);
     }
 
     pub fn update(&self, member_ids: &[Uuid]) -> HashMap<usize, Vec<MembershipChange>> {
         let mut result = HashMap::with_capacity(RING_CAPACITY);
-        for p_id in 0..RING_CAPACITY {
-            let partition = &self.partitions[p_id];
+        for part_id in 0..RING_CAPACITY {
+            let partition = &self.partitions[part_id];
             let changes = partition.update(member_ids);
             if !changes.is_empty() {
-                result.insert(p_id, changes);
+                result.insert(part_id, changes);
             }
         }
 
@@ -176,72 +156,54 @@ impl Group {
 
     pub fn update_version(&self, member_ids: &[Uuid]) {
         let mut version = self.version.lock().expect("Cannot be poisoned");
-        *version = Self::compute_version(member_ids);
-    }
-
-    pub fn compute_version(member_ids: &[Uuid]) -> u128 {
-        const COUNT_BITS: u32 = 16;
-        const COUNT_MASK: u128 = (1u128 << COUNT_BITS) - 1;
-        const HASH_MASK: u128 = !COUNT_MASK;
-        let mut hasher = XxHash3_128::with_seed(PARTITION_HASH_SEED);
-        for member_id in member_ids {
-            hasher.write(member_id.as_bytes());
-        }
-
-        (hasher.finish_128() & HASH_MASK) | (member_ids.len() as u128 & COUNT_MASK)
+        *version = partition::version(member_ids);
     }
 
     pub fn with_segment_read<F, O>(
         &self,
-        p_id: usize,
-        s_id: &str,
+        part_id: usize,
+        obj_id: &str,
         f: F,
     ) -> Result<O, partition::Error>
     where
         F: FnOnce(&Segment) -> O,
     {
-        if p_id >= RING_CAPACITY {
+        if part_id >= RING_CAPACITY {
             return Err(Error::PartitionNotFound);
         }
 
-        let partition = &self.partitions[p_id];
-        if let Some(segment) = partition.segments.get(s_id) {
-            let guard = segment.read().expect("Cannot be poisoned");
-            Ok(f(&guard))
-        } else {
-            Err(Error::SegmentNotFound)
-        }
+        let partition = &self.partitions[part_id];
+        let segment = partition
+            .segments
+            .get(obj_id)
+            .expect("existence is a precondtion")
+            .read()
+            .expect("Cannot be poisoned");
+        Ok(f(&segment))
     }
 
     pub fn with_segment_write<F>(
         &self,
-        p_id: usize,
-        s_id: &str,
+        part_id: usize,
+        obj_id: &str,
         f: F,
     ) -> Result<(), partition::Error>
     where
         F: FnOnce(&mut Segment),
     {
-        if p_id >= RING_CAPACITY {
+        if part_id >= RING_CAPACITY {
             return Err(Error::PartitionNotFound);
         }
 
-        let partition = &self.partitions[p_id];
-        if let Some(segment) = partition.segments.get(s_id) {
-            let mut guard = segment.write().expect("Cannot be poisoned");
-            f(&mut guard);
-            Ok(())
-        } else {
-            Err(Error::SegmentNotFound)
-        }
-    }
-
-    pub fn obj_metadata(&self, s_id: &str) -> Result<&object::Metadata, partition::Error> {
-        self.objs_metadata.get(s_id).ok_or(Error::SegmentNotFound)
-    }
-
-    pub fn objs_metadata(&self) -> &HashMap<String, object::Metadata> {
-        &self.objs_metadata
+        let partition = &self.partitions[part_id];
+        let mut segment = partition
+            .segments
+            .get(obj_id)
+            .expect("existence is a precondtion")
+            .write()
+            .expect("Cannot be poisoned");
+        f(&mut segment);
+        Ok(())
     }
 
     pub fn version(&self) -> u128 {
@@ -259,13 +221,13 @@ impl Group {
 
 pub struct Partition {
     metadata: RwLock<Metadata>,
-    segments: HashMap<String, RwLock<Segment>>,
+    segments: HashMap<object::Id, RwLock<Segment>>,
     state: State<Lifecycle>,
 }
 
 impl Partition {
     pub fn new<F: Fn() -> Segment>(id: usize, member_id: Uuid, segment_fns: &[F]) -> Self {
-        let (master_id, replica_ids) = Partition::compute_membership(id, &[member_id]);
+        let (master_id, replica_ids) = members_rank(id, &[member_id]);
 
         let mut segments = HashMap::with_capacity(segment_fns.len());
         for f in segment_fns {
@@ -286,51 +248,17 @@ impl Partition {
         self
     }
 
-    fn compute_membership(partiton_id: usize, member_ids: &[Uuid]) -> (Uuid, Vec<Uuid>) {
-        if member_ids.is_empty() {
-            panic!("Members cannot be empty");
-        }
-
-        let mut top_k = BinaryHeap::with_capacity(member_ids.len());
-        for member_id in member_ids {
-            let mut hasher = XxHash3_128::with_seed(PARTITION_HASH_SEED);
-            hasher.write(&partiton_id.to_le_bytes());
-            hasher.write(member_id.as_bytes());
-            let rank = hasher.finish_128();
-            let result: (u128, Uuid) = (rank, *member_id);
-            top_k.push(result);
-        }
-
-        let master_id = top_k
-            .pop()
-            .expect("No zero member list previously checked")
-            .1;
-
-        let replicas_len = top_k.len();
-        let mut replica_ids = Vec::with_capacity(replicas_len);
-        for _ in 0..replicas_len {
-            let replica_id = top_k
-                .pop()
-                .expect("Replica availability previously checked")
-                .1;
-
-            replica_ids.push(replica_id);
-        }
-
-        (master_id, replica_ids)
-    }
-
     fn update(&self, member_ids: &[Uuid]) -> Vec<MembershipChange> {
         let mut metadata = self
             .metadata
             .write()
             .expect("Critical section cannot be poisoned");
-        let (master_id, replica_ids) = Partition::compute_membership(metadata.id, member_ids);
+        let (master_id, replica_ids) = members_rank(metadata.id, member_ids);
         metadata.update(master_id, replica_ids)
     }
 
     pub fn await_ready(&self, timeout: Option<Duration>) -> bool {
-        self.state.await_status(Lifecycle::Ready, timeout)
+        self.state.await_until(Lifecycle::Ready, timeout)
     }
 }
 
@@ -400,46 +328,48 @@ pub enum Lifecycle {
     Migration,
 }
 
-pub struct State<T: Default + Eq + PartialEq> {
-    state: Mutex<T>,
-    cv: Condvar,
+pub fn version(member_ids: &[Uuid]) -> u128 {
+    const COUNT_BITS: u32 = 16;
+    const COUNT_MASK: u128 = (1u128 << COUNT_BITS) - 1;
+    const HASH_MASK: u128 = !COUNT_MASK;
+    let mut hasher = XxHash3_128::with_seed(PARTITION_HASH_SEED);
+    for member_id in member_ids {
+        hasher.write(member_id.as_bytes());
+    }
+
+    (hasher.finish_128() & HASH_MASK) | (member_ids.len() as u128 & COUNT_MASK)
 }
 
-impl<T: Default + Eq + PartialEq> Default for State<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: Default + Eq + PartialEq> State<T> {
-    pub fn new() -> Self {
-        Self {
-            state: Mutex::new(T::default()),
-            cv: Condvar::new(),
-        }
+fn members_rank(part_id: usize, member_ids: &[Uuid]) -> (Uuid, Vec<Uuid>) {
+    if member_ids.is_empty() {
+        panic!("Members cannot be empty");
     }
 
-    pub fn await_status(&self, status: T, timeout: Option<Duration>) -> bool {
-        let state = self.state.lock().expect("Cannot be poisoned");
-        if status.eq(&*state) {
-            return true;
-        }
-
-        match timeout {
-            Some(val) => match self.cv.wait_timeout(state, val) {
-                Ok((state, res)) => !res.timed_out() && status.eq(&*state),
-                Err(_) => false,
-            },
-            None => false,
-        }
+    let mut top_k = BinaryHeap::with_capacity(member_ids.len());
+    for member_id in member_ids {
+        let mut hasher = XxHash3_128::with_seed(PARTITION_HASH_SEED);
+        hasher.write(&part_id.to_le_bytes());
+        hasher.write(member_id.as_bytes());
+        let rank = hasher.finish_128();
+        let result: (u128, Uuid) = (rank, *member_id);
+        top_k.push(result);
     }
 
-    pub fn update(&self, value: T) {
-        {
-            let mut state = self.state.lock().expect("Cannot be poisioned");
-            *state = value;
-        }
+    let master_id = top_k
+        .pop()
+        .expect("No zero member list previously checked")
+        .1;
 
-        self.cv.notify_all();
+    let replicas_len = top_k.len();
+    let mut replica_ids = Vec::with_capacity(replicas_len);
+    for _ in 0..replicas_len {
+        let replica_id = top_k
+            .pop()
+            .expect("Replica availability previously checked")
+            .1;
+
+        replica_ids.push(replica_id);
     }
+
+    (master_id, replica_ids)
 }

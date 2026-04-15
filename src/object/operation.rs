@@ -1,14 +1,6 @@
 use std::{collections::HashMap, io};
 
-use crate::{partition, serde};
-
-// TODO: Move this to object module
-
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("Operation not found")]
-    OperationNotFound,
-}
+use crate::{object, serde};
 
 pub trait Base: serde::Serializer {
     fn static_id() -> &'static str
@@ -19,14 +11,14 @@ pub trait Base: serde::Serializer {
 }
 
 pub trait Write: Base {
-    fn execute(&mut self, segment: &mut dyn partition::RawSegment);
+    fn execute(&mut self, segment: &mut dyn object::Raw);
     fn deserialize(val: &[u8]) -> Result<GenericWrite, io::Error>
     where
         Self: Sized;
 }
 
 pub trait Read: Base {
-    fn execute(&self, segment: &dyn partition::RawSegment) -> Vec<u8>;
+    fn execute(&self, segment: &dyn object::Raw) -> Vec<u8>;
     fn deserialize(val: &[u8]) -> Result<GenericRead, io::Error>
     where
         Self: Sized;
@@ -62,7 +54,7 @@ impl Base for GenericRead {
 }
 
 impl Read for GenericRead {
-    fn execute(&self, segment: &dyn partition::RawSegment) -> Vec<u8> {
+    fn execute(&self, segment: &dyn object::Raw) -> Vec<u8> {
         self.inner.execute(segment)
     }
 
@@ -102,7 +94,7 @@ impl Base for GenericWrite {
 }
 
 impl Write for GenericWrite {
-    fn execute(&mut self, segment: &mut dyn partition::RawSegment) {
+    fn execute(&mut self, segment: &mut dyn object::Raw) {
         self.inner.execute(segment);
     }
 
@@ -142,17 +134,17 @@ impl Registry {
         self
     }
 
-    pub fn read_fn(&self, op_id: &str) -> Result<ReadBuilder, Error> {
+    pub fn read_fn(&self, opart_id: &str) -> Result<ReadBuilder, object::Error> {
         self.read_fns
-            .get(op_id)
-            .ok_or(Error::OperationNotFound)
+            .get(opart_id)
+            .ok_or(object::Error::OperationNotFound)
             .copied()
     }
 
-    pub fn write_fn(&self, op_id: &str) -> Result<WriteBuilder, Error> {
+    pub fn write_fn(&self, opart_id: &str) -> Result<WriteBuilder, object::Error> {
         self.write_fns
-            .get(op_id)
-            .ok_or(Error::OperationNotFound)
+            .get(opart_id)
+            .ok_or(object::Error::OperationNotFound)
             .copied()
     }
 }

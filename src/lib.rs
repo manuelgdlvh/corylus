@@ -1,14 +1,10 @@
-use std::{collections::HashMap, hash::Hash, io, result, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 
 use uuid::Uuid;
 
 use crate::{
-    instance::{
-        Membership, Shutdown,
-        operation::{self},
-    },
+    instance::{Membership, Shutdown},
     object::DistributedMap,
-    serde::{Deserializer, Serializer},
 };
 
 pub mod instance;
@@ -16,9 +12,11 @@ pub mod network;
 pub mod object;
 pub mod partition;
 pub mod serde;
+mod sync;
 
-pub type CorylusResult<T> = result::Result<T, CorylusError>;
+pub type CorylusResult<T> = Result<T, CorylusError>;
 
+use crate::object::map;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -28,7 +26,7 @@ pub enum CorylusError {
     #[error("Partition error")]
     Partition(#[from] partition::Error),
     #[error("Operation error")]
-    Operation(#[from] operation::Error),
+    Object(#[from] object::Error),
     #[error("Serde error")]
     Serde(#[from] serde::Error),
 }
@@ -38,11 +36,14 @@ pub struct Instance {
     inner: Arc<instance::Inner>,
 }
 
+// TODO: Do architecture overall stabilization procedure
+
 impl Instance {
     fn new(
         id: Uuid,
         net: network::Sender,
         part_group: partition::Group,
+        objects: HashMap<object::Id, object::Metadata>,
         shutdown: Shutdown,
     ) -> Self {
         let membership = Membership::new();
@@ -53,6 +54,7 @@ impl Instance {
             net,
             part_group,
             membership,
+            objects,
             shutdown,
         });
 
@@ -73,10 +75,14 @@ impl Instance {
 
     pub fn get_map<K, V>(&self, id: &str) -> Option<DistributedMap<K, V>>
     where
-        K: Serializer + Deserializer + Hash + Eq + Clone + 'static,
-        V: Serializer + Deserializer + Clone + 'static,
+        K: map::Key,
+        V: map::Value,
     {
         let id = format!("map:{}", id);
+        if !self.inner.objects.contains_key(&id) {
+            return None;
+        }
+
         let result = self.inner.part_group.with_segment_read(0, &id, |segment| {
             segment
                 .data

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use uuid::Uuid;
 
-use crate::{CorylusError, instance::operation, partition, serde};
+use crate::{CorylusError, object, partition, serde};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Event {
@@ -42,15 +42,15 @@ pub enum Write {
         v: u128,
         corr_id: Uuid,
         // Just to check inconsistences in the partition tables to reject
-        partition_id: u16,
-        segment_id: String,
-        op_id: String,
+        part_id: u16,
+        obj_id: String,
+        opart_id: String,
         raw_op: Vec<u8>,
     },
     PartitionFetchCompletion {
         v: u128,
         corr_id: Uuid,
-        partition_id: u16,
+        part_id: u16,
     },
 }
 
@@ -64,17 +64,17 @@ pub enum Read {
         v: u128,
         corr_id: Uuid,
         // Just to check inconsistences in the partition tables to reject
-        partition_id: u16,
-        segment_id: String,
-        op_id: String,
+        part_id: u16,
+        obj_id: String,
+        opart_id: String,
         raw_op: Vec<u8>,
     },
     FetchObject {
         v: u128,
         corr_id: Uuid,
         // Just to check inconsistences in the partition tables to reject
-        partition_id: u16,
-        segment_id: String,
+        part_id: u16,
+        obj_id: String,
     },
 }
 
@@ -85,7 +85,7 @@ pub enum Status {
     Rebalance = 1,
     OperationNotFound = 2,
     PartitionNotFound = 3,
-    SegmentNotFound = 4,
+    ObjectNotFound = 4,
     IoError = 5,
     SerdeInvalidBufferSize = 6,
     SerdeUnknown = 7,
@@ -99,13 +99,13 @@ impl From<CorylusError> for Status {
             CorylusError::Io(_) => Status::IoError,
             CorylusError::Partition(err) => match err {
                 partition::Error::PartitionNotFound => Status::PartitionNotFound,
-                partition::Error::SegmentNotFound => Status::SegmentNotFound,
                 partition::Error::Rebalance => Status::Rebalance,
                 partition::Error::NotEnoughReplicas => Status::NotEnoughReplicas,
                 partition::Error::PartitionNotReady => Status::PartitionNotReady,
             },
-            CorylusError::Operation(err) => match err {
-                operation::Error::OperationNotFound => Status::OperationNotFound,
+            CorylusError::Object(err) => match err {
+                Error::OperationNotFound => Status::OperationNotFound,
+                Error::ObjectNotFound => Status::ObjectNotFound,
             },
             CorylusError::Serde(err) => match err {
                 serde::Error::InvalidBufferSize => Status::SerdeInvalidBufferSize,
@@ -116,6 +116,7 @@ impl From<CorylusError> for Status {
     }
 }
 
+use crate::object::Error;
 use std::convert::TryFrom;
 
 impl TryFrom<Status> for CorylusError {
@@ -125,15 +126,11 @@ impl TryFrom<Status> for CorylusError {
         match value {
             Status::Success => Err(()),
             Status::Rebalance => Ok(CorylusError::Partition(partition::Error::Rebalance)),
-            Status::OperationNotFound => {
-                Ok(CorylusError::Operation(operation::Error::OperationNotFound))
-            }
+            Status::OperationNotFound => Ok(CorylusError::Object(Error::OperationNotFound)),
             Status::PartitionNotFound => {
                 Ok(CorylusError::Partition(partition::Error::PartitionNotFound))
             }
-            Status::SegmentNotFound => {
-                Ok(CorylusError::Partition(partition::Error::SegmentNotFound))
-            }
+            Status::ObjectNotFound => Ok(CorylusError::Object(object::Error::ObjectNotFound)),
             Status::IoError => Ok(CorylusError::Io(std::io::Error::other("IO error"))),
             Status::SerdeUnknown => Ok(CorylusError::Serde(serde::Error::Unknown)),
             Status::SerdeInvalidBufferSize => {
@@ -304,22 +301,22 @@ impl From<&Packet> for Vec<u8> {
                     Read::GetOp {
                         v,
                         corr_id,
-                        partition_id,
-                        segment_id,
-                        op_id,
+                        part_id,
+                        obj_id,
+                        opart_id,
                         raw_op,
                     } => {
                         buffer.extend_from_slice(&v.to_le_bytes());
                         buffer.extend_from_slice(corr_id.as_bytes());
-                        buffer.extend_from_slice(&partition_id.to_le_bytes());
+                        buffer.extend_from_slice(&part_id.to_le_bytes());
 
-                        let segment_id_len: u16 = segment_id.len() as u16;
-                        buffer.extend_from_slice(&segment_id_len.to_le_bytes());
-                        buffer.extend_from_slice(segment_id.as_bytes());
+                        let obj_id_len: u16 = obj_id.len() as u16;
+                        buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                        buffer.extend_from_slice(obj_id.as_bytes());
 
-                        let op_id_len: u16 = op_id.len() as u16;
-                        buffer.extend_from_slice(&op_id_len.to_le_bytes());
-                        buffer.extend_from_slice(op_id.as_bytes());
+                        let opart_id_len: u16 = opart_id.len() as u16;
+                        buffer.extend_from_slice(&opart_id_len.to_le_bytes());
+                        buffer.extend_from_slice(opart_id.as_bytes());
 
                         if !raw_op.is_empty() {
                             buffer.extend_from_slice(raw_op.as_slice());
@@ -328,16 +325,16 @@ impl From<&Packet> for Vec<u8> {
                     Read::FetchObject {
                         v,
                         corr_id,
-                        partition_id,
-                        segment_id,
+                        part_id,
+                        obj_id,
                     } => {
                         buffer.extend_from_slice(&v.to_le_bytes());
                         buffer.extend_from_slice(corr_id.as_bytes());
-                        buffer.extend_from_slice(&partition_id.to_le_bytes());
+                        buffer.extend_from_slice(&part_id.to_le_bytes());
 
-                        let segment_id_len: u16 = segment_id.len() as u16;
-                        buffer.extend_from_slice(&segment_id_len.to_le_bytes());
-                        buffer.extend_from_slice(segment_id.as_bytes());
+                        let obj_id_len: u16 = obj_id.len() as u16;
+                        buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                        buffer.extend_from_slice(obj_id.as_bytes());
                     }
                 },
 
@@ -347,22 +344,22 @@ impl From<&Packet> for Vec<u8> {
                     Write::WriteOp {
                         v,
                         corr_id,
-                        partition_id,
-                        segment_id,
-                        op_id,
+                        part_id,
+                        obj_id,
+                        opart_id,
                         raw_op,
                     } => {
                         buffer.extend_from_slice(&v.to_le_bytes());
                         buffer.extend_from_slice(corr_id.as_bytes());
-                        buffer.extend_from_slice(&partition_id.to_le_bytes());
+                        buffer.extend_from_slice(&part_id.to_le_bytes());
 
-                        let segment_id_len: u16 = segment_id.len() as u16;
-                        buffer.extend_from_slice(&segment_id_len.to_le_bytes());
-                        buffer.extend_from_slice(segment_id.as_bytes());
+                        let obj_id_len: u16 = obj_id.len() as u16;
+                        buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                        buffer.extend_from_slice(obj_id.as_bytes());
 
-                        let op_id_len: u16 = op_id.len() as u16;
-                        buffer.extend_from_slice(&op_id_len.to_le_bytes());
-                        buffer.extend_from_slice(op_id.as_bytes());
+                        let opart_id_len: u16 = opart_id.len() as u16;
+                        buffer.extend_from_slice(&opart_id_len.to_le_bytes());
+                        buffer.extend_from_slice(opart_id.as_bytes());
 
                         if !raw_op.is_empty() {
                             buffer.extend_from_slice(raw_op.as_slice());
@@ -372,11 +369,11 @@ impl From<&Packet> for Vec<u8> {
                     Write::PartitionFetchCompletion {
                         v,
                         corr_id,
-                        partition_id,
+                        part_id,
                     } => {
                         buffer.extend_from_slice(&v.to_le_bytes());
                         buffer.extend_from_slice(corr_id.as_bytes());
-                        buffer.extend_from_slice(&partition_id.to_le_bytes());
+                        buffer.extend_from_slice(&part_id.to_le_bytes());
                     }
                 },
             },
@@ -462,29 +459,28 @@ impl From<&[u8]> for Packet {
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
-                let partition_id =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+                let part_id = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
                 offset += 2;
 
-                let segment_id_len =
+                let obj_id_len =
                     u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
                 offset += 2;
 
-                let segment_id = std::str::from_utf8(&value[offset..offset + segment_id_len])
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
                     .unwrap()
                     .to_string();
 
-                offset += segment_id_len;
+                offset += obj_id_len;
 
-                let op_id_len =
+                let opart_id_len =
                     u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
                 offset += 2;
 
-                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len])
+                let opart_id = std::str::from_utf8(&value[offset..offset + opart_id_len])
                     .unwrap()
                     .to_string();
 
-                offset += op_id_len;
+                offset += opart_id_len;
 
                 let raw_op = if offset >= value.len() {
                     vec![]
@@ -495,9 +491,9 @@ impl From<&[u8]> for Packet {
                 Packet::Request(Request::Write(Write::WriteOp {
                     v,
                     corr_id,
-                    partition_id,
-                    segment_id,
-                    op_id,
+                    part_id,
+                    obj_id,
+                    opart_id,
                     raw_op,
                 }))
             }
@@ -524,29 +520,28 @@ impl From<&[u8]> for Packet {
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
-                let partition_id =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+                let part_id = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
                 offset += 2;
 
-                let segment_id_len =
+                let obj_id_len =
                     u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
                 offset += 2;
 
-                let segment_id = std::str::from_utf8(&value[offset..offset + segment_id_len])
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
                     .unwrap()
                     .to_string();
 
-                offset += segment_id_len;
+                offset += obj_id_len;
 
-                let op_id_len =
+                let opart_id_len =
                     u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
                 offset += 2;
 
-                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len])
+                let opart_id = std::str::from_utf8(&value[offset..offset + opart_id_len])
                     .unwrap()
                     .to_string();
 
-                offset += op_id_len;
+                offset += opart_id_len;
 
                 let raw_op = if offset >= value.len() {
                     vec![]
@@ -557,9 +552,9 @@ impl From<&[u8]> for Packet {
                 Packet::Request(Request::Read(Read::GetOp {
                     v,
                     corr_id,
-                    partition_id,
-                    segment_id,
-                    op_id,
+                    part_id,
+                    obj_id,
+                    opart_id,
                     raw_op,
                 }))
             }
@@ -596,23 +591,22 @@ impl From<&[u8]> for Packet {
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
-                let partition_id =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+                let part_id = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
                 offset += 2;
 
-                let segment_id_len =
+                let obj_id_len =
                     u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
                 offset += 2;
 
-                let segment_id = std::str::from_utf8(&value[offset..offset + segment_id_len])
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
                     .unwrap()
                     .to_string();
 
                 Packet::Request(Request::Read(Read::FetchObject {
                     v,
                     corr_id,
-                    partition_id,
-                    segment_id,
+                    part_id,
+                    obj_id,
                 }))
             }
 
@@ -647,13 +641,12 @@ impl From<&[u8]> for Packet {
                 let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
                 offset += 16;
 
-                let partition_id =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+                let part_id = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
 
                 Packet::Request(Request::Write(Write::PartitionFetchCompletion {
                     v,
                     corr_id,
-                    partition_id,
+                    part_id,
                 }))
             }
 
