@@ -14,7 +14,7 @@ use crate::{
     CorylusError, CorylusResult, Instance,
     network::{
         self,
-        packet::{self, Packet},
+        packet::{self},
     },
     object::{
         self,
@@ -402,16 +402,16 @@ impl Inner {
             self.replicate(obj_id, part_id, op)
         } else {
             let raw_op = op.serialize();
-            let response = self.net.sync_send(
+            let response = self.net.request_sync(
                 owner,
-                Packet::Request(packet::Request::Write(packet::Write::WriteOp {
+                packet::Request::Write(packet::Write::WriteOp {
                     v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
                     part_id: part_id as u16,
                     obj_id: obj_id.to_string(),
                     opart_id: op.id().to_string(),
                     raw_op,
-                })),
+                }),
                 None,
             )?;
 
@@ -457,16 +457,16 @@ impl Inner {
                 object::Replication::Sync => {
                     let mut responses = Vec::with_capacity(replica_ids.len());
                     for replica_id in replica_ids {
-                        let response = self.net.sync_send(
+                        let response = self.net.request_sync(
                             replica_id,
-                            Packet::Request(packet::Request::Write(packet::Write::WriteOp {
+                            packet::Request::Write(packet::Write::WriteOp {
                                 v: self.part_group.version(),
                                 corr_id: Uuid::new_v4(),
                                 part_id: part_id as u16,
                                 obj_id: obj_id.to_string(),
                                 opart_id: op.id().to_string(),
                                 raw_op: raw_op.clone(),
-                            })),
+                            }),
                             None,
                         )?;
                         responses.push(response);
@@ -487,16 +487,16 @@ impl Inner {
                 }
                 object::Replication::Async => {
                     for replica_id in replica_ids {
-                        self.net.send(
+                        self.net.request(
                             replica_id,
-                            Packet::Request(packet::Request::Write(packet::Write::WriteOp {
+                            packet::Request::Write(packet::Write::WriteOp {
                                 v: self.part_group.version(),
                                 corr_id: Uuid::new_v4(),
                                 part_id: part_id as u16,
                                 obj_id: obj_id.to_string(),
                                 opart_id: op.id().to_string(),
                                 raw_op: raw_op.clone(),
-                            })),
+                            }),
                             None,
                         )?;
                     }
@@ -537,16 +537,16 @@ impl Inner {
                 .map_err(|err| err.into())
         } else {
             let raw_op = op.serialize();
-            let response = self.net.sync_send(
+            let response = self.net.request_sync(
                 owner,
-                Packet::Request(packet::Request::Read(packet::Read::GetOp {
+                packet::Request::Read(packet::Read::GetOp {
                     v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
                     part_id: part_id as u16,
                     obj_id: obj_id.to_string(),
                     opart_id: op.id().to_string(),
                     raw_op,
-                })),
+                }),
                 None,
             )?;
 

@@ -36,22 +36,40 @@ pub struct Sender {
 }
 
 impl Sender {
-    pub fn sync_send(
+    pub fn request_sync(
         &self,
         id: Uuid,
-        packet: Packet,
+        packet: packet::Request,
         timeout: Option<Duration>,
     ) -> io::Result<Response<'_>> {
         if let Some(corr_id) = packet.correlation_id() {
             let response = self.registry.register_ack(corr_id);
-            self.send(id, packet, timeout)?;
+            self.send_internal(id, Packet::Request(packet), timeout)?;
             Ok(response)
         } else {
             unreachable!("All packets must have informed correlation_id")
         }
     }
 
-    pub fn send(&self, id: Uuid, packet: Packet, timeout: Option<Duration>) -> io::Result<()> {
+    pub fn request(
+        &self,
+        id: Uuid,
+        packet: packet::Request,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        self.send_internal(id, Packet::Request(packet), timeout)
+    }
+
+    pub fn reply(
+        &self,
+        id: Uuid,
+        packet: packet::Reply,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        self.send_internal(id, Packet::Reply(packet), timeout)
+    }
+
+    fn send_internal(&self, id: Uuid, packet: Packet, timeout: Option<Duration>) -> io::Result<()> {
         let (result, v) = self.registry.with_writers_read(|writers| {
             if let Some(writer) = writers.get(&id) {
                 match writer.write(&packet, timeout) {

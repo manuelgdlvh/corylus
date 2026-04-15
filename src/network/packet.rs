@@ -35,6 +35,23 @@ pub enum Request {
     Write(Write),
 }
 
+impl Request {
+    pub fn correlation_id(&self) -> Option<Uuid> {
+        match self {
+            Request::Read(val) => match val {
+                Read::WhoIs { .. } => None,
+                Read::GetOp { corr_id, .. } => Some(*corr_id),
+                Read::FetchObject { corr_id, .. } => Some(*corr_id),
+            },
+            Request::Write(val) => match val {
+                Write::WriteOp { corr_id, .. } => Some(*corr_id),
+                Write::HeartBeat => None,
+                Write::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Write {
     HeartBeat,
@@ -240,19 +257,8 @@ impl Packet {
 
     pub fn correlation_id(&self) -> Option<Uuid> {
         match self {
-            Self::Request(val) => match val {
-                Request::Read(val) => match val {
-                    Read::WhoIs { .. } => None,
-                    Read::GetOp { corr_id, .. } => Some(*corr_id),
-                    Read::FetchObject { corr_id, .. } => Some(*corr_id),
-                },
-                Request::Write(val) => match val {
-                    Write::WriteOp { corr_id, .. } => Some(*corr_id),
-                    Write::HeartBeat => None,
-                    Write::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
-                },
-            },
-            Self::Reply(val) => val.correlation_id(),
+            Self::Request(req) => req.correlation_id(),
+            Self::Reply(reply) => reply.correlation_id(),
         }
     }
 

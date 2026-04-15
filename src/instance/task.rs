@@ -11,7 +11,7 @@ use crate::{
     CorylusError,
     instance::{self},
     network::{
-        packet::{self, Packet},
+        packet::{self},
         registry::Response,
     },
     object, partition,
@@ -139,15 +139,15 @@ impl Task {
                                 if req.segments.is_empty() {
                                     let response = ref_
                                         .net
-                                        .sync_send(
+                                        .request_sync(
                                             req.member_id,
-                                            Packet::Request(packet::Request::Write(
+                                            packet::Request::Write(
                                                 packet::Write::PartitionFetchCompletion {
                                                     v,
                                                     corr_id: Uuid::new_v4(),
                                                     part_id: *part_id as u16,
                                                 },
-                                            )),
+                                            ),
                                             None,
                                         )
                                         .expect("TODO: Handle this error");
@@ -164,16 +164,14 @@ impl Task {
                                     let obj_id = obj_id.to_string();
                                     let response = ref_
                                         .net
-                                        .sync_send(
+                                        .request_sync(
                                             req.member_id,
-                                            Packet::Request(packet::Request::Read(
-                                                packet::Read::FetchObject {
-                                                    v,
-                                                    corr_id: Uuid::new_v4(),
-                                                    part_id: req.part_id as u16,
-                                                    obj_id: obj_id.to_string(),
-                                                },
-                                            )),
+                                            packet::Request::Read(packet::Read::FetchObject {
+                                                v,
+                                                corr_id: Uuid::new_v4(),
+                                                part_id: req.part_id as u16,
+                                                obj_id: obj_id.to_string(),
+                                            }),
                                             None,
                                         )
                                         .expect("TODO: Handle this error");
@@ -251,13 +249,13 @@ impl Task {
                             .map(|val| (Status::Success, val))
                             .unwrap_or_else(|err| (Status::from(err), vec![]));
 
-                        let _ = ref_.net.send(
+                        let _ = ref_.net.reply(
                             from,
-                            Packet::Reply(packet::Reply::GetOp {
+                            packet::Reply::GetOp {
                                 corr_id,
                                 status,
                                 result,
-                            }),
+                            },
                             None,
                         );
                     }
@@ -275,13 +273,13 @@ impl Task {
                             Err(err) => (Status::from(err), vec![]),
                         };
 
-                        let _ = ref_.net.send(
+                        let _ = ref_.net.reply(
                             from,
-                            Packet::Reply(Reply::GetOp {
+                            Reply::GetOp {
                                 corr_id,
                                 status,
                                 result,
-                            }),
+                            },
                             None,
                         );
                     }
@@ -308,11 +306,9 @@ impl Task {
                             .map(|_| Status::Success)
                             .unwrap_or_else(Status::from);
 
-                        let _ = ref_.net.send(
-                            from,
-                            Packet::Reply(Reply::WriteOp { corr_id, status }),
-                            None,
-                        );
+                        let _ = ref_
+                            .net
+                            .reply(from, Reply::WriteOp { corr_id, status }, None);
                     }
                 }
                 packet::Write::PartitionFetchCompletion {
@@ -323,12 +319,12 @@ impl Task {
                     if let Some(ref_) = instance.as_ref().upgrade() {
                         ref_.part_group
                             .set_lifecycle(part_id as usize, partition::Lifecycle::Ready);
-                        let _ = ref_.net.send(
+                        let _ = ref_.net.reply(
                             from,
-                            Packet::Reply(Reply::PartitionFetchCompletion {
+                            Reply::PartitionFetchCompletion {
                                 corr_id,
                                 status: Status::Success,
-                            }),
+                            },
                             None,
                         );
                     }
