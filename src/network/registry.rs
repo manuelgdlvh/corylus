@@ -360,6 +360,11 @@ impl PeerRead {
     }
 
     pub fn read(&mut self, timeout: Option<Duration>) -> io::Result<Packet> {
+        let raw = self.read_raw(timeout)?;
+        Ok(Packet::from(raw))
+    }
+
+    pub fn read_raw(&mut self, timeout: Option<Duration>) -> io::Result<packet::Raw<'_>> {
         self.stream.set_read_timeout(timeout)?;
         let mut len_buffer: [u8; PACKET_LENGTH] = [0; PACKET_LENGTH];
         self.stream.read_exact(&mut len_buffer)?;
@@ -367,8 +372,7 @@ impl PeerRead {
 
         let mut payload_buffer = vec![0u8; len as usize];
         self.stream.read_exact(&mut payload_buffer)?;
-
-        Ok(Packet::from(payload_buffer.as_slice()))
+        Ok(packet::Raw::owned(payload_buffer))
     }
 
     pub fn start(

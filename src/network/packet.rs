@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::fmt::Display;
 use std::net::SocketAddr;
 
 use uuid::Uuid;
@@ -110,6 +112,7 @@ pub enum Status {
     NotEnoughReplicas = 9,
     PartitionNotReady = 10,
 }
+
 impl From<CorylusError> for Status {
     fn from(value: CorylusError) -> Self {
         match value {
@@ -214,43 +217,27 @@ impl Reply {
     }
 }
 
-pub(crate) const DISCRIMINANT: usize = std::mem::size_of::<u8>();
-pub(crate) const PACKET_LENGTH: usize = std::mem::size_of::<u32>();
-
-pub enum Len {
-    Hint(usize),
-    Exact(usize),
-}
-
-impl Len {
-    pub fn value(&self) -> usize {
-        match self {
-            Self::Hint(val) | Self::Exact(val) => *val,
-        }
-    }
-}
-
 impl Packet {
-    pub fn kind(&self) -> u8 {
+    pub fn kind(&self) -> Kind {
         match self {
             Self::Request(val) => match val {
                 Request::Read(val) => match val {
-                    Read::WhoIs { .. } => 1,
-                    Read::GetOp { .. } => 8,
-                    Read::FetchObject { .. } => 10,
+                    Read::WhoIs { .. } => Kind::WhoIsRequest,
+                    Read::GetOp { .. } => Kind::GetOpRequest,
+                    Read::FetchObject { .. } => Kind::FetchObjectRequest,
                 },
                 Request::Write(val) => match val {
-                    Write::WriteOp { .. } => 6,
-                    Write::HeartBeat => 3,
-                    Write::PartitionFetchCompletion { .. } => 12,
+                    Write::WriteOp { .. } => Kind::WriteOpRequest,
+                    Write::HeartBeat => Kind::HeartBeatRequest,
+                    Write::PartitionFetchCompletion { .. } => Kind::PartitionFetchCompletionRequest,
                 },
             },
             Self::Reply(val) => match val {
-                Reply::WhoIs { .. } => 2,
-                Reply::WriteOp { .. } => 7,
-                Reply::GetOp { .. } => 9,
-                Reply::FetchObject { .. } => 11,
-                Reply::PartitionFetchCompletion { .. } => 13,
+                Reply::WhoIs { .. } => Kind::WhoIsReply,
+                Reply::WriteOp { .. } => Kind::WriteOpReply,
+                Reply::GetOp { .. } => Kind::GetOpReply,
+                Reply::FetchObject { .. } => Kind::FetchObjectReply,
+                Reply::PartitionFetchCompletion { .. } => Kind::PartitionFetchCompletionReply,
             },
         }
     }
@@ -261,35 +248,14 @@ impl Packet {
             Self::Reply(reply) => reply.correlation_id(),
         }
     }
-
-    pub fn len(discriminant: u8) -> Len {
-        match discriminant {
-            1 => Len::Hint(128),
-            2 => Len::Exact(16),
-            3 => Len::Exact(0),
-            6 => Len::Hint(256),
-            7 => Len::Exact(17),
-            8 => Len::Hint(512),
-            9 => Len::Hint(512),
-            10 => Len::Hint(128),
-            11 => Len::Hint(4096),
-            12 => Len::Exact(34),
-            13 => Len::Exact(17),
-            _ => Len::Hint(256),
-        }
-    }
-
-    pub fn reserve_buffer(discriminant: u8) -> Vec<u8> {
-        Vec::with_capacity(PACKET_LENGTH + DISCRIMINANT + Packet::len(discriminant).value())
-    }
 }
 
 impl From<&Packet> for Vec<u8> {
     fn from(packet: &Packet) -> Self {
-        let discriminant = packet.kind();
-        let mut buffer = Packet::reserve_buffer(packet.kind());
+        let kind = packet.kind();
+        let mut buffer = kind.buffer();
 
-        match Packet::len(discriminant) {
+        match kind.len() {
             Len::Hint(_) => {
                 buffer.extend_from_slice(&0u32.to_le_bytes());
             }
@@ -298,7 +264,7 @@ impl From<&Packet> for Vec<u8> {
             }
         }
 
-        buffer.push(discriminant);
+        buffer.push(kind as u8);
 
         match packet {
             Packet::Request(req) => match req {
@@ -431,7 +397,7 @@ impl From<&Packet> for Vec<u8> {
             },
         }
 
-        if matches!(Packet::len(discriminant), Len::Hint(_)) {
+        if matches!(kind.len(), Len::Hint(_)) {
             let len = buffer[4..].len() as u32;
             buffer[0..4].copy_from_slice(&len.to_le_bytes());
         }
@@ -440,58 +406,63 @@ impl From<&Packet> for Vec<u8> {
     }
 }
 
-impl From<&[u8]> for Packet {
-    fn from(value: &[u8]) -> Self {
-        let discriminant = value.first().expect("First byte must contain discriminant");
+impl<'a> From<Raw<'a>> for Packet {
+    fn from(value: Raw<'_>) -> Self {
+        let mut offset = size_of::<u8>();
 
-        match *discriminant {
-            // WhoIs (Request::Read)
-            1 => {
-                let id = Uuid::from_slice(&value[1..=16]).unwrap();
-                let addr: SocketAddr = std::str::from_utf8(&value[17..]).unwrap().parse().unwrap();
+        match value.kind() {
+            Kind::WhoIsRequest => {
+                let id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let addr: SocketAddr = std::str::from_utf8(&value[offset..])
+                    .unwrap()
+                    .parse()
+                    .unwrap();
 
                 Packet::Request(Request::Read(Read::WhoIs { id, addr }))
             }
 
-            // WhoIsReply (Reply)
-            2 => Packet::Reply(Reply::WhoIs {
-                id: Uuid::from_slice(&value[1..]).unwrap(),
+            Kind::WhoIsReply => Packet::Reply(Reply::WhoIs {
+                id: Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap(),
             }),
 
-            // HeartBeat (Request::Write)
-            3 => Packet::Request(Request::Write(Write::HeartBeat)),
+            Kind::HeartBeatRequest => Packet::Request(Request::Write(Write::HeartBeat)),
 
-            // WriteOp (Request::Write)
-            6 => {
-                let mut offset = 1;
+            Kind::WriteOpRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
 
-                let v = u128::from_le_bytes(value[offset..offset + 16].try_into().unwrap());
-                offset += 16;
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
 
-                let part_id = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
-                offset += 2;
-
-                let obj_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
                 let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
                     .unwrap()
                     .to_string();
-
                 offset += obj_id_len;
 
-                let opart_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
+                let opart_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
                 let opart_id = std::str::from_utf8(&value[offset..offset + opart_id_len])
                     .unwrap()
                     .to_string();
-
                 offset += opart_id_len;
 
                 let raw_op = if offset >= value.len() {
@@ -510,49 +481,49 @@ impl From<&[u8]> for Packet {
                 }))
             }
 
-            // WriteOpReply (Reply)
-            7 => {
-                let mut offset = 1;
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+            Kind::WriteOpReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
                 let status = Status::try_from(value[offset]).unwrap();
 
                 Packet::Reply(Reply::WriteOp { corr_id, status })
             }
 
-            // GetOp (Request::Read)
-            8 => {
-                let mut offset = 1;
+            Kind::GetOpRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
 
-                let v = u128::from_le_bytes(value[offset..offset + 16].try_into().unwrap());
-                offset += 16;
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
 
-                let part_id = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
-                offset += 2;
-
-                let obj_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
                 let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
                     .unwrap()
                     .to_string();
-
                 offset += obj_id_len;
 
-                let opart_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
+                let opart_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
                 let opart_id = std::str::from_utf8(&value[offset..offset + opart_id_len])
                     .unwrap()
                     .to_string();
-
                 offset += opart_id_len;
 
                 let raw_op = if offset >= value.len() {
@@ -571,15 +542,12 @@ impl From<&[u8]> for Packet {
                 }))
             }
 
-            // GetOpReply (Reply)
-            9 => {
-                let mut offset = 1;
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+            Kind::GetOpReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
                 let status = Status::try_from(value[offset]).unwrap();
-                offset += 1;
+                offset += size_of::<u8>();
 
                 let result = if offset >= value.len() {
                     vec![]
@@ -594,21 +562,26 @@ impl From<&[u8]> for Packet {
                 })
             }
 
-            10 => {
-                let mut offset = 1;
+            Kind::FetchObjectRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
 
-                let v = u128::from_le_bytes(value[offset..offset + 16].try_into().unwrap());
-                offset += 16;
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
 
-                let part_id = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
-                offset += 2;
-
-                let obj_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
                 let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
                     .unwrap()
@@ -622,14 +595,12 @@ impl From<&[u8]> for Packet {
                 }))
             }
 
-            11 => {
-                let mut offset = 1;
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+            Kind::FetchObjectReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
                 let status = Status::try_from(value[offset]).unwrap();
-                offset += 1;
+                offset += size_of::<u8>();
 
                 let result = if offset >= value.len() {
                     vec![]
@@ -644,16 +615,20 @@ impl From<&[u8]> for Packet {
                 })
             }
 
-            12 => {
-                let mut offset = 1;
+            Kind::PartitionFetchCompletionRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
 
-                let v = u128::from_le_bytes(value[offset..offset + 16].try_into().unwrap());
-                offset += 16;
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
-
-                let part_id = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
 
                 Packet::Request(Request::Write(Write::PartitionFetchCompletion {
                     v,
@@ -662,18 +637,125 @@ impl From<&[u8]> for Packet {
                 }))
             }
 
-            13 => {
-                let mut offset = 1;
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+            Kind::PartitionFetchCompletionReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
                 let status = Status::try_from(value[offset]).unwrap();
 
                 Packet::Reply(Reply::PartitionFetchCompletion { corr_id, status })
             }
+        }
+    }
+}
 
+const DISCRIMINANT: usize = std::mem::size_of::<u8>();
+pub(crate) const PACKET_LENGTH: usize = std::mem::size_of::<u32>();
+
+pub enum Len {
+    Hint(usize),
+    Exact(usize),
+}
+
+impl Len {
+    pub fn value(&self) -> usize {
+        match self {
+            Self::Hint(val) | Self::Exact(val) => *val,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum Kind {
+    WhoIsRequest = 1,
+    WhoIsReply = 2,
+    HeartBeatRequest = 3,
+    WriteOpRequest = 6,
+    WriteOpReply = 7,
+    GetOpRequest = 8,
+    GetOpReply = 9,
+    FetchObjectRequest = 10,
+    FetchObjectReply = 11,
+    PartitionFetchCompletionRequest = 12,
+    PartitionFetchCompletionReply = 13,
+}
+impl Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Kind::WhoIsRequest => "WhoIsRequest",
+            Kind::WhoIsReply => "WhoIsReply",
+            Kind::HeartBeatRequest => "HeartBeatRequest",
+            Kind::WriteOpRequest => "WriteOpRequest",
+            Kind::WriteOpReply => "WriteOpReply",
+            Kind::GetOpRequest => "GetOpRequest",
+            Kind::GetOpReply => "GetOpReply",
+            Kind::FetchObjectRequest => "FetchObjectRequest",
+            Kind::FetchObjectReply => "FetchObjectReply",
+            Kind::PartitionFetchCompletionRequest => "PartitionFetchCompletionRequest",
+            Kind::PartitionFetchCompletionReply => "PartitionFetchCompletionReply",
+        };
+
+        f.write_str(s)
+    }
+}
+
+impl Kind {
+    pub fn len(&self) -> Len {
+        match self {
+            Kind::WhoIsRequest => Len::Hint(128),
+            Kind::WhoIsReply => Len::Exact(16),
+            Kind::HeartBeatRequest => Len::Exact(0),
+            Kind::WriteOpRequest => Len::Hint(256),
+            Kind::WriteOpReply => Len::Exact(17),
+            Kind::GetOpRequest => Len::Hint(512),
+            Kind::GetOpReply => Len::Hint(512),
+            Kind::FetchObjectRequest => Len::Hint(128),
+            Kind::FetchObjectReply => Len::Hint(4096),
+            Kind::PartitionFetchCompletionRequest => Len::Exact(34),
+            Kind::PartitionFetchCompletionReply => Len::Exact(17),
+        }
+    }
+
+    pub fn buffer(&self) -> Vec<u8> {
+        Vec::with_capacity(PACKET_LENGTH + DISCRIMINANT + self.len().value())
+    }
+}
+
+pub struct Raw<'a>(Cow<'a, [u8]>);
+
+impl<'a> Raw<'a> {
+    pub fn owned(buffer: Vec<u8>) -> Self {
+        Self(Cow::Owned(buffer))
+    }
+
+    pub fn borrowed(buffer: &'a [u8]) -> Self {
+        Self(Cow::Borrowed(buffer))
+    }
+
+    pub fn kind(&self) -> Kind {
+        let discriminant = self.0[0];
+        match discriminant {
+            1 => Kind::WhoIsRequest,
+            2 => Kind::WhoIsReply,
+            3 => Kind::HeartBeatRequest,
+            6 => Kind::WriteOpRequest,
+            7 => Kind::WriteOpReply,
+            8 => Kind::GetOpRequest,
+            9 => Kind::GetOpReply,
+            10 => Kind::FetchObjectRequest,
+            11 => Kind::FetchObjectReply,
+            12 => Kind::PartitionFetchCompletionRequest,
+            13 => Kind::PartitionFetchCompletionReply,
             _ => panic!("Unknown packet"),
         }
+    }
+}
+
+impl<'a> std::ops::Deref for Raw<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
     }
 }
