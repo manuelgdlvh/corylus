@@ -185,6 +185,18 @@ pub enum Reply {
     },
 }
 
+impl Reply {
+    pub fn correlation_id(&self) -> Option<Uuid> {
+        match self {
+            Reply::WhoIs { .. } => None,
+            Reply::WriteOp { corr_id, .. } => Some(*corr_id),
+            Reply::GetOp { corr_id, .. } => Some(*corr_id),
+            Reply::FetchObject { corr_id, .. } => Some(*corr_id),
+            Reply::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
+        }
+    }
+}
+
 pub(crate) const DISCRIMINANT: usize = std::mem::size_of::<u8>();
 pub(crate) const PACKET_LENGTH: usize = std::mem::size_of::<u32>();
 
@@ -240,13 +252,7 @@ impl Packet {
                     Write::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
                 },
             },
-            Self::Reply(val) => match val {
-                Reply::WhoIs { .. } => None,
-                Reply::WriteOp { corr_id, .. } => Some(*corr_id),
-                Reply::GetOp { corr_id, .. } => Some(*corr_id),
-                Reply::FetchObject { corr_id, .. } => Some(*corr_id),
-                Reply::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
-            },
+            Self::Reply(val) => val.correlation_id(),
         }
     }
 

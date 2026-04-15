@@ -188,11 +188,11 @@ impl Receiver {
                                         );
                                     }
                                 },
-                                Packet::Reply(_) => {
-                                    if let Some(corr_id) = val.p.correlation_id()
+                                Packet::Reply(reply) => {
+                                    if let Some(corr_id) = reply.correlation_id()
                                         && let Some(entry) = self.registry.unregister_ack(corr_id)
                                     {
-                                        let _ = entry.try_send(val.p);
+                                        let _ = entry.try_send(reply);
                                     }
                                 }
                             },

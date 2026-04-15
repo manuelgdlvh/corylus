@@ -49,11 +49,11 @@ impl Limiter {
 pub struct Response<'a> {
     corr_id: Uuid,
     reg: &'a Registry,
-    receiver: mpsc::Receiver<Packet>,
+    receiver: mpsc::Receiver<packet::Reply>,
 }
 
 impl<'a> Response<'a> {
-    fn new(corr_id: Uuid, reg: &'a Registry, receiver: mpsc::Receiver<Packet>) -> Self {
+    fn new(corr_id: Uuid, reg: &'a Registry, receiver: mpsc::Receiver<packet::Reply>) -> Self {
         Self {
             corr_id,
             reg,
@@ -61,7 +61,7 @@ impl<'a> Response<'a> {
         }
     }
 
-    pub fn get(&self, timeout: Duration) -> Result<Packet, io::Error> {
+    pub fn get(&self, timeout: Duration) -> Result<packet::Reply, io::Error> {
         self.receiver
             .recv_timeout(timeout)
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
@@ -86,7 +86,7 @@ pub(crate) struct Inner {
     pub(crate) sigterm: Shutdown,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
     writers: RwLock<HashMap<Uuid, PeerWrite>>,
-    acks: Mutex<HashMap<Uuid, SyncSender<Packet>>>,
+    acks: Mutex<HashMap<Uuid, SyncSender<packet::Reply>>>,
     limiter: Limiter,
 }
 
@@ -307,7 +307,7 @@ impl Registry {
         Response::new(corr_id, self, rx)
     }
 
-    pub(crate) fn unregister_ack(&self, corr_id: Uuid) -> Option<mpsc::SyncSender<Packet>> {
+    pub(crate) fn unregister_ack(&self, corr_id: Uuid) -> Option<mpsc::SyncSender<packet::Reply>> {
         self.as_ref()
             .acks
             .lock()

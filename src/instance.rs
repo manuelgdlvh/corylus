@@ -416,13 +416,11 @@ impl Inner {
             )?;
 
             match response.get(Duration::from_secs(1))? {
-                Packet::Reply(packet::Reply::WriteOp { status, .. }) => match status {
+                packet::Reply::WriteOp { status, .. } => match status {
                     packet::Status::Success => Ok(()),
                     s => Err(CorylusError::try_from(s).unwrap()),
                 },
-                Packet::Reply(_) | Packet::Request(_) => {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into())
-                }
+                _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),
             }
         }
     }
@@ -475,12 +473,12 @@ impl Inner {
                     }
 
                     for response in responses {
-                        match response.get(Duration::from_secs(3))? {
-                            Packet::Reply(packet::Reply::WriteOp { status, .. }) => match status {
+                        match response.get(Duration::from_secs(1))? {
+                            packet::Reply::WriteOp { status, .. } => match status {
                                 packet::Status::Success => Ok(()),
                                 s => Err(CorylusError::try_from(s).unwrap()),
                             },
-                            Packet::Reply(_) | Packet::Request(_) => {
+                            _ => {
                                 Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")
                                     .into())
                             }
@@ -553,13 +551,11 @@ impl Inner {
             )?;
 
             match response.get(Duration::from_secs(1))? {
-                Packet::Reply(packet::Reply::GetOp { status, result, .. }) => match status {
+                packet::Reply::GetOp { status, result, .. } => match status {
                     packet::Status::Success => Ok(result),
                     s => Err(CorylusError::try_from(s).unwrap()),
                 },
-                Packet::Reply(_) | Packet::Request(_) => {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into())
-                }
+                _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),
             }
         }
     }

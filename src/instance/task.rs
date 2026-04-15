@@ -191,10 +191,8 @@ impl Task {
                                 for entry in responses {
                                     match entry {
                                         FetchResponse::FetchObject { obj_id, resp } => {
-                                            if let Ok(res) = resp.get(timeout) {
-                                                if let Packet::Reply(reply) = res
-                                                    && let Reply::FetchObject { result, .. } = reply
-                                                {
+                                            if let Ok(reply) = resp.get(timeout) {
+                                                if let Reply::FetchObject { result, .. } = reply {
                                                     ref_.rebuild(&obj_id, part_id as u16, result)
                                                         .expect("TODO");
                                                 }
