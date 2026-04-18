@@ -1,16 +1,22 @@
 use std::{any::Any, collections::HashMap, hash::Hash, io, marker::PhantomData};
 
 use crate::{
-    instance::operation::{self, Deserializer, GenericRead, GenericWrite, Read, Serializer, Write},
-    partition::{self, RawSegment},
+    object,
+    serde::{Deserializer, Serializer},
 };
 
+use crate::object::operation::{self, GenericRead, GenericWrite, Read, Write};
 use std::convert::TryInto;
 
-impl<K, V> RawSegment for HashMap<K, V>
+pub trait Key: Serializer + Deserializer + Hash + Eq + Clone + Send + Sync + 'static {}
+pub trait Value: Serializer + Deserializer + Clone + Send + Sync + 'static {}
+impl<T: Serializer + Deserializer + Hash + Eq + Clone + Send + Sync + 'static> Key for T {}
+impl<T: Serializer + Deserializer + Clone + Send + Sync + 'static> Value for T {}
+
+impl<K, V> object::Raw for HashMap<K, V>
 where
-    K: Serializer + Deserializer + Send + Sync + Hash + Eq + 'static,
-    V: Serializer + Deserializer + Send + Sync + 'static,
+    K: Key,
+    V: Value,
 {
     fn as_any(&self) -> &dyn Any {
         self
@@ -19,23 +25,72 @@ where
     fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
+
+    fn as_raw(&self) -> Vec<u8> {
+        if self.is_empty() {
+            return vec![];
+        }
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&(self.len() as u32).to_le_bytes());
+        for (k, v) in self {
+            let raw_key = k.serialize();
+            buffer.extend_from_slice(&(raw_key.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(raw_key.as_slice());
+
+            let raw_value = v.serialize();
+            buffer.extend_from_slice(&(raw_value.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(raw_value.as_slice());
+        }
+
+        buffer
+    }
+
+    fn rebuild(&mut self, raw: &[u8]) {
+        let mut result;
+        let mut offset = 0;
+        if raw.is_empty() {
+            result = HashMap::new();
+        } else {
+            let size = u32::from_le_bytes(raw[offset..size_of::<u32>()].try_into().unwrap());
+            offset += size_of::<u32>();
+
+            result = HashMap::with_capacity(size as usize);
+            for _ in 0..size {
+                let key_len =
+                    u32::from_le_bytes(raw[offset..offset + size_of::<u32>()].try_into().unwrap());
+                offset += size_of::<u32>();
+                let key = K::deserialize(&raw[offset..offset + key_len as usize]).unwrap();
+                offset += key_len as usize;
+
+                let value_len =
+                    u32::from_le_bytes(raw[offset..offset + size_of::<u32>()].try_into().unwrap());
+                offset += size_of::<u32>();
+                let value = V::deserialize(&raw[offset..offset + value_len as usize]).unwrap();
+                offset += value_len as usize;
+
+                result.insert(key, value);
+            }
+        }
+
+        *self = result;
+    }
 }
 
 // --- Put ---
 
 pub struct Put<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq,
-    V: Serializer + Deserializer,
+    K: Key,
+    V: Value,
 {
     pub(crate) key: K,
     pub(crate) value: V,
 }
 
-impl<K, V> operation::Serializer for Put<K, V>
+impl<K, V> Serializer for Put<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq,
-    V: Serializer + Deserializer,
+    K: Key,
+    V: Value,
 {
     fn serialize(&self) -> Vec<u8> {
         let key = self.key.serialize();
@@ -53,8 +108,8 @@ where
 
 impl<K, V> operation::Base for Put<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq,
-    V: Serializer + Deserializer,
+    K: Key,
+    V: Value,
 {
     fn static_id() -> &'static str {
         "map:put"
@@ -71,10 +126,10 @@ where
 
 impl<K, V> Write for Put<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq + Clone + 'static,
-    V: Serializer + Deserializer + Clone + 'static,
+    K: Key,
+    V: Value,
 {
-    fn execute(&mut self, segment: &mut dyn crate::partition::RawSegment) {
+    fn execute(&mut self, segment: &mut dyn object::Raw) {
         let map = segment
             .as_mut_any()
             .downcast_mut::<HashMap<K, V>>()
@@ -136,17 +191,17 @@ where
 
 pub struct Get<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq,
-    V: Serializer + Deserializer,
+    K: Key,
+    V: Value,
 {
     pub(crate) key: K,
     pub(crate) _value: PhantomData<V>,
 }
 
-impl<K, V> operation::Serializer for Get<K, V>
+impl<K, V> Serializer for Get<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq,
-    V: Serializer + Deserializer,
+    K: Key,
+    V: Value,
 {
     fn serialize(&self) -> Vec<u8> {
         let key = self.key.serialize();
@@ -161,8 +216,8 @@ where
 
 impl<K, V> operation::Base for Get<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq,
-    V: Serializer + Deserializer,
+    K: Key,
+    V: Value,
 {
     fn static_id() -> &'static str {
         "map:get"
@@ -179,10 +234,10 @@ where
 
 impl<K, V> Read for Get<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq + 'static,
-    V: Serializer + Deserializer + 'static,
+    K: Key,
+    V: Value,
 {
-    fn execute(&self, segment: &dyn partition::RawSegment) -> Vec<u8> {
+    fn execute(&self, segment: &dyn object::Raw) -> Vec<u8> {
         let map = segment
             .as_any()
             .downcast_ref::<HashMap<K, V>>()

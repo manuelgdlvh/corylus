@@ -1,14 +1,23 @@
-use rayon::ThreadPoolBuilder;
-
+use crate::network::Response;
+use crate::network::packet::{Inbound, Reply, Request, Status};
 use crate::{
-    instance,
-    network::packet::{InboundPacket, Packet},
+    CorylusError,
+    instance::{self},
+    network::packet::{self},
+    object, partition,
 };
+use rayon::ThreadPoolBuilder;
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
+use tracing::{error, info};
+use uuid::Uuid;
 
 pub enum Task {
     PartitionRebalance,
-    Read { packet: InboundPacket },
-    Write { packet: InboundPacket },
+    Read(Inbound),
+    Write(Inbound),
 }
 
 impl Task {
@@ -16,116 +25,335 @@ impl Task {
         match self {
             Self::PartitionRebalance => {
                 if let Some(ref_) = instance.as_ref().upgrade() {
-                    let members = ref_.members();
-                    let _ = ref_.part_group.update(members.as_slice());
-                }
-            }
-            Self::Read { packet } => {
-                let from = packet.from;
+                    let mut members;
 
-                match packet.p {
-                    Packet::WhoIs { .. }
-                    | Packet::WhoIsReply { .. }
-                    | Packet::HeartBeat
-                    | Packet::WriteOpReply { .. }
-                    | Packet::GetOpReply { .. }
-                    | Packet::WriteOp { .. } => {}
-                    Packet::GetOp {
-                        corr_id,
-                        partition_id,
-                        segment_id,
-                        op_id,
-                        raw_op,
-                    } => {
-                        if let Some(ref_) = instance.as_ref().upgrade() {
-                            let ok;
-                            let result;
-                            if let Ok(Some(f)) = ref_.part_group.with_segment_read(
-                                partition_id as usize,
-                                &segment_id,
-                                |segment| segment.op_reg.read_fn(&op_id),
-                            ) {
-                                match f(raw_op.as_slice()) {
-                                    Ok(read_op) => match ref_.read(&segment_id, read_op) {
-                                        Ok(val) => {
-                                            result = val;
-                                            ok = true;
+                    'rebalance: loop {
+                        members = ref_.membership.all();
+                        let target_version = partition::version(members.as_slice());
+                        if target_version.eq(&ref_.part_group.version()) {
+                            break 'rebalance;
+                        }
+
+                        struct FetchEntry<'a> {
+                            part_id: usize,
+                            member_id: Uuid,
+                            segments: HashSet<&'a String>,
+                        }
+
+                        info!(id = %ref_.id, "rebalance has started");
+
+                        ref_.part_group
+                            .set_all_lifecycle(partition::Lifecycle::Migration);
+
+                        let mut fetch: HashMap<usize, FetchEntry> = HashMap::new();
+                        for (part_id, changes) in ref_.part_group.update(members.as_slice()) {
+                            let mut ready = true;
+                            for change in changes {
+                                match change {
+                                    partition::MembershipChange::MasterChanged { old, new } => {
+                                        if new.eq(&ref_.id) {
+                                            let old_alive = members.contains(&old);
+                                            if old_alive {
+                                                ready = false;
+                                                fetch.insert(
+                                                    part_id,
+                                                    FetchEntry {
+                                                        part_id,
+                                                        member_id: old,
+                                                        segments: ref_
+                                                            .objects
+                                                            .keys()
+                                                            .collect::<HashSet<_>>(),
+                                                    },
+                                                );
+                                            }
                                         }
-                                        Err(_) => {
-                                            result = vec![];
-                                            ok = false;
+
+                                        if old.eq(&ref_.id) {
+                                            ready = false;
                                         }
-                                    },
-                                    Err(_) => {
-                                        result = vec![];
-                                        ok = false;
                                     }
+
+                                    partition::MembershipChange::ReplicasChanged {
+                                        added: _,
+                                        removed: _,
+                                    } => {}
                                 }
-                            } else {
-                                ok = false;
-                                result = vec![];
                             }
 
-                            let _ = ref_.net.send(
-                                from,
-                                Packet::GetOpReply {
-                                    corr_id,
-                                    ok,
-                                    result,
-                                },
-                                None,
-                            );
+                            if ready {
+                                if ref_.part_group.is_initialized() {
+                                    ref_.part_group
+                                        .set_lifecycle(part_id, partition::Lifecycle::Ready);
+                                } else if ref_.part_group.owner_of(part_id as u64).eq(&ref_.id) {
+                                    let member_id = *ref_
+                                        .part_group
+                                        .replicas_of(part_id as u64, 1)
+                                        .first()
+                                        .expect("CHECK");
+                                    fetch.insert(
+                                        part_id,
+                                        FetchEntry {
+                                            part_id,
+                                            member_id,
+                                            segments: ref_.objects.keys().collect::<HashSet<_>>(),
+                                        },
+                                    );
+                                }
+                            }
                         }
+
+                        enum FetchResponse<'a> {
+                            FetchObject {
+                                obj_id: &'a String,
+                                resp: Response<'a>,
+                            },
+                            Completion(Response<'a>),
+                        }
+
+                        let v = ref_.part_group.version();
+                        let mut pending_partitions = fetch.keys().copied().collect::<HashSet<_>>();
+                        loop {
+                            if pending_partitions.is_empty() {
+                                break 'rebalance;
+                            }
+
+                            // Some peers changed in the meeantime, restarting process
+                            if !members.eq(&ref_.membership.all()) {
+                                continue 'rebalance;
+                            }
+
+                            let mut timeout = Duration::from_secs(2);
+                            let start = Instant::now();
+                            let mut response_map = HashMap::new();
+                            for (part_id, req) in fetch.iter() {
+                                if !pending_partitions.contains(part_id) {
+                                    continue;
+                                }
+
+                                response_map.insert(
+                                    req.part_id,
+                                    Vec::with_capacity(req.segments.len().max(1)),
+                                );
+                                if req.segments.is_empty() {
+                                    let response = ref_
+                                        .net
+                                        .request_sync(
+                                            req.member_id,
+                                            packet::Request::PartitionFetchCompletion {
+                                                v,
+                                                corr_id: Uuid::new_v4(),
+                                                part_id: *part_id as u16,
+                                            },
+                                            None,
+                                        )
+                                        .unwrap();
+
+                                    response_map
+                                        .get_mut(&req.part_id)
+                                        .unwrap()
+                                        .push(FetchResponse::Completion(response));
+
+                                    continue;
+                                }
+
+                                for &obj_id in req.segments.iter() {
+                                    let response = ref_
+                                        .net
+                                        .request_sync(
+                                            req.member_id,
+                                            packet::Request::FetchObject {
+                                                v,
+                                                corr_id: Uuid::new_v4(),
+                                                part_id: req.part_id as u16,
+                                                obj_id,
+                                            },
+                                            None,
+                                        )
+                                        .unwrap();
+
+                                    response_map.get_mut(&req.part_id).unwrap().push(
+                                        FetchResponse::FetchObject {
+                                            obj_id,
+                                            resp: response,
+                                        },
+                                    );
+                                }
+                            }
+
+                            for (part_id, responses) in response_map {
+                                for entry in responses {
+                                    match entry {
+                                        FetchResponse::FetchObject { obj_id, resp } => {
+                                            match resp.get(timeout) {
+                                                Ok(raw) => {
+                                                    if let Reply::FetchObject { result, .. } =
+                                                        Reply::try_from(&raw).unwrap()
+                                                    {
+                                                        ref_.rebuild(
+                                                            obj_id,
+                                                            part_id as u16,
+                                                            result,
+                                                        )
+                                                        .unwrap();
+                                                        fetch
+                                                            .get_mut(&part_id)
+                                                            .expect("Always available")
+                                                            .segments
+                                                            .remove(obj_id);
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    error!(err = %err, "Fetch object error");
+                                                }
+                                            }
+                                        }
+                                        FetchResponse::Completion(resp) => {
+                                            match resp.get(timeout) {
+                                                Ok(_) => {
+                                                    pending_partitions.remove(&part_id);
+                                                    ref_.part_group.set_lifecycle(
+                                                        part_id,
+                                                        partition::Lifecycle::Ready,
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    error!(err = %err, "Partition Completion error");
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    timeout = timeout.saturating_sub(start.elapsed());
+                                }
+                            }
+                        }
+                    }
+
+                    ref_.part_group.update_version(&members);
+                    ref_.part_group.initialize();
+                    ref_.part_group
+                        .set_all_lifecycle(partition::Lifecycle::Ready);
+                    info!(id = %ref_.id, "Rebalance has finished");
+                }
+            }
+
+            Self::Read(inbound) => {
+                let from = inbound.from;
+                if let Ok(packet) = Request::try_from(&inbound.p) {
+                    match packet {
+                        Request::GetOp {
+                            v,
+                            corr_id,
+                            part_id,
+                            obj_id,
+                            op_id,
+                            raw_op,
+                        } => {
+                            if let Some(ref_) = instance.as_ref().upgrade() {
+                                let (status, result) = ref_
+                                    .objects
+                                    .get(obj_id)
+                                    .ok_or(object::Error::ObjectNotFound.into())
+                                    .and_then(|m| m.read_fn(op_id).map_err(CorylusError::from))
+                                    .and_then(|f| f(raw_op).map_err(CorylusError::from))
+                                    .and_then(|op| ref_.remote_read(obj_id, part_id, v, op))
+                                    .map(|val| (Status::Success, val))
+                                    .unwrap_or_else(|err| (Status::from(err), vec![]));
+
+                                let _ = ref_.net.reply(
+                                    from,
+                                    Reply::GetOp {
+                                        corr_id,
+                                        status,
+                                        result: &result,
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+
+                        Request::FetchObject {
+                            v: _,
+                            corr_id,
+                            part_id,
+                            obj_id,
+                        } => {
+                            if let Some(ref_) = instance.as_ref().upgrade() {
+                                let (status, result) = match ref_.fetch(obj_id, part_id) {
+                                    Ok(res) => (Status::Success, res),
+                                    Err(err) => (Status::from(err), vec![]),
+                                };
+
+                                let _ = ref_.net.reply(
+                                    from,
+                                    Reply::FetchObject {
+                                        corr_id,
+                                        status,
+                                        result: &result,
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                        Request::HeartBeat => {}
+                        Request::WriteOp { .. } => {}
+                        Request::PartitionFetchCompletion { .. } => {}
+                        Request::WhoIs { .. } => {}
                     }
                 }
             }
 
-            Self::Write { packet } => {
-                let from = packet.from;
+            Self::Write(inbound) => {
+                let from = inbound.from;
+                if let Ok(packet) = Request::try_from(&inbound.p) {
+                    match packet {
+                        Request::WriteOp {
+                            v,
+                            corr_id,
+                            part_id,
+                            obj_id,
+                            op_id,
+                            raw_op,
+                        } => {
+                            if let Some(ref_) = instance.as_ref().upgrade() {
+                                let status = ref_
+                                    .objects
+                                    .get(obj_id)
+                                    .ok_or(object::Error::ObjectNotFound.into())
+                                    .and_then(|m| m.write_fn(op_id).map_err(CorylusError::from))
+                                    .and_then(|f| f(raw_op).map_err(CorylusError::from))
+                                    .and_then(|op| ref_.remote_write(obj_id, part_id, v, op))
+                                    .map(|_| Status::Success)
+                                    .unwrap_or_else(Status::from);
 
-                match packet.p {
-                    Packet::WhoIs { .. }
-                    | Packet::WhoIsReply { .. }
-                    | Packet::HeartBeat
-                    | Packet::WriteOpReply { .. }
-                    | Packet::GetOpReply { .. }
-                    | Packet::GetOp { .. } => {}
-
-                    Packet::WriteOp {
-                        corr_id,
-                        partition_id,
-                        segment_id,
-                        op_id,
-                        raw_op,
-                    } => {
-                        if let Some(ref_) = instance.as_ref().upgrade() {
-                            let ok;
-                            if let Ok(Some(f)) = ref_.part_group.with_segment_read(
-                                partition_id as usize,
-                                &segment_id,
-                                |segment| segment.op_reg.write_fn(&op_id),
-                            ) {
-                                match f(raw_op.as_slice()) {
-                                    Ok(write_op) => match ref_.write(&segment_id, write_op) {
-                                        Ok(_) => {
-                                            ok = true;
-                                        }
-                                        Err(_) => {
-                                            ok = false;
-                                        }
-                                    },
-                                    Err(_) => {
-                                        ok = false;
-                                    }
-                                }
-                            } else {
-                                ok = false;
+                                let _ =
+                                    ref_.net
+                                        .reply(from, Reply::WriteOp { corr_id, status }, None);
                             }
-
-                            let _ = ref_
-                                .net
-                                .send(from, Packet::WriteOpReply { corr_id, ok }, None);
                         }
+                        Request::PartitionFetchCompletion {
+                            v: _,
+                            corr_id,
+                            part_id,
+                        } => {
+                            if let Some(ref_) = instance.as_ref().upgrade() {
+                                ref_.part_group
+                                    .set_lifecycle(part_id as usize, partition::Lifecycle::Ready);
+                                let _ = ref_.net.reply(
+                                    from,
+                                    Reply::PartitionFetchCompletion {
+                                        corr_id,
+                                        status: Status::Success,
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                        Request::HeartBeat
+                        | Request::WhoIs { .. }
+                        | Request::GetOp { .. }
+                        | Request::FetchObject { .. } => {}
                     }
                 }
             }
@@ -155,7 +383,6 @@ impl Executor {
             .num_threads(16)
             .build()
             .expect("Failed to build thread pool");
-
         let write = ThreadPoolBuilder::new()
             .num_threads(4)
             .build()

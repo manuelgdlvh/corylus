@@ -1,24 +1,29 @@
 use std::{
     collections::{HashMap, HashSet},
-    hash::Hash,
     io,
     marker::PhantomData,
-    sync::{self, Arc, Condvar, Mutex},
+    sync::{self, Arc, Mutex},
     thread::JoinHandle,
     time::Duration,
 };
 
 use uuid::Uuid;
 
+use crate::network::packet::Reply;
+use crate::object::operation;
 use crate::{
-    Instance,
-    instance::operation::{Deserializer, Serializer},
-    network::{self, packet::Packet},
-    object::map::{Get, Put},
+    CorylusError, CorylusResult, Instance,
+    network::{
+        self,
+        packet::{self},
+    },
+    object::{
+        self,
+        map::{Get, Put},
+    },
     partition::{self, Segment},
 };
 
-pub mod operation;
 pub mod task;
 
 // --- State markers ---
@@ -34,7 +39,8 @@ pub struct Builder<S> {
     id: Option<Uuid>,
     c: Option<Config>,
     d: Option<network::Discovery>,
-    segments: Vec<Box<dyn Fn() -> Segment>>,
+    objects: HashMap<object::Id, object::Metadata>,
+    segment_fns: Vec<Box<dyn Fn() -> Segment>>,
     _state: PhantomData<S>,
 }
 
@@ -50,7 +56,8 @@ impl Builder<NeedsId> {
             id: None,
             c: None,
             d: None,
-            segments: Vec::new(),
+            objects: HashMap::new(),
+            segment_fns: Vec::new(),
             _state: PhantomData,
         }
     }
@@ -59,7 +66,8 @@ impl Builder<NeedsId> {
             id: Some(id),
             c: self.c,
             d: self.d,
-            segments: self.segments,
+            objects: self.objects,
+            segment_fns: self.segment_fns,
             _state: PhantomData,
         }
     }
@@ -71,7 +79,8 @@ impl Builder<NeedsConfig> {
             id: self.id,
             c: Some(c),
             d: self.d,
-            segments: self.segments,
+            objects: self.objects,
+            segment_fns: self.segment_fns,
             _state: PhantomData,
         }
     }
@@ -83,27 +92,30 @@ impl Builder<NeedsDiscovery> {
             id: self.id,
             c: self.c,
             d: Some(d),
-            segments: self.segments,
+
+            objects: self.objects,
+            segment_fns: self.segment_fns,
             _state: PhantomData,
         }
     }
 }
 
 impl Builder<Ready> {
-    pub fn with_map<K, V>(mut self, id: &str) -> Self
+    pub fn with_map<K, V>(mut self, id: &str, repl_config: object::ReplicationConfig) -> Self
     where
-        K: Serializer + Deserializer + Send + Sync + Hash + Eq + Clone + 'static,
-        V: Serializer + Deserializer + Send + Sync + Clone + 'static,
+        K: object::map::Key,
+        V: object::map::Value,
     {
         let id = format!("map:{}", id);
 
         let op_reg = operation::Registry::new()
             .with_read_op::<Get<K, V>>()
             .with_write_op::<Put<K, V>>();
-
-        self.segments.push(Box::new(move || {
+        self.objects
+            .insert(id.to_string(), object::Metadata::new(op_reg, repl_config));
+        self.segment_fns.push(Box::new(move || {
             let data: HashMap<K, V> = HashMap::new();
-            Segment::new(id.to_string(), data, op_reg.clone())
+            Segment::new(id.to_string(), data)
         }));
 
         self
@@ -116,9 +128,9 @@ impl Builder<Ready> {
 
         let shutdown = Shutdown::new();
 
-        let (net_sender, net_receiver) = network::handle(id, d, Arc::clone(&shutdown), c.network)?;
-        let partition = partition::Group::new(id, self.segments.as_slice());
-        let instance = Instance::new(id, net_sender, partition, Arc::clone(&shutdown));
+        let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
+        let partition = partition::Group::new(id, self.segment_fns.as_slice());
+        let instance = Instance::new(id, net_sender, partition, self.objects, shutdown.clone());
 
         shutdown.register(net_receiver.start(instance.downgrade())?);
 
@@ -127,57 +139,84 @@ impl Builder<Ready> {
 }
 
 // --- Shutdown ---
+mod shutdown {
+    use crate::sync::State;
+    use std::{sync::Mutex, thread::JoinHandle, time::Duration};
 
+    pub struct Inner {
+        state: State<bool>,
+        handles: Mutex<Vec<JoinHandle<()>>>,
+    }
+
+    impl Default for Inner {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Inner {
+        pub fn new() -> Self {
+            Self {
+                state: State::new(),
+                handles: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn update(&self, val: bool) {
+            self.state.update(val);
+        }
+
+        pub fn with_handles_write<F, O>(&self, f: F) -> O
+        where
+            F: FnOnce(&mut Vec<JoinHandle<()>>) -> O,
+        {
+            let mut handles = self.handles.lock().expect("Cannot be poisoned");
+            f(&mut handles)
+        }
+
+        pub fn checkpoint(&self, timeout: Option<Duration>) -> bool {
+            !self.state.await_until(true, timeout)
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Shutdown {
-    flag: Mutex<bool>,
-    notify: Condvar,
-    handles: Mutex<Vec<JoinHandle<()>>>,
+    inner: Arc<shutdown::Inner>,
+}
+
+impl AsRef<shutdown::Inner> for Shutdown {
+    fn as_ref(&self) -> &shutdown::Inner {
+        &self.inner
+    }
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Shutdown {
-    pub fn new() -> Arc<Self> {
-        let self_ = Self {
-            flag: Mutex::new(false),
-            notify: Condvar::new(),
-            handles: Mutex::new(Vec::new()),
-        };
-
-        Arc::new(self_)
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(shutdown::Inner::new()),
+        }
     }
 
     pub fn register(&self, h: JoinHandle<()>) {
-        self.handles.lock().expect("Cannot be poisoned").push(h);
+        self.as_ref().with_handles_write(|handles| {
+            handles.push(h);
+        })
     }
 
     pub fn checkpoint(&self, timeout: Option<Duration>) -> bool {
-        let flag = self.flag.lock().expect("Cannot be poisoned");
-        if *flag {
-            return false;
-        }
-
-        match timeout {
-            Some(val) => match self.notify.wait_timeout(flag, val) {
-                Ok((_, res)) => res.timed_out(),
-                Err(_) => false,
-            },
-            None => true,
-        }
+        self.as_ref().checkpoint(timeout)
     }
 
     pub fn destroy(&self) {
-        {
-            let mut flag = self.flag.lock().expect("Cannot be poisoned");
-            *flag = true;
-        }
-
-        self.notify.notify_all();
-
-        let handles = self
-            .handles
-            .lock()
-            .expect("Cannot be poisoned")
-            .drain(..)
-            .collect::<Vec<_>>();
+        self.inner.update(true);
+        let handles = self.as_ref().with_handles_write(std::mem::take);
         for h in handles {
             let _ = h.join();
         }
@@ -205,12 +244,53 @@ impl AsRef<sync::Weak<Inner>> for Weak {
     }
 }
 
+pub struct Membership(Mutex<HashSet<Uuid>>);
+
+impl Default for Membership {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Membership {
+    pub fn new() -> Self {
+        Self(Mutex::new(HashSet::new()))
+    }
+
+    pub(crate) fn remove(&self, id: Uuid) {
+        let mut members = self.0.lock().expect("Cannot be poisoned");
+        members.remove(&id);
+    }
+
+    pub(crate) fn add(&self, id: Uuid) {
+        let mut members = self.0.lock().expect("Cannot be poisoned");
+        members.insert(id);
+    }
+
+    pub(crate) fn all(&self) -> Vec<Uuid> {
+        let mut member_ids = self
+            .0
+            .lock()
+            .expect("Cannot be poisoned")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable();
+        member_ids
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.0.lock().expect("Cannot be poisoned").len()
+    }
+}
+
 pub struct Inner {
     pub(crate) id: Uuid,
     pub(crate) net: network::Sender,
     pub(crate) part_group: partition::Group,
-    pub(crate) members: Mutex<HashSet<Uuid>>,
-    pub(crate) shutdown: Arc<Shutdown>,
+    pub(crate) objects: HashMap<object::Id, object::Metadata>,
+    pub(crate) membership: Membership,
+    pub(crate) shutdown: Shutdown,
 }
 
 impl Drop for Inner {
@@ -220,105 +300,266 @@ impl Drop for Inner {
 }
 
 impl Inner {
-    pub(crate) fn remove_member(&self, id: Uuid) {
-        let mut members = self.members.lock().expect("Cannot be poisoned");
-        members.remove(&id);
+    pub(crate) fn rebuild(&self, obj_id: &str, part_id: u16, raw: &[u8]) -> CorylusResult<()> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
+        self.part_group
+            .with_segment_write(part_id as usize, obj_id, |segment| {
+                (*segment.data).rebuild(raw)
+            })
+            .map_err(|err| err.into())
     }
 
-    pub(crate) fn add_member(&self, id: Uuid) {
-        let mut members = self.members.lock().expect("Cannot be poisoned");
-        members.insert(id);
+    pub(crate) fn fetch(&self, obj_id: &str, part_id: u16) -> CorylusResult<Vec<u8>> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
+        self.part_group
+            .with_segment_read(part_id as usize, obj_id, |segment| (*segment.data).as_raw())
+            .map_err(|err| err.into())
     }
 
-    pub(crate) fn members(&self) -> Vec<Uuid> {
-        self.members
-            .lock()
-            .expect("Cannot be poisoned")
-            .iter()
-            .copied()
-            .collect()
-    }
-
-    pub(crate) fn write<O: operation::Write>(&self, s_id: &str, mut op: O) -> io::Result<()> {
-        let key = op.partition_key();
-        let p_id = self.part_group.partition_of(&key);
-        let owner = self.part_group.owner_of(p_id);
+    pub(crate) fn remote_write<O: operation::Write>(
+        &self,
+        obj_id: &str,
+        part_id: u16,
+        v: u128,
+        mut op: O,
+    ) -> CorylusResult<()> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
+        let owner = self.part_group.owner_of(part_id as u64);
 
         if self.id.eq(&owner) {
-            self.part_group
-                .with_segment_write(p_id as usize, s_id, |segment| {
-                    op.execute(&mut *segment.data);
-                })
-                .expect("As internal operation, partition and segment must always exist");
+            self.check_repl_requirements(obj_id)?;
+        }
+
+        self.part_group
+            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+        if !self.part_group.version().eq(&v) {
+            return Err(partition::Error::Rebalance.into());
+        }
+
+        // Implement double check of part group version inside lock.
+        // Implement await of status change if not ready and tryLock.
+        self.part_group
+            .with_segment_write(part_id as usize, obj_id, |segment| {
+                op.execute(&mut *segment.data);
+            })?;
+
+        if self.id.eq(&owner) {
+            self.replicate(obj_id, part_id as u64, op)
+        } else {
             Ok(())
+        }
+    }
+
+    pub(crate) fn remote_read<O: operation::Read>(
+        &self,
+        obj_id: &str,
+        part_id: u16,
+        v: u128,
+        op: O,
+    ) -> CorylusResult<Vec<u8>> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
+        // If partition version is correct is ensured that this node is master or replica.
+
+        self.part_group
+            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+        if !self.part_group.version().eq(&v) {
+            return Err(partition::Error::Rebalance.into());
+        }
+
+        // Implement double check of part group version inside lock.
+        // Implement await of status change if not ready and tryLock.
+        self.part_group
+            .with_segment_read(part_id as usize, obj_id, |segment| {
+                op.execute(&*segment.data)
+            })
+            .map_err(|err| err.into())
+    }
+
+    pub(crate) fn write<O: operation::Write>(&self, obj_id: &str, mut op: O) -> CorylusResult<()> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
+        let key = op.partition_key();
+        let part_id = self.part_group.partition_of(&key);
+
+        self.part_group
+            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+        let owner = self.part_group.owner_of(part_id);
+
+        if self.id.eq(&owner) {
+            self.check_repl_requirements(obj_id)?;
+            self.part_group
+                .with_segment_write(part_id as usize, obj_id, |segment| {
+                    op.execute(&mut *segment.data);
+                })?;
+            self.replicate(obj_id, part_id, op)
         } else {
             let raw_op = op.serialize();
-            let response = self.net.sync_send(
+            let response = self.net.request_sync(
                 owner,
-                network::packet::Packet::WriteOp {
+                packet::Request::WriteOp {
+                    v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
-                    partition_id: p_id as u16,
-                    segment_id: s_id.to_string(),
-                    op_id: op.id().to_string(),
-                    raw_op,
+                    part_id: part_id as u16,
+                    obj_id,
+                    op_id: op.id(),
+                    raw_op: &raw_op,
                 },
                 None,
             )?;
 
-            if let Ok(packet) = response.get(Duration::from_secs(1)) {
-                match packet {
-                    Packet::WriteOpReply { ok, .. } => {
-                        if ok {
-                            Ok(())
-                        } else {
-                            Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input"))
-                        }
-                    }
-                    _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")),
-                }
-            } else {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
+            let raw = response.get(Duration::from_secs(1))?;
+            match Reply::try_from(&raw).unwrap() {
+                Reply::WriteOp { status, .. } => match status {
+                    packet::Status::Success => Ok(()),
+                    s => Err(CorylusError::try_from(s).unwrap()),
+                },
+                _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),
             }
         }
     }
 
-    pub(crate) fn read<O: operation::Read>(&self, s_id: &str, op: O) -> io::Result<Vec<u8>> {
+    fn check_repl_requirements(&self, obj_id: &str) -> CorylusResult<()> {
+        let metadata = self
+            .objects
+            .get(obj_id)
+            .ok_or(object::Error::ObjectNotFound)?;
+        let repl_factor = metadata.repl_factor();
+        if repl_factor != 0 && repl_factor > (self.membership.size() - 1) {
+            return Err(CorylusError::from(partition::Error::NotEnoughReplicas));
+        }
+
+        Ok(())
+    }
+
+    fn replicate<O: operation::Write>(
+        &self,
+        obj_id: &str,
+        part_id: u64,
+        op: O,
+    ) -> CorylusResult<()> {
+        let metadata = self
+            .objects
+            .get(obj_id)
+            .ok_or(object::Error::ObjectNotFound)?;
+        let repl_factor = metadata.repl_factor();
+        if repl_factor != 0 {
+            let raw_op = op.serialize();
+            let replica_ids = self.part_group.replicas_of(part_id, repl_factor);
+
+            match metadata.repl() {
+                object::Replication::Sync => {
+                    let mut responses = Vec::with_capacity(replica_ids.len());
+                    for replica_id in replica_ids {
+                        let response = self.net.request_sync(
+                            replica_id,
+                            packet::Request::WriteOp {
+                                v: self.part_group.version(),
+                                corr_id: Uuid::new_v4(),
+                                part_id: part_id as u16,
+                                obj_id,
+                                op_id: op.id(),
+                                raw_op: &raw_op,
+                            },
+                            None,
+                        )?;
+                        responses.push(response);
+                    }
+
+                    for response in responses {
+                        let raw = response.get(Duration::from_secs(1))?;
+                        match Reply::try_from(&raw).unwrap() {
+                            Reply::WriteOp { status, .. } => match status {
+                                packet::Status::Success => Ok(()),
+                                s => Err(CorylusError::try_from(s).unwrap()),
+                            },
+                            _ => {
+                                Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")
+                                    .into())
+                            }
+                        }?;
+                    }
+                }
+                object::Replication::Async => {
+                    for replica_id in replica_ids {
+                        self.net.request(
+                            replica_id,
+                            packet::Request::WriteOp {
+                                v: self.part_group.version(),
+                                corr_id: Uuid::new_v4(),
+                                part_id: part_id as u16,
+                                obj_id,
+                                op_id: op.id(),
+                                raw_op: &raw_op,
+                            },
+                            None,
+                        )?;
+                    }
+                }
+                object::Replication::None => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn read<O: operation::Read>(&self, obj_id: &str, op: O) -> CorylusResult<Vec<u8>> {
+        if !self.objects.contains_key(obj_id) {
+            return Err(CorylusError::Object(object::Error::ObjectNotFound));
+        }
         let key = op.partition_key();
-        let p_id = self.part_group.partition_of(&key);
-        let owner = self.part_group.owner_of(p_id);
-        if self.id.eq(&owner) {
-            let result = self
-                .part_group
-                .with_segment_read(p_id as usize, s_id, |segment| op.execute(&*segment.data))
-                .expect("As internal operation, partition and segment must always exist");
-            Ok(result)
+        let part_id = self.part_group.partition_of(&key);
+
+        self.part_group
+            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+        let owner = self.part_group.owner_of(part_id);
+
+        let metadata = self
+            .objects
+            .get(obj_id)
+            .ok_or(object::Error::ObjectNotFound)?;
+
+        let local_exec = self.id.eq(&owner)
+            || (metadata.repl_read()
+                && self
+                    .part_group
+                    .is_replica(self.id, part_id, metadata.repl_factor()));
+        if local_exec {
+            self.part_group
+                .with_segment_read(part_id as usize, obj_id, |segment| {
+                    op.execute(&*segment.data)
+                })
+                .map_err(|err| err.into())
         } else {
             let raw_op = op.serialize();
-            let response = self.net.sync_send(
+            let response = self.net.request_sync(
                 owner,
-                network::packet::Packet::GetOp {
+                packet::Request::GetOp {
+                    v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
-                    partition_id: p_id as u16,
-                    segment_id: s_id.to_string(),
-                    op_id: op.id().to_string(),
-                    raw_op,
+                    part_id: part_id as u16,
+                    obj_id,
+                    op_id: op.id(),
+                    raw_op: &raw_op,
                 },
                 None,
             )?;
 
-            if let Ok(packet) = response.get(Duration::from_secs(1)) {
-                match packet {
-                    Packet::GetOpReply { ok, result, .. } => {
-                        if ok {
-                            Ok(result)
-                        } else {
-                            Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input"))
-                        }
-                    }
-                    _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")),
-                }
-            } else {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
+            let raw = response.get(Duration::from_secs(1))?;
+            match Reply::try_from(&raw).unwrap() {
+                packet::Reply::GetOp { status, result, .. } => match status {
+                    packet::Status::Success => Ok(result.to_vec()),
+                    s => Err(CorylusError::try_from(s).unwrap()),
+                },
+                _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),
             }
         }
     }

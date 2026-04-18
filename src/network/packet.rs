@@ -1,384 +1,764 @@
+use std::fmt::Display;
 use std::net::SocketAddr;
 
 use uuid::Uuid;
+
+use crate::{CorylusError, object, partition, serde};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Event {
     PeerAdded { id: Uuid },
     PeerRemoved { id: Uuid },
+    Checkpoint,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct InboundPacket {
+pub struct Inbound {
     pub(crate) from: Uuid,
-    pub(crate) p: Packet,
+    pub(crate) p: Raw,
 }
 
-impl InboundPacket {
-    pub fn new(id: Uuid, p: Packet) -> Self {
-        Self { from: id, p }
+impl Inbound {
+    pub fn new(id: Uuid, raw: Raw) -> Self {
+        Self { from: id, p: raw }
     }
 }
 
-// Request packets
 #[derive(Debug, Eq, PartialEq)]
-pub enum Packet {
+pub enum Packet<'a> {
+    Request(Request<'a>),
+    Reply(Reply<'a>),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum Request<'a> {
+    HeartBeat,
+    WriteOp {
+        v: u128,
+        corr_id: Uuid,
+        // Just to check inconsistencies in the partition tables to reject
+        part_id: u16,
+        obj_id: &'a str,
+        op_id: &'a str,
+        raw_op: &'a [u8],
+    },
+    PartitionFetchCompletion {
+        v: u128,
+        corr_id: Uuid,
+        part_id: u16,
+    },
     WhoIs {
         id: Uuid,
         addr: SocketAddr,
     },
-    WhoIsReply {
-        id: Uuid,
-    },
-    HeartBeat,
-    WriteOp {
-        corr_id: Uuid,
-        // Just to check inconsistences in the partition tables to reject
-        partition_id: u16,
-        segment_id: String,
-        op_id: String,
-        raw_op: Vec<u8>,
-    },
-    WriteOpReply {
-        corr_id: Uuid,
-        ok: bool,
-    },
     GetOp {
+        v: u128,
         corr_id: Uuid,
         // Just to check inconsistences in the partition tables to reject
-        partition_id: u16,
-        segment_id: String,
-        op_id: String,
-        raw_op: Vec<u8>,
+        part_id: u16,
+        obj_id: &'a str,
+        op_id: &'a str,
+        raw_op: &'a [u8],
     },
-    GetOpReply {
+    FetchObject {
+        v: u128,
         corr_id: Uuid,
-        ok: bool,
-        result: Vec<u8>,
+        // Just to check inconsistences in the partition tables to reject
+        part_id: u16,
+        obj_id: &'a str,
     },
 }
 
-pub(crate) const DISCRIMINANT: usize = 1;
-pub(crate) const PACKET_LENGTH: usize = 4;
-
-impl Packet {
-    pub fn kind(&self) -> u8 {
+impl Request<'_> {
+    pub fn correlation_id(&self) -> Option<Uuid> {
         match self {
-            Self::WhoIs { .. } => 1,
-            Self::WhoIsReply { .. } => 2,
-            Self::HeartBeat => 3,
-            Self::WriteOp { .. } => 6,
-            Self::WriteOpReply { .. } => 7,
-            Self::GetOp { .. } => 8,
-            Self::GetOpReply { .. } => 9,
+            Self::WhoIs { .. } => None,
+            Self::GetOp { corr_id, .. } => Some(*corr_id),
+            Self::FetchObject { corr_id, .. } => Some(*corr_id),
+            Self::WriteOp { corr_id, .. } => Some(*corr_id),
+            Self::HeartBeat => None,
+            Self::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
         }
     }
+}
 
-    pub fn is_read(&self) -> bool {
-        match self {
-            Self::WhoIs { .. }
-            | Self::WhoIsReply { .. }
-            | Self::HeartBeat
-            | Self::GetOpReply { .. }
-            | Self::WriteOpReply { .. }
-            | Self::WriteOp { .. } => false,
-            Self::GetOp { .. } => true,
+#[repr(u8)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum Status {
+    Success = 0,
+    Rebalance = 1,
+    OperationNotFound = 2,
+    PartitionNotFound = 3,
+    ObjectNotFound = 4,
+    IoError = 5,
+    SerdeInvalidBufferSize = 6,
+    SerdeUnknown = 7,
+    SerdeInvalidUtf8 = 8,
+    NotEnoughReplicas = 9,
+    PartitionNotReady = 10,
+}
+
+impl From<CorylusError> for Status {
+    fn from(value: CorylusError) -> Self {
+        match value {
+            CorylusError::Io(_) => Status::IoError,
+            CorylusError::Partition(err) => match err {
+                partition::Error::PartitionNotFound => Status::PartitionNotFound,
+                partition::Error::Rebalance => Status::Rebalance,
+                partition::Error::NotEnoughReplicas => Status::NotEnoughReplicas,
+                partition::Error::PartitionNotReady => Status::PartitionNotReady,
+            },
+            CorylusError::Object(err) => match err {
+                Error::OperationNotFound => Status::OperationNotFound,
+                Error::ObjectNotFound => Status::ObjectNotFound,
+            },
+            CorylusError::Serde(err) => match err {
+                serde::Error::InvalidBufferSize => Status::SerdeInvalidBufferSize,
+                serde::Error::InvalidUtf8 => Status::SerdeInvalidUtf8,
+                serde::Error::Unknown => Status::SerdeUnknown,
+            },
         }
     }
+}
 
-    pub fn is_write(&self) -> bool {
+use crate::object::Error;
+use std::convert::TryFrom;
+
+impl TryFrom<Status> for CorylusError {
+    type Error = ();
+
+    fn try_from(value: Status) -> Result<Self, Self::Error> {
+        match value {
+            Status::Success => Err(()),
+            Status::Rebalance => Ok(CorylusError::Partition(partition::Error::Rebalance)),
+            Status::OperationNotFound => Ok(CorylusError::Object(Error::OperationNotFound)),
+            Status::PartitionNotFound => {
+                Ok(CorylusError::Partition(partition::Error::PartitionNotFound))
+            }
+            Status::ObjectNotFound => Ok(CorylusError::Object(object::Error::ObjectNotFound)),
+            Status::IoError => Ok(CorylusError::Io(std::io::Error::other("IO error"))),
+            Status::SerdeUnknown => Ok(CorylusError::Serde(serde::Error::Unknown)),
+            Status::SerdeInvalidBufferSize => {
+                Ok(CorylusError::Serde(serde::Error::InvalidBufferSize))
+            }
+            Status::SerdeInvalidUtf8 => Ok(CorylusError::Serde(serde::Error::InvalidUtf8)),
+            Status::NotEnoughReplicas => {
+                Ok(CorylusError::Partition(partition::Error::NotEnoughReplicas))
+            }
+            Status::PartitionNotReady => {
+                Ok(CorylusError::Partition(partition::Error::PartitionNotReady))
+            }
+        }
+    }
+}
+
+impl TryFrom<u8> for Status {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Status::Success),
+            1 => Ok(Status::Rebalance),
+            2 => Ok(Status::OperationNotFound),
+            3 => Ok(Status::PartitionNotFound),
+            4 => Ok(Status::ObjectNotFound),
+            5 => Ok(Status::IoError),
+            6 => Ok(Status::SerdeInvalidBufferSize),
+            7 => Ok(Status::SerdeUnknown),
+            8 => Ok(Status::SerdeInvalidUtf8),
+            9 => Ok(Status::NotEnoughReplicas),
+            10 => Ok(Status::PartitionNotReady),
+            _ => Err(()),
+        }
+    }
+}
+#[derive(Debug, Eq, PartialEq)]
+pub enum Reply<'a> {
+    WhoIs {
+        id: Uuid,
+    },
+    WriteOp {
+        corr_id: Uuid,
+        status: Status,
+    },
+    GetOp {
+        corr_id: Uuid,
+        status: Status,
+        result: &'a [u8],
+    },
+    FetchObject {
+        corr_id: Uuid,
+        status: Status,
+        result: &'a [u8],
+    },
+
+    PartitionFetchCompletion {
+        corr_id: Uuid,
+        status: Status,
+    },
+}
+
+impl Reply<'_> {
+    pub fn correlation_id(&self) -> Option<Uuid> {
         match self {
-            Self::WhoIs { .. }
-            | Self::WhoIsReply { .. }
-            | Self::HeartBeat
-            | Self::GetOpReply { .. }
-            | Self::WriteOpReply { .. }
-            | Self::GetOp { .. } => false,
-            Self::WriteOp { .. } => true,
+            Reply::WhoIs { .. } => None,
+            Reply::WriteOp { corr_id, .. } => Some(*corr_id),
+            Reply::GetOp { corr_id, .. } => Some(*corr_id),
+            Reply::FetchObject { corr_id, .. } => Some(*corr_id),
+            Reply::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
+        }
+    }
+}
+
+impl Packet<'_> {
+    pub fn kind(&self) -> Kind {
+        match self {
+            Self::Request(val) => match val {
+                Request::WhoIs { .. } => Kind::WhoIsRequest,
+                Request::GetOp { .. } => Kind::GetOpRequest,
+                Request::FetchObject { .. } => Kind::FetchObjectRequest,
+                Request::WriteOp { .. } => Kind::WriteOpRequest,
+                Request::HeartBeat => Kind::HeartBeatRequest,
+                Request::PartitionFetchCompletion { .. } => Kind::PartitionFetchCompletionRequest,
+            },
+            Self::Reply(val) => match val {
+                Reply::WhoIs { .. } => Kind::WhoIsReply,
+                Reply::WriteOp { .. } => Kind::WriteOpReply,
+                Reply::GetOp { .. } => Kind::GetOpReply,
+                Reply::FetchObject { .. } => Kind::FetchObjectReply,
+                Reply::PartitionFetchCompletion { .. } => Kind::PartitionFetchCompletionReply,
+            },
         }
     }
 
     pub fn correlation_id(&self) -> Option<Uuid> {
         match self {
-            Self::WhoIs { .. } | Self::WhoIsReply { .. } | Self::HeartBeat => None,
-            Self::GetOp { corr_id, .. }
-            | Self::GetOpReply { corr_id, .. }
-            | Self::WriteOp { corr_id, .. }
-            | Self::WriteOpReply { corr_id, .. } => Some(*corr_id),
+            Self::Request(req) => req.correlation_id(),
+            Self::Reply(reply) => reply.correlation_id(),
         }
-    }
-
-    pub fn len(discriminant: u8) -> Option<usize> {
-        match discriminant {
-            1 => None,
-            2 => Some(16),
-            3 => Some(0),
-            6 => None,
-            7 => Some(17),
-            8 => None,
-            9 => None,
-            _ => None,
-        }
-    }
-
-    pub fn reserve_buffer(discriminant: u8) -> Vec<u8> {
-        const DEFAULT_LEN: usize = 256;
-        Vec::with_capacity(
-            PACKET_LENGTH + DISCRIMINANT + Packet::len(discriminant).unwrap_or(DEFAULT_LEN),
-        )
     }
 }
 
-impl From<&Packet> for Vec<u8> {
+impl From<&Packet<'_>> for Vec<u8> {
     fn from(packet: &Packet) -> Self {
-        let discriminant = packet.kind();
-        let mut buffer = Packet::reserve_buffer(packet.kind());
+        let kind = packet.kind();
+        let mut buffer = kind.buffer();
 
-        let mut filled = false;
-        if let Some(len) = Packet::len(discriminant) {
-            buffer.extend_from_slice(&((len + DISCRIMINANT) as u32).to_le_bytes());
-            filled = true;
+        match kind.len() {
+            Len::Hint(_) => {
+                buffer.extend_from_slice(&0u32.to_le_bytes());
+            }
+            Len::Exact(val) => {
+                buffer.extend_from_slice(&((val + DISCRIMINANT) as u32).to_le_bytes());
+            }
         }
 
-        buffer.push(discriminant);
+        buffer.push(kind as u8);
+
         match packet {
-            Packet::WhoIs { id, addr } => {
-                buffer.extend_from_slice(id.as_bytes());
-                let addr = addr.to_string().into_bytes();
-                buffer.extend_from_slice(addr.as_slice());
-            }
-            Packet::WhoIsReply { id } => {
-                buffer.extend_from_slice(id.as_bytes());
-            }
-            Packet::HeartBeat => {}
-            Packet::WriteOp {
-                corr_id,
-                partition_id,
-                segment_id,
-                op_id,
-                raw_op,
-            } => {
-                buffer.extend_from_slice(corr_id.as_bytes());
-                buffer.extend_from_slice(partition_id.to_le_bytes().as_slice());
+            Packet::Request(req) => match req {
+                Request::WhoIs { id, addr } => {
+                    buffer.extend_from_slice(id.as_bytes());
 
-                let segment_id_len: u16 = segment_id.len() as u16;
-                buffer.extend_from_slice(segment_id_len.to_le_bytes().as_slice());
-                buffer.extend_from_slice(segment_id.as_bytes());
-
-                let op_id_len: u16 = op_id.len() as u16;
-                buffer.extend_from_slice(op_id_len.to_le_bytes().as_slice());
-                buffer.extend_from_slice(op_id.as_bytes());
-
-                if !raw_op.is_empty() {
-                    buffer.extend_from_slice(raw_op.as_slice());
+                    let addr = addr.to_string().into_bytes();
+                    buffer.extend_from_slice(addr.as_slice());
                 }
-            }
-            Packet::WriteOpReply { corr_id, ok } => {
-                buffer.extend_from_slice(corr_id.as_bytes().as_slice());
-                buffer.push(*ok as u8);
-            }
 
-            Packet::GetOp {
-                corr_id,
-                partition_id,
-                segment_id,
-                op_id,
-                raw_op,
-            } => {
-                buffer.extend_from_slice(corr_id.as_bytes().as_slice());
-                buffer.extend_from_slice(partition_id.to_le_bytes().as_slice());
+                Request::GetOp {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                    op_id,
+                    raw_op,
+                } => {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.extend_from_slice(&part_id.to_le_bytes());
 
-                let segment_id_len: u16 = segment_id.len() as u16;
-                buffer.extend_from_slice(segment_id_len.to_le_bytes().as_slice());
-                buffer.extend_from_slice(segment_id.as_bytes());
+                    let obj_id_len: u16 = obj_id.len() as u16;
+                    buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                    buffer.extend_from_slice(obj_id.as_bytes());
 
-                let op_id_len: u16 = op_id.len() as u16;
-                buffer.extend_from_slice(op_id_len.to_le_bytes().as_slice());
-                buffer.extend_from_slice(op_id.as_bytes());
+                    let op_id_len: u16 = op_id.len() as u16;
+                    buffer.extend_from_slice(&op_id_len.to_le_bytes());
+                    buffer.extend_from_slice(op_id.as_bytes());
 
-                if !raw_op.is_empty() {
-                    buffer.extend_from_slice(raw_op.as_slice());
+                    if !raw_op.is_empty() {
+                        buffer.extend_from_slice(raw_op);
+                    }
                 }
-            }
+                Request::FetchObject {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                } => {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.extend_from_slice(&part_id.to_le_bytes());
 
-            Packet::GetOpReply {
-                corr_id,
-                ok,
-                result,
-            } => {
-                buffer.extend_from_slice(corr_id.as_bytes().as_slice());
-                buffer.push(*ok as u8);
-
-                if !result.is_empty() {
-                    buffer.extend_from_slice(result.as_slice());
+                    let obj_id_len: u16 = obj_id.len() as u16;
+                    buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                    buffer.extend_from_slice(obj_id.as_bytes());
                 }
-            }
+                Request::HeartBeat => {}
+                Request::WriteOp {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                    op_id,
+                    raw_op,
+                } => {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.extend_from_slice(&part_id.to_le_bytes());
+
+                    let obj_id_len: u16 = obj_id.len() as u16;
+                    buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                    buffer.extend_from_slice(obj_id.as_bytes());
+
+                    let op_id_len: u16 = op_id.len() as u16;
+                    buffer.extend_from_slice(&op_id_len.to_le_bytes());
+                    buffer.extend_from_slice(op_id.as_bytes());
+
+                    if !raw_op.is_empty() {
+                        buffer.extend_from_slice(raw_op);
+                    }
+                }
+                Request::PartitionFetchCompletion {
+                    v,
+                    corr_id,
+                    part_id,
+                } => {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.extend_from_slice(&part_id.to_le_bytes());
+                }
+            },
+
+            Packet::Reply(rep) => match rep {
+                Reply::WhoIs { id } => {
+                    buffer.extend_from_slice(id.as_bytes());
+                }
+
+                Reply::WriteOp { corr_id, status } => {
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.push(*status as u8);
+                }
+                Reply::GetOp {
+                    corr_id,
+                    status,
+                    result,
+                } => {
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.push(*status as u8);
+
+                    if !result.is_empty() {
+                        buffer.extend_from_slice(result);
+                    }
+                }
+                Reply::FetchObject {
+                    corr_id,
+                    status,
+                    result,
+                } => {
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.push(*status as u8);
+
+                    if !result.is_empty() {
+                        buffer.extend_from_slice(result);
+                    }
+                }
+
+                Reply::PartitionFetchCompletion { corr_id, status } => {
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.push(*status as u8);
+                }
+            },
         }
 
-        if filled {
-            buffer
-        } else {
-            let mut new_buffer = Vec::with_capacity(PACKET_LENGTH + buffer.len());
-            new_buffer.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
-            new_buffer.append(&mut buffer);
-            new_buffer
+        if matches!(kind.len(), Len::Hint(_)) {
+            let len = buffer[4..].len() as u32;
+            buffer[0..4].copy_from_slice(&len.to_le_bytes());
+        }
+
+        buffer
+    }
+}
+
+impl<'a> From<&'a Raw> for Packet<'a> {
+    fn from(value: &'a Raw) -> Self {
+        match value.kind() {
+            Kind::PartitionFetchCompletionReply
+            | Kind::FetchObjectReply
+            | Kind::GetOpReply
+            | Kind::WriteOpReply
+            | Kind::WhoIsReply => Packet::Reply(Reply::try_from(value).unwrap()),
+            Kind::WhoIsRequest
+            | Kind::HeartBeatRequest
+            | Kind::WriteOpRequest
+            | Kind::GetOpRequest
+            | Kind::FetchObjectRequest
+            | Kind::PartitionFetchCompletionRequest => {
+                Packet::Request(Request::try_from(value).unwrap())
+            }
         }
     }
 }
 
-impl From<&[u8]> for Packet {
-    fn from(value: &[u8]) -> Self {
-        let discriminant = value
-            .first()
-            .expect("First byte must contains discriminant");
-        match *discriminant {
-            1 => {
-                let id = Uuid::from_slice(&value[1..=16]).unwrap();
-                let addr: SocketAddr = str::from_utf8(&value[17..]).unwrap().parse().unwrap();
-                Packet::WhoIs { id, addr }
+const DISCRIMINANT: usize = std::mem::size_of::<u8>();
+pub(crate) const PACKET_LENGTH: usize = std::mem::size_of::<u32>();
+
+pub enum Len {
+    Hint(usize),
+    Exact(usize),
+}
+
+impl Len {
+    pub fn value(&self) -> usize {
+        match self {
+            Self::Hint(val) | Self::Exact(val) => *val,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum Kind {
+    WhoIsRequest = 1,
+    WhoIsReply = 2,
+    HeartBeatRequest = 3,
+    WriteOpRequest = 6,
+    WriteOpReply = 7,
+    GetOpRequest = 8,
+    GetOpReply = 9,
+    FetchObjectRequest = 10,
+    FetchObjectReply = 11,
+    PartitionFetchCompletionRequest = 12,
+    PartitionFetchCompletionReply = 13,
+}
+impl Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Kind::WhoIsRequest => "WhoIsRequest",
+            Kind::WhoIsReply => "WhoIsReply",
+            Kind::HeartBeatRequest => "HeartBeatRequest",
+            Kind::WriteOpRequest => "WriteOpRequest",
+            Kind::WriteOpReply => "WriteOpReply",
+            Kind::GetOpRequest => "GetOpRequest",
+            Kind::GetOpReply => "GetOpReply",
+            Kind::FetchObjectRequest => "FetchObjectRequest",
+            Kind::FetchObjectReply => "FetchObjectReply",
+            Kind::PartitionFetchCompletionRequest => "PartitionFetchCompletionRequest",
+            Kind::PartitionFetchCompletionReply => "PartitionFetchCompletionReply",
+        };
+
+        f.write_str(s)
+    }
+}
+
+impl Kind {
+    pub fn len(&self) -> Len {
+        match self {
+            Kind::WhoIsRequest => Len::Hint(128),
+            Kind::WhoIsReply => Len::Exact(16),
+            Kind::HeartBeatRequest => Len::Exact(0),
+            Kind::WriteOpRequest => Len::Hint(256),
+            Kind::WriteOpReply => Len::Exact(17),
+            Kind::GetOpRequest => Len::Hint(512),
+            Kind::GetOpReply => Len::Hint(512),
+            Kind::FetchObjectRequest => Len::Hint(128),
+            Kind::FetchObjectReply => Len::Hint(4096),
+            Kind::PartitionFetchCompletionRequest => Len::Exact(34),
+            Kind::PartitionFetchCompletionReply => Len::Exact(17),
+        }
+    }
+
+    pub fn buffer(&self) -> Vec<u8> {
+        Vec::with_capacity(PACKET_LENGTH + DISCRIMINANT + self.len().value())
+    }
+}
+
+impl<'a> TryFrom<&'a Raw> for Request<'a> {
+    type Error = ();
+
+    fn try_from(value: &'a Raw) -> Result<Self, Self::Error> {
+        let mut offset = size_of::<u8>();
+
+        match value.kind() {
+            Kind::WhoIsRequest => {
+                let id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let addr: SocketAddr = std::str::from_utf8(&value[offset..])
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+
+                Ok(Request::WhoIs { id, addr })
             }
-            2 => Packet::WhoIsReply {
-                id: Uuid::from_slice(&value[1..]).unwrap(),
-            },
-            3 => Packet::HeartBeat,
-            6 => {
-                let mut offset = 1;
+            Kind::HeartBeatRequest => Ok(Request::HeartBeat),
+            Kind::WriteOpRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
 
-                // corr_id (Uuid)
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
-                // partition_id (u16)
-                let partition_id =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
-                offset += 2;
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
 
-                // segment_id length
-                let segment_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
-                // segment_id bytes
-                let segment_id = std::str::from_utf8(&value[offset..offset + segment_id_len])
-                    .unwrap()
-                    .to_string();
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
+                offset += obj_id_len;
 
-                offset += segment_id_len;
+                let op_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
-                // op_id length
-                let op_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
-
-                // op_id bytes
-                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len])
-                    .unwrap()
-                    .to_string();
-
+                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len]).unwrap();
                 offset += op_id_len;
 
-                // raw_op (no extra extend needed)
                 let raw_op = if offset >= value.len() {
-                    vec![]
+                    &[]
                 } else {
-                    value[offset..].to_vec()
+                    &value[offset..]
                 };
 
-                Packet::WriteOp {
+                Ok(Request::WriteOp {
+                    v,
                     corr_id,
-                    partition_id,
-                    segment_id,
+                    part_id,
+                    obj_id,
                     op_id,
                     raw_op,
-                }
+                })
             }
-            7 => {
-                let mut offset = 1;
+            Kind::GetOpRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
 
-                // corr_id (Uuid)
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
-                let ok = !matches!(value[offset], 0);
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
 
-                Packet::WriteOpReply { corr_id, ok }
-            }
-            8 => {
-                let mut offset = 1;
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
-                // corr_id (Uuid)
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
+                offset += obj_id_len;
 
-                // partition_id (u16)
-                let partition_id =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
-                offset += 2;
+                let op_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
 
-                // segment_id length
-                let segment_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
-
-                // segment_id bytes
-                let segment_id = std::str::from_utf8(&value[offset..offset + segment_id_len])
-                    .unwrap()
-                    .to_string();
-
-                offset += segment_id_len;
-
-                // op_id length
-                let op_id_len =
-                    u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap()) as usize;
-                offset += 2;
-
-                // op_id bytes
-                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len])
-                    .unwrap()
-                    .to_string();
-
+                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len]).unwrap();
                 offset += op_id_len;
 
-                // raw_op (no extra extend needed)
                 let raw_op = if offset >= value.len() {
-                    vec![]
+                    &[]
                 } else {
-                    value[offset..].to_vec()
+                    &value[offset..]
                 };
 
-                Packet::GetOp {
+                Ok(Request::GetOp {
+                    v,
                     corr_id,
-                    partition_id,
-                    segment_id,
+                    part_id,
+                    obj_id,
                     op_id,
                     raw_op,
-                }
+                })
             }
-            9 => {
-                let mut offset = 1;
+            Kind::FetchObjectRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
 
-                // corr_id (Uuid)
-                let corr_id = Uuid::from_slice(&value[offset..offset + 16]).unwrap();
-                offset += 16;
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
 
-                let ok = !matches!(value[offset], 0);
-                offset += 1;
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
+
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
+
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
+
+                Ok(Request::FetchObject {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                })
+            }
+            Kind::PartitionFetchCompletionRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+
+                Ok(Request::PartitionFetchCompletion {
+                    v,
+                    corr_id,
+                    part_id,
+                })
+            }
+
+            Kind::WhoIsReply
+            | Kind::WriteOpReply
+            | Kind::GetOpReply
+            | Kind::FetchObjectReply
+            | Kind::PartitionFetchCompletionReply => Err(()),
+        }
+    }
+}
+impl<'a> TryFrom<&'a Raw> for Reply<'a> {
+    type Error = ();
+
+    fn try_from(value: &'a Raw) -> Result<Self, Self::Error> {
+        let mut offset = size_of::<u8>();
+
+        match value.kind() {
+            Kind::WhoIsReply => Ok(Reply::WhoIs {
+                id: Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap(),
+            }),
+            Kind::WriteOpReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let status = Status::try_from(value[offset]).unwrap();
+
+                Ok(Reply::WriteOp { corr_id, status })
+            }
+            Kind::GetOpReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let status = Status::try_from(value[offset]).unwrap();
+                offset += size_of::<u8>();
 
                 let result = if offset >= value.len() {
-                    vec![]
+                    &[]
                 } else {
-                    value[offset..].to_vec()
+                    &value[offset..]
                 };
 
-                Packet::GetOpReply {
+                Ok(Reply::GetOp {
                     corr_id,
-                    ok,
+                    status,
                     result,
-                }
+                })
             }
-            _ => {
-                panic!("Unknown packet");
+            Kind::FetchObjectReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let status = Status::try_from(value[offset]).unwrap();
+                offset += size_of::<u8>();
+
+                let result = if offset >= value.len() {
+                    &[]
+                } else {
+                    &value[offset..]
+                };
+
+                Ok(Reply::FetchObject {
+                    corr_id,
+                    status,
+                    result,
+                })
             }
+            Kind::PartitionFetchCompletionReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let status = Status::try_from(value[offset]).unwrap();
+
+                Ok(Reply::PartitionFetchCompletion { corr_id, status })
+            }
+            Kind::WhoIsRequest
+            | Kind::HeartBeatRequest
+            | Kind::WriteOpRequest
+            | Kind::GetOpRequest
+            | Kind::FetchObjectRequest
+            | Kind::PartitionFetchCompletionRequest => Err(()),
         }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Raw(Vec<u8>);
+
+impl Raw {
+    pub fn new(buffer: Vec<u8>) -> Self {
+        Self(buffer)
+    }
+
+    pub fn kind(&self) -> Kind {
+        let discriminant = self.0[0];
+        match discriminant {
+            1 => Kind::WhoIsRequest,
+            2 => Kind::WhoIsReply,
+            3 => Kind::HeartBeatRequest,
+            6 => Kind::WriteOpRequest,
+            7 => Kind::WriteOpReply,
+            8 => Kind::GetOpRequest,
+            9 => Kind::GetOpReply,
+            10 => Kind::FetchObjectRequest,
+            11 => Kind::FetchObjectReply,
+            12 => Kind::PartitionFetchCompletionRequest,
+            13 => Kind::PartitionFetchCompletionReply,
+            _ => panic!("Unknown packet"),
+        }
+    }
+}
+
+impl std::ops::Deref for Raw {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
     }
 }

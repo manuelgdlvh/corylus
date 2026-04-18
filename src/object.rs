@@ -1,19 +1,115 @@
-use std::{hash::Hash, io, marker::PhantomData};
-
+use crate::object::operation::{ReadBuilder, WriteBuilder};
 use crate::{
-    instance::{
-        self,
-        operation::{DeserializeError, Deserializer, Serializer},
-    },
+    CorylusResult,
+    instance::{self},
     object::map::{Get, Put},
 };
+use std::any::Any;
+use std::marker::PhantomData;
 
 pub mod map;
+pub mod operation;
+
+pub type Id = String;
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Operation not found")]
+    ObjectNotFound,
+    #[error("Operation not found")]
+    OperationNotFound,
+}
+
+pub trait Raw: Send + Sync + Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_mut_any(&mut self) -> &mut dyn Any;
+    fn as_raw(&self) -> Vec<u8>;
+    fn rebuild(&mut self, raw: &[u8]);
+}
+
+#[derive(Copy, Clone)]
+pub enum Replication {
+    Sync,
+    Async,
+    None,
+}
+
+pub struct Metadata {
+    ops: operation::Registry,
+    repl_config: ReplicationConfig,
+}
+
+#[derive(Copy, Clone)]
+pub struct ReplicationConfig {
+    repl_factor: usize,
+    repl: Replication,
+    repl_read: bool,
+}
+
+impl ReplicationConfig {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn synchronous(factor: usize, repl_read: bool) -> Self {
+        assert!(factor > 0);
+        Self {
+            repl_factor: factor,
+            repl: Replication::Sync,
+            repl_read,
+        }
+    }
+
+    pub fn asynchronous(factor: usize, repl_read: bool) -> Self {
+        assert!(factor > 0);
+        Self {
+            repl_factor: factor,
+            repl: Replication::Async,
+            repl_read,
+        }
+    }
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            repl_factor: 0,
+            repl: Replication::None,
+            repl_read: false,
+        }
+    }
+}
+
+impl Metadata {
+    pub fn new(ops: operation::Registry, repl_config: ReplicationConfig) -> Self {
+        Self { ops, repl_config }
+    }
+
+    pub fn read_fn(&self, opart_id: &str) -> Result<ReadBuilder, Error> {
+        self.ops.read_fn(opart_id)
+    }
+
+    pub fn write_fn(&self, opart_id: &str) -> Result<WriteBuilder, Error> {
+        self.ops.write_fn(opart_id)
+    }
+
+    pub fn repl_factor(&self) -> usize {
+        self.repl_config.repl_factor
+    }
+
+    pub fn repl(&self) -> Replication {
+        self.repl_config.repl
+    }
+
+    pub fn repl_read(&self) -> bool {
+        self.repl_config.repl_read
+    }
+}
 
 pub struct DistributedMap<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq + Clone,
-    V: Serializer + Deserializer + Clone,
+    K: map::Key,
+    V: map::Value,
 {
     instance: instance::Weak,
     id: String,
@@ -22,8 +118,8 @@ where
 
 impl<K, V> DistributedMap<K, V>
 where
-    K: Serializer + Deserializer + Hash + Eq + Clone + 'static,
-    V: Serializer + Deserializer + Clone + 'static,
+    K: map::Key,
+    V: map::Value,
 {
     pub fn new(id: String, instance: instance::Weak) -> Self {
         Self {
@@ -33,7 +129,7 @@ where
         }
     }
 
-    pub fn put(&self, k: K, v: V) -> io::Result<()> {
+    pub fn put(&self, k: K, v: V) -> CorylusResult<()> {
         let op = Put::<K, V> { key: k, value: v };
 
         if let Some(ref_) = self.instance.as_ref().upgrade() {
@@ -43,7 +139,7 @@ where
         }
     }
 
-    pub fn get(&self, k: K) -> io::Result<Option<V>> {
+    pub fn get(&self, k: K) -> CorylusResult<Option<V>> {
         let op = Get::<K, V> {
             key: k,
             _value: Default::default(),
@@ -54,9 +150,8 @@ where
             if result.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(V::deserialize(result.as_slice()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, e)
-                })?))
+                let value = V::deserialize(result.as_slice())?;
+                Ok(Some(value))
             }
         } else {
             panic!("Instance was destroyed")
@@ -64,94 +159,19 @@ where
     }
 }
 
-// --- Serializers / Deserializers ---
+#[cfg(test)]
+mod tests {
+    use crate::object::ReplicationConfig;
 
-impl Serializer for String {
-    fn serialize(&self) -> Vec<u8> {
-        self.as_bytes().to_vec()
+    #[test]
+    #[should_panic]
+    pub fn should_fail_when_sync_repl_and_zero_factor() {
+        ReplicationConfig::synchronous(0, false);
+    }
+
+    #[test]
+    #[should_panic]
+    pub fn should_fail_when_async_repl_and_zero_factor() {
+        ReplicationConfig::asynchronous(0, false);
     }
 }
-
-impl Deserializer for String {
-    type Error = DeserializeError;
-
-    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
-        String::from_utf8(buffer.to_vec()).map_err(DeserializeError::InvalidUtf8)
-    }
-}
-
-impl Serializer for Vec<u8> {
-    fn serialize(&self) -> Vec<u8> {
-        self.clone()
-    }
-}
-
-impl Deserializer for Vec<u8> {
-    type Error = DeserializeError;
-
-    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
-        Ok(buffer.to_vec())
-    }
-}
-
-impl Serializer for bool {
-    fn serialize(&self) -> Vec<u8> {
-        vec![*self as u8]
-    }
-}
-
-impl Deserializer for bool {
-    type Error = DeserializeError;
-
-    fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
-        if buffer.len() != 1 {
-            return Err(DeserializeError::InvalidBufferSize {
-                expected: 1,
-                got: buffer.len(),
-            });
-        }
-        match buffer[0] {
-            0 => Ok(false),
-            1 => Ok(true),
-            v => Err(DeserializeError::Unknown(format!("Invalid bool byte: {v}"))),
-        }
-    }
-}
-
-macro_rules! impl_fixed_serde {
-    ($t:ty) => {
-        impl Serializer for $t {
-            fn serialize(&self) -> Vec<u8> {
-                self.to_le_bytes().to_vec()
-            }
-        }
-
-        impl Deserializer for $t {
-            type Error = DeserializeError;
-
-            fn deserialize(buffer: &[u8]) -> Result<Self, Self::Error> {
-                const N: usize = std::mem::size_of::<$t>();
-                if buffer.len() != N {
-                    return Err(DeserializeError::InvalidBufferSize {
-                        expected: N,
-                        got: buffer.len(),
-                    });
-                }
-                Ok(<$t>::from_le_bytes(buffer.try_into().unwrap()))
-            }
-        }
-    };
-}
-
-impl_fixed_serde!(u8);
-impl_fixed_serde!(u16);
-impl_fixed_serde!(u32);
-impl_fixed_serde!(u64);
-impl_fixed_serde!(u128);
-impl_fixed_serde!(i8);
-impl_fixed_serde!(i16);
-impl_fixed_serde!(i32);
-impl_fixed_serde!(i64);
-impl_fixed_serde!(i128);
-impl_fixed_serde!(f32);
-impl_fixed_serde!(f64);

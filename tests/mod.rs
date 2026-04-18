@@ -1,5 +1,4 @@
 use std::{
-    io,
     net::{Ipv4Addr, SocketAddr},
     sync::Mutex,
     thread::sleep,
@@ -7,17 +6,29 @@ use std::{
 };
 
 use corylus::{
-    Instance, instance,
+    CorylusResult, Instance, instance,
     network::{self, Discovery},
+    object,
+    partition::{self},
 };
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
 
 mod map;
+mod repl;
 
 pub static WITH_INSTANCES_LOCK: Mutex<()> = Mutex::new(());
 
-fn with_instances<F: FnOnce(Instance, Instance) -> io::Result<()>>(f: F) -> io::Result<()> {
+fn with_instances_no_repl<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
+    f: F,
+) -> CorylusResult<()> {
+    with_instances(f, object::ReplicationConfig::default())
+}
+
+fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
+    f: F,
+    repl_config: object::ReplicationConfig,
+) -> CorylusResult<()> {
     let _guard = WITH_INSTANCES_LOCK.lock();
 
     let subscriber = FmtSubscriber::new();
@@ -25,6 +36,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> io::Result<()>>(f: F) -> io::
 
     let id_1 = Uuid::from_u128(1);
     let id_2 = Uuid::from_u128(2);
+    let version = partition::version(&[id_1, id_2]);
 
     let instance_1 = instance::Builder::new()
         .with_id(Uuid::from_u128(1))
@@ -44,7 +56,7 @@ fn with_instances<F: FnOnce(Instance, Instance) -> io::Result<()>>(f: F) -> io::
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
             ],
         })
-        .with_map::<String, String>("str-str")
+        .with_map::<String, String>("str-str", repl_config)
         .build()?;
 
     let instance_2 = instance::Builder::new()
@@ -65,25 +77,25 @@ fn with_instances<F: FnOnce(Instance, Instance) -> io::Result<()>>(f: F) -> io::
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
             ],
         })
-        .with_map::<String, String>("str-str")
+        .with_map::<String, String>("str-str", repl_config)
         .build()?;
 
     wait_until(
         || {
             instance_1.members().iter().any(|id| id.eq(&id_2))
-                && instance_1.part_group_version() == 1
+                && instance_1.part_group_version() == version
         },
         Duration::from_millis(100),
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
 
     wait_until(
         || {
             instance_2.members().iter().any(|id| id.eq(&id_1))
-                && instance_2.part_group_version() == 1
+                && instance_2.part_group_version() == version
         },
         Duration::from_millis(100),
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
 
     f(instance_1, instance_2)
@@ -108,19 +120,42 @@ where
     }
 }
 
+// Tests under same parent module to avoid binary split
 mod tests {
     mod map {
-        use std::io;
+        use corylus::CorylusResult;
 
-        use crate::{map, with_instances};
+        use crate::{map, with_instances_no_repl};
         #[test]
-        pub fn should_register_map_successfully() -> io::Result<()> {
-            with_instances(map::should_register_map_successfully)
+        pub fn should_register_map_successfully() -> CorylusResult<()> {
+            with_instances_no_repl(map::should_register_map_successfully)
         }
 
         #[test]
-        pub fn should_put_and_get_map_successfully() -> io::Result<()> {
-            with_instances(map::should_put_and_get_map_successfully)
+        pub fn should_put_and_get_map_successfully() -> CorylusResult<()> {
+            with_instances_no_repl(map::should_put_and_get_map_successfully)
+        }
+    }
+
+    mod repl {
+        use corylus::{CorylusResult, object::ReplicationConfig};
+
+        use crate::{repl, with_instances};
+
+        #[test]
+        pub fn should_read_success_when_sync_repl_and_allow_replica_read() -> CorylusResult<()> {
+            with_instances(
+                repl::should_read_success_when_sync_repl_and_allow_replica_read,
+                ReplicationConfig::synchronous(1, true),
+            )
+        }
+
+        #[test]
+        pub fn should_read_fail_when_sync_repl_and_no_allow_replica_read() -> CorylusResult<()> {
+            with_instances(
+                repl::should_read_fail_when_sync_repl_and_no_allow_replica_read,
+                ReplicationConfig::synchronous(1, false),
+            )
         }
     }
 }

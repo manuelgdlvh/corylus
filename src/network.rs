@@ -1,17 +1,4 @@
-use std::{
-    io::{self},
-    net::{Ipv4Addr, SocketAddr},
-    sync::{
-        Arc,
-        mpsc::{self},
-    },
-    thread::{self, JoinHandle},
-    time::Duration,
-};
-
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
-
+use crate::network::packet::{Kind, Reply};
 use crate::{
     instance::{
         self, Shutdown,
@@ -19,13 +6,25 @@ use crate::{
     },
     network::{
         self,
-        packet::{Event, InboundPacket, Packet},
-        registry::{Registry, Response},
+        packet::{Event, Packet},
+        registry::Registry,
     },
 };
+use std::collections::HashMap;
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex};
+use std::{
+    io::{self},
+    net::{Ipv4Addr, SocketAddr},
+    sync::mpsc::{self},
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 pub mod packet;
-mod registry;
+pub mod registry;
 mod sched;
 
 pub enum Discovery {
@@ -34,27 +33,114 @@ pub enum Discovery {
 }
 
 #[derive(Clone)]
-pub struct Sender {
-    registry: Registry,
+pub struct AckHolder {
+    entries: Arc<Mutex<HashMap<Uuid, SyncSender<packet::Raw>>>>,
 }
 
-impl Sender {
-    pub fn sync_send(
-        &self,
-        id: Uuid,
-        packet: Packet,
-        timeout: Option<Duration>,
-    ) -> io::Result<Response<'_>> {
-        if let Some(corr_id) = packet.correlation_id() {
-            let response = self.registry.register_ack(corr_id);
-            self.send(id, packet, timeout)?;
-            Ok(response)
-        } else {
-            todo!("Must return error if not informed correlation_id")
+impl Default for AckHolder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AckHolder {
+    pub fn new() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn send(&self, id: Uuid, packet: Packet, timeout: Option<Duration>) -> io::Result<()> {
+    pub(crate) fn register(&self, corr_id: Uuid) -> Response<'_> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.entries
+            .lock()
+            .expect("Cannot be poisoned")
+            .insert(corr_id, tx);
+
+        Response::new(corr_id, self, rx)
+    }
+
+    pub(crate) fn unregister(&self, corr_id: Uuid) -> Option<SyncSender<packet::Raw>> {
+        self.entries
+            .lock()
+            .expect("Cannot be poisoned")
+            .remove(&corr_id)
+    }
+}
+
+pub struct Response<'a> {
+    corr_id: Uuid,
+    reg: &'a AckHolder,
+    receiver: mpsc::Receiver<packet::Raw>,
+}
+
+impl<'a> Response<'a> {
+    pub(crate) fn new(
+        corr_id: Uuid,
+        reg: &'a AckHolder,
+        receiver: mpsc::Receiver<packet::Raw>,
+    ) -> Self {
+        Self {
+            corr_id,
+            reg,
+            receiver,
+        }
+    }
+
+    pub fn get(&self, timeout: Duration) -> Result<packet::Raw, io::Error> {
+        self.receiver
+            .recv_timeout(timeout)
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
+    }
+}
+
+impl Drop for Response<'_> {
+    fn drop(&mut self) {
+        self.reg.unregister(self.corr_id);
+    }
+}
+
+#[derive(Clone)]
+pub struct Sender {
+    registry: Registry,
+    ack_holder: AckHolder,
+}
+
+impl Sender {
+    pub fn request_sync(
+        &self,
+        id: Uuid,
+        packet: packet::Request,
+        timeout: Option<Duration>,
+    ) -> io::Result<Response<'_>> {
+        if let Some(corr_id) = packet.correlation_id() {
+            let response = self.ack_holder.register(corr_id);
+            self.send_internal(id, Packet::Request(packet), timeout)?;
+            Ok(response)
+        } else {
+            unreachable!("All packets must have informed correlation_id")
+        }
+    }
+
+    pub fn request(
+        &self,
+        id: Uuid,
+        packet: packet::Request,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        self.send_internal(id, Packet::Request(packet), timeout)
+    }
+
+    pub fn reply(
+        &self,
+        id: Uuid,
+        packet: packet::Reply,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        self.send_internal(id, Packet::Reply(packet), timeout)
+    }
+
+    fn send_internal(&self, id: Uuid, packet: Packet, timeout: Option<Duration>) -> io::Result<()> {
         let (result, v) = self.registry.with_writers_read(|writers| {
             if let Some(writer) = writers.get(&id) {
                 match writer.write(&packet, timeout) {
@@ -129,12 +215,13 @@ impl Sender {
 
 #[derive(Eq, PartialEq, Debug)]
 pub enum Message {
-    Packet { val: InboundPacket },
-    Event { val: Event },
+    Packet(packet::Inbound),
+    Event(Event),
 }
 
 pub struct Receiver {
     rx_msg: mpsc::Receiver<Message>,
+    ack_holder: AckHolder,
     registry: Registry,
 }
 
@@ -170,46 +257,43 @@ impl Receiver {
 
                     if let Some(message) = self.recv(Some(Duration::from_secs(1))) {
                         match message {
-                            Message::Packet { val } => {
-                                if val.p.is_read() {
-                                    task_executor
-                                        .spawn(instance.clone(), Task::Read { packet: val });
-                                } else if val.p.is_write() {
-                                    task_executor
-                                        .spawn(instance.clone(), Task::Write { packet: val });
-                                } else {
-                                    match val.p {
-                                        Packet::WhoIs { .. }
-                                        | Packet::WhoIsReply { .. }
-                                        | Packet::HeartBeat
-                                        | Packet::WriteOp { .. }
-                                        | Packet::GetOp { .. } => {}
-
-                                        Packet::WriteOpReply { corr_id, .. }
-                                        | Packet::GetOpReply { corr_id, .. } => {
-                                            if let Some(entry) =
-                                                self.registry.unregister_ack(corr_id)
-                                            {
-                                                let _ = entry.try_send(val.p);
-                                            }
-                                        }
+                            Message::Packet(inbound) => match inbound.p.kind() {
+                                Kind::WhoIsRequest
+                                | Kind::GetOpRequest
+                                | Kind::FetchObjectRequest => {
+                                    task_executor.spawn(instance.clone(), Task::Read(inbound));
+                                }
+                                Kind::HeartBeatRequest
+                                | Kind::WriteOpRequest
+                                | Kind::PartitionFetchCompletionRequest => {
+                                    task_executor.spawn(instance.clone(), Task::Write(inbound));
+                                }
+                                Kind::PartitionFetchCompletionReply
+                                | Kind::FetchObjectReply
+                                | Kind::GetOpReply
+                                | Kind::WriteOpReply
+                                | Kind::WhoIsReply => {
+                                    if let Ok(packet) = Reply::try_from(&inbound.p)
+                                        && let Some(corr_id) = packet.correlation_id()
+                                        && let Some(entry) = self.ack_holder.unregister(corr_id)
+                                    {
+                                        let _ = entry.try_send(inbound.p);
                                     }
                                 }
-                            }
-                            Message::Event { val } => match val {
+                            },
+                            Message::Event(event) => match event {
                                 Event::PeerAdded { id } => {
                                     if let Some(ref_) = instance.as_ref().upgrade() {
-                                        ref_.add_member(id);
-                                        task_executor
-                                            .spawn(instance.clone(), Task::PartitionRebalance);
+                                        ref_.membership.add(id);
                                     }
                                 }
                                 Event::PeerRemoved { id } => {
                                     if let Some(ref_) = instance.as_ref().upgrade() {
-                                        ref_.remove_member(id);
-                                        task_executor
-                                            .spawn(instance.clone(), Task::PartitionRebalance);
+                                        ref_.membership.remove(id);
                                     }
+                                }
+                                Event::Checkpoint => {
+                                    task_executor.spawn(instance.clone(), Task::PartitionRebalance);
                                 }
                             },
                         }
@@ -275,20 +359,27 @@ impl Default for HeartbeatConfig {
 pub fn handle(
     id: Uuid,
     d: Discovery,
-    shutdown: Arc<Shutdown>,
+    shutdown: Shutdown,
     c: network::Config,
 ) -> io::Result<(Sender, Receiver)> {
     let (tx_msg, rx_msg) = mpsc::sync_channel(c.msg_buf_len);
 
-    let registry = Registry::new(id, c, tx_msg, Arc::clone(&shutdown));
+    let registry = Registry::new(id, c, tx_msg, shutdown.clone());
 
     shutdown.register(sched::listener(c, registry.clone())?);
     shutdown.register(sched::hb(c, d, registry.clone())?);
 
+    let ack_holder = AckHolder::new();
+
     let net_tx = Sender {
         registry: registry.clone(),
+        ack_holder: ack_holder.clone(),
     };
-    let net_rx = Receiver { rx_msg, registry };
+    let net_rx = Receiver {
+        rx_msg,
+        ack_holder,
+        registry,
+    };
 
     Ok((net_tx, net_rx))
 }
