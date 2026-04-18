@@ -9,6 +9,7 @@ use std::{
 
 use uuid::Uuid;
 
+use crate::network::packet::Reply;
 use crate::object::operation;
 use crate::{
     CorylusError, CorylusResult, Instance,
@@ -299,7 +300,7 @@ impl Drop for Inner {
 }
 
 impl Inner {
-    pub(crate) fn rebuild(&self, obj_id: &str, part_id: u16, raw: Vec<u8>) -> CorylusResult<()> {
+    pub(crate) fn rebuild(&self, obj_id: &str, part_id: u16, raw: &[u8]) -> CorylusResult<()> {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
@@ -404,19 +405,20 @@ impl Inner {
             let raw_op = op.serialize();
             let response = self.net.request_sync(
                 owner,
-                packet::Request::Write(packet::Write::WriteOp {
+                packet::Request::WriteOp {
                     v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
                     part_id: part_id as u16,
-                    obj_id: obj_id.to_string(),
-                    opart_id: op.id().to_string(),
-                    raw_op,
-                }),
+                    obj_id,
+                    op_id: op.id(),
+                    raw_op: &raw_op,
+                },
                 None,
             )?;
 
-            match response.get(Duration::from_secs(1))? {
-                packet::Reply::WriteOp { status, .. } => match status {
+            let raw = response.get(Duration::from_secs(1))?;
+            match Reply::try_from(&raw).expect("TODO") {
+                Reply::WriteOp { status, .. } => match status {
                     packet::Status::Success => Ok(()),
                     s => Err(CorylusError::try_from(s).unwrap()),
                 },
@@ -459,22 +461,23 @@ impl Inner {
                     for replica_id in replica_ids {
                         let response = self.net.request_sync(
                             replica_id,
-                            packet::Request::Write(packet::Write::WriteOp {
+                            packet::Request::WriteOp {
                                 v: self.part_group.version(),
                                 corr_id: Uuid::new_v4(),
                                 part_id: part_id as u16,
-                                obj_id: obj_id.to_string(),
-                                opart_id: op.id().to_string(),
-                                raw_op: raw_op.clone(),
-                            }),
+                                obj_id,
+                                op_id: op.id(),
+                                raw_op: &raw_op,
+                            },
                             None,
                         )?;
                         responses.push(response);
                     }
 
                     for response in responses {
-                        match response.get(Duration::from_secs(1))? {
-                            packet::Reply::WriteOp { status, .. } => match status {
+                        let raw = response.get(Duration::from_secs(1))?;
+                        match Reply::try_from(&raw).expect("TODO") {
+                            Reply::WriteOp { status, .. } => match status {
                                 packet::Status::Success => Ok(()),
                                 s => Err(CorylusError::try_from(s).unwrap()),
                             },
@@ -489,14 +492,14 @@ impl Inner {
                     for replica_id in replica_ids {
                         self.net.request(
                             replica_id,
-                            packet::Request::Write(packet::Write::WriteOp {
+                            packet::Request::WriteOp {
                                 v: self.part_group.version(),
                                 corr_id: Uuid::new_v4(),
                                 part_id: part_id as u16,
-                                obj_id: obj_id.to_string(),
-                                opart_id: op.id().to_string(),
-                                raw_op: raw_op.clone(),
-                            }),
+                                obj_id,
+                                op_id: op.id(),
+                                raw_op: &raw_op,
+                            },
                             None,
                         )?;
                     }
@@ -539,20 +542,22 @@ impl Inner {
             let raw_op = op.serialize();
             let response = self.net.request_sync(
                 owner,
-                packet::Request::Read(packet::Read::GetOp {
+                packet::Request::GetOp {
                     v: self.part_group.version(),
                     corr_id: Uuid::new_v4(),
                     part_id: part_id as u16,
-                    obj_id: obj_id.to_string(),
-                    opart_id: op.id().to_string(),
-                    raw_op,
-                }),
+                    obj_id,
+                    op_id: op.id(),
+                    raw_op: &raw_op,
+                },
                 None,
             )?;
 
-            match response.get(Duration::from_secs(1))? {
+            let raw = response.get(Duration::from_secs(1))?;
+            match Reply::try_from(&raw).expect("TODO") {
                 packet::Reply::GetOp { status, result, .. } => match status {
-                    packet::Status::Success => Ok(result),
+                    // TODO: Check
+                    packet::Status::Success => Ok(result.to_vec()),
                     s => Err(CorylusError::try_from(s).unwrap()),
                 },
                 _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),

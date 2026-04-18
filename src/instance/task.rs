@@ -1,26 +1,23 @@
+use crate::network::Response;
+use crate::network::packet::{Inbound, Reply, Request, Status};
+use crate::{
+    CorylusError,
+    instance::{self},
+    network::packet::{self},
+    object, partition,
+};
 use rayon::ThreadPoolBuilder;
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
-
-use crate::network::packet::{Reply, Status};
-use crate::{
-    CorylusError,
-    instance::{self},
-    network::{
-        packet::{self},
-        registry::Response,
-    },
-    object, partition,
-};
 
 pub enum Task {
     PartitionRebalance,
-    Read { from: Uuid, packet: packet::Read },
-    Write { from: Uuid, packet: packet::Write },
+    Read(Inbound),
+    Write(Inbound),
 }
 
 impl Task {
@@ -108,7 +105,10 @@ impl Task {
                         }
 
                         enum FetchResponse<'a> {
-                            FetchObject { obj_id: String, resp: Response<'a> },
+                            FetchObject {
+                                obj_id: &'a String,
+                                resp: Response<'a>,
+                            },
                             Completion(Response<'a>),
                         }
 
@@ -141,13 +141,11 @@ impl Task {
                                         .net
                                         .request_sync(
                                             req.member_id,
-                                            packet::Request::Write(
-                                                packet::Write::PartitionFetchCompletion {
-                                                    v,
-                                                    corr_id: Uuid::new_v4(),
-                                                    part_id: *part_id as u16,
-                                                },
-                                            ),
+                                            packet::Request::PartitionFetchCompletion {
+                                                v,
+                                                corr_id: Uuid::new_v4(),
+                                                part_id: *part_id as u16,
+                                            },
                                             None,
                                         )
                                         .expect("TODO: Handle this error");
@@ -160,18 +158,17 @@ impl Task {
                                     continue;
                                 }
 
-                                for obj_id in req.segments.iter() {
-                                    let obj_id = obj_id.to_string();
+                                for &obj_id in req.segments.iter() {
                                     let response = ref_
                                         .net
                                         .request_sync(
                                             req.member_id,
-                                            packet::Request::Read(packet::Read::FetchObject {
+                                            packet::Request::FetchObject {
                                                 v,
                                                 corr_id: Uuid::new_v4(),
                                                 part_id: req.part_id as u16,
-                                                obj_id: obj_id.to_string(),
-                                            }),
+                                                obj_id,
+                                            },
                                             None,
                                         )
                                         .expect("TODO: Handle this error");
@@ -189,26 +186,41 @@ impl Task {
                                 for entry in responses {
                                     match entry {
                                         FetchResponse::FetchObject { obj_id, resp } => {
-                                            if let Ok(reply) = resp.get(timeout) {
-                                                if let Reply::FetchObject { result, .. } = reply {
-                                                    ref_.rebuild(&obj_id, part_id as u16, result)
+                                            match resp.get(timeout) {
+                                                Ok(raw) => {
+                                                    if let Reply::FetchObject { result, .. } =
+                                                        Reply::try_from(&raw).expect("TODO")
+                                                    {
+                                                        ref_.rebuild(
+                                                            obj_id,
+                                                            part_id as u16,
+                                                            result,
+                                                        )
                                                         .expect("TODO");
+                                                        fetch
+                                                            .get_mut(&part_id)
+                                                            .expect("Always available")
+                                                            .segments
+                                                            .remove(obj_id);
+                                                    }
                                                 }
-
-                                                fetch
-                                                    .get_mut(&part_id)
-                                                    .expect("Always available")
-                                                    .segments
-                                                    .remove(&obj_id);
+                                                Err(err) => {
+                                                    error!(err = %err, "Fetch object error");
+                                                }
                                             }
                                         }
                                         FetchResponse::Completion(resp) => {
-                                            if resp.get(timeout).is_ok() {
-                                                pending_partitions.remove(&part_id);
-                                                ref_.part_group.set_lifecycle(
-                                                    part_id,
-                                                    partition::Lifecycle::Ready,
-                                                );
+                                            match resp.get(timeout) {
+                                                Ok(_) => {
+                                                    pending_partitions.remove(&part_id);
+                                                    ref_.part_group.set_lifecycle(
+                                                        part_id,
+                                                        partition::Lifecycle::Ready,
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    error!(err = %err, "Partition Completion error");
+                                                }
                                             }
                                         }
                                     }
@@ -228,108 +240,125 @@ impl Task {
                 }
             }
 
-            Self::Read { from, packet } => match packet {
-                packet::Read::WhoIs { .. } => {}
-                packet::Read::GetOp {
-                    v,
-                    corr_id,
-                    part_id,
-                    obj_id,
-                    opart_id,
-                    raw_op,
-                } => {
-                    if let Some(ref_) = instance.as_ref().upgrade() {
-                        let (status, result) = ref_
-                            .objects
-                            .get(&obj_id)
-                            .ok_or(object::Error::ObjectNotFound.into())
-                            .and_then(|m| m.read_fn(&opart_id).map_err(CorylusError::from))
-                            .and_then(|f| f(raw_op.as_slice()).map_err(CorylusError::from))
-                            .and_then(|op| ref_.remote_read(&obj_id, part_id, v, op))
-                            .map(|val| (Status::Success, val))
-                            .unwrap_or_else(|err| (Status::from(err), vec![]));
+            Self::Read(inbound) => {
+                let from = inbound.from;
+                if let Ok(packet) = Request::try_from(&inbound.p) {
+                    match packet {
+                        Request::GetOp {
+                            v,
+                            corr_id,
+                            part_id,
+                            obj_id,
+                            op_id,
+                            raw_op,
+                        } => {
+                            if let Some(ref_) = instance.as_ref().upgrade() {
+                                let (status, result) = ref_
+                                    .objects
+                                    .get(obj_id)
+                                    .ok_or(object::Error::ObjectNotFound.into())
+                                    .and_then(|m| m.read_fn(op_id).map_err(CorylusError::from))
+                                    .and_then(|f| f(raw_op).map_err(CorylusError::from))
+                                    .and_then(|op| ref_.remote_read(obj_id, part_id, v, op))
+                                    .map(|val| (Status::Success, val))
+                                    .unwrap_or_else(|err| (Status::from(err), vec![]));
 
-                        let _ = ref_.net.reply(
-                            from,
-                            packet::Reply::GetOp {
-                                corr_id,
-                                status,
-                                result,
-                            },
-                            None,
-                        );
+                                let _ = ref_.net.reply(
+                                    from,
+                                    Reply::GetOp {
+                                        corr_id,
+                                        status,
+                                        result: &result,
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+
+                        Request::FetchObject {
+                            v: _,
+                            corr_id,
+                            part_id,
+                            obj_id,
+                        } => {
+                            if let Some(ref_) = instance.as_ref().upgrade() {
+                                let (status, result) = match ref_.fetch(obj_id, part_id) {
+                                    Ok(res) => (Status::Success, res),
+                                    Err(err) => (Status::from(err), vec![]),
+                                };
+
+                                let _ = ref_.net.reply(
+                                    from,
+                                    Reply::FetchObject {
+                                        corr_id,
+                                        status,
+                                        result: &result,
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                        Request::HeartBeat => {}
+                        Request::WriteOp { .. } => {}
+                        Request::PartitionFetchCompletion { .. } => {}
+                        Request::WhoIs { .. } => {}
                     }
                 }
+            }
 
-                packet::Read::FetchObject {
-                    v: _,
-                    corr_id,
-                    part_id,
-                    obj_id,
-                } => {
-                    if let Some(ref_) = instance.as_ref().upgrade() {
-                        let (status, result) = match ref_.fetch(&obj_id, part_id) {
-                            Ok(res) => (Status::Success, res),
-                            Err(err) => (Status::from(err), vec![]),
-                        };
+            Self::Write(inbound) => {
+                let from = inbound.from;
+                if let Ok(packet) = Request::try_from(&inbound.p) {
+                    match packet {
+                        Request::WriteOp {
+                            v,
+                            corr_id,
+                            part_id,
+                            obj_id,
+                            op_id,
+                            raw_op,
+                        } => {
+                            if let Some(ref_) = instance.as_ref().upgrade() {
+                                let status = ref_
+                                    .objects
+                                    .get(obj_id)
+                                    .ok_or(object::Error::ObjectNotFound.into())
+                                    .and_then(|m| m.write_fn(op_id).map_err(CorylusError::from))
+                                    .and_then(|f| f(raw_op).map_err(CorylusError::from))
+                                    .and_then(|op| ref_.remote_write(obj_id, part_id, v, op))
+                                    .map(|_| Status::Success)
+                                    .unwrap_or_else(Status::from);
 
-                        let _ = ref_.net.reply(
-                            from,
-                            Reply::GetOp {
-                                corr_id,
-                                status,
-                                result,
-                            },
-                            None,
-                        );
+                                let _ =
+                                    ref_.net
+                                        .reply(from, Reply::WriteOp { corr_id, status }, None);
+                            }
+                        }
+                        Request::PartitionFetchCompletion {
+                            v: _,
+                            corr_id,
+                            part_id,
+                        } => {
+                            if let Some(ref_) = instance.as_ref().upgrade() {
+                                ref_.part_group
+                                    .set_lifecycle(part_id as usize, partition::Lifecycle::Ready);
+                                let _ = ref_.net.reply(
+                                    from,
+                                    Reply::PartitionFetchCompletion {
+                                        corr_id,
+                                        status: Status::Success,
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                        Request::HeartBeat
+                        | Request::WhoIs { .. }
+                        | Request::GetOp { .. }
+                        | Request::FetchObject { .. } => {}
                     }
                 }
-            },
-            Self::Write { from, packet } => match packet {
-                packet::Write::HeartBeat => {}
-                packet::Write::WriteOp {
-                    v,
-                    corr_id,
-                    part_id,
-                    obj_id,
-                    opart_id,
-                    raw_op,
-                } => {
-                    if let Some(ref_) = instance.as_ref().upgrade() {
-                        let status = ref_
-                            .objects
-                            .get(&obj_id)
-                            .ok_or(object::Error::ObjectNotFound.into())
-                            .and_then(|m| m.write_fn(&opart_id).map_err(CorylusError::from))
-                            .and_then(|f| f(raw_op.as_slice()).map_err(CorylusError::from))
-                            .and_then(|op| ref_.remote_write(&obj_id, part_id, v, op))
-                            .map(|_| Status::Success)
-                            .unwrap_or_else(Status::from);
-
-                        let _ = ref_
-                            .net
-                            .reply(from, Reply::WriteOp { corr_id, status }, None);
-                    }
-                }
-                packet::Write::PartitionFetchCompletion {
-                    v: _,
-                    corr_id,
-                    part_id,
-                } => {
-                    if let Some(ref_) = instance.as_ref().upgrade() {
-                        ref_.part_group
-                            .set_lifecycle(part_id as usize, partition::Lifecycle::Ready);
-                        let _ = ref_.net.reply(
-                            from,
-                            Reply::PartitionFetchCompletion {
-                                corr_id,
-                                status: Status::Success,
-                            },
-                            None,
-                        );
-                    }
-                }
-            },
+            }
         }
     }
 }

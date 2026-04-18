@@ -57,7 +57,7 @@ pub(crate) fn hb(
                     let (v, reconnect) = registry.with_writers_read(|writers| {
                         let writer = writers.get(id).expect("Checked existence before");
                         let reconnect =
-                            match writer.write(&Packet::Request(packet::Request::Write(packet::Write::HeartBeat))
+                            match writer.write(&Packet::Request(packet::Request::HeartBeat)
                                                , Some(config.timeout.write)) {
                                 Err(err)
                                 if matches!(
@@ -99,7 +99,7 @@ pub(crate) fn hb(
                     }
                 });
 
-                let _ = registry.as_ref().tx_msg.send(Message::Event { val: Event::Checkpoint });
+                let _ = registry.as_ref().tx_msg.send(Message::Event (Event::Checkpoint));
                 info!(id = %registry.as_ref().id, "Heartbeat tick finished");
             }
 
@@ -141,8 +141,8 @@ pub(crate) fn listener(config: network::Config, registry: Registry) -> io::Resul
                             }
                         };
 
-                        let (peer_id, peer_addr) = match who_is_req {
-                            Packet::Request(packet::Request::Read(packet::Read::WhoIs { id, addr })) => (id, addr),
+                        let (peer_id, peer_addr) = match Packet::from(&who_is_req) {
+                            Packet::Request(packet::Request::WhoIs { id, addr }) => (id, addr),
                             _ => continue,
                         };
 

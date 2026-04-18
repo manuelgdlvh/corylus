@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::fmt::Display;
 use std::net::SocketAddr;
 
@@ -14,67 +13,40 @@ pub enum Event {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct InboundPacket {
+pub struct Inbound {
     pub(crate) from: Uuid,
-    pub(crate) p: Packet,
+    pub(crate) p: Raw,
 }
 
-impl InboundPacket {
-    pub fn new(id: Uuid, p: Packet) -> Self {
-        Self { from: id, p }
+impl Inbound {
+    pub fn new(id: Uuid, raw: Raw) -> Self {
+        Self { from: id, p: raw }
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum Packet {
-    Request(Request),
-    Reply(Reply),
+pub enum Packet<'a> {
+    Request(Request<'a>),
+    Reply(Reply<'a>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum Request {
-    Read(Read),
-    Write(Write),
-}
-
-impl Request {
-    pub fn correlation_id(&self) -> Option<Uuid> {
-        match self {
-            Request::Read(val) => match val {
-                Read::WhoIs { .. } => None,
-                Read::GetOp { corr_id, .. } => Some(*corr_id),
-                Read::FetchObject { corr_id, .. } => Some(*corr_id),
-            },
-            Request::Write(val) => match val {
-                Write::WriteOp { corr_id, .. } => Some(*corr_id),
-                Write::HeartBeat => None,
-                Write::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum Write {
+pub enum Request<'a> {
     HeartBeat,
     WriteOp {
         v: u128,
         corr_id: Uuid,
-        // Just to check inconsistences in the partition tables to reject
+        // Just to check inconsistencies in the partition tables to reject
         part_id: u16,
-        obj_id: String,
-        opart_id: String,
-        raw_op: Vec<u8>,
+        obj_id: &'a str,
+        op_id: &'a str,
+        raw_op: &'a [u8],
     },
     PartitionFetchCompletion {
         v: u128,
         corr_id: Uuid,
         part_id: u16,
     },
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum Read {
     WhoIs {
         id: Uuid,
         addr: SocketAddr,
@@ -84,17 +56,30 @@ pub enum Read {
         corr_id: Uuid,
         // Just to check inconsistences in the partition tables to reject
         part_id: u16,
-        obj_id: String,
-        opart_id: String,
-        raw_op: Vec<u8>,
+        obj_id: &'a str,
+        op_id: &'a str,
+        raw_op: &'a [u8],
     },
     FetchObject {
         v: u128,
         corr_id: Uuid,
         // Just to check inconsistences in the partition tables to reject
         part_id: u16,
-        obj_id: String,
+        obj_id: &'a str,
     },
+}
+
+impl Request<'_> {
+    pub fn correlation_id(&self) -> Option<Uuid> {
+        match self {
+            Self::WhoIs { .. } => None,
+            Self::GetOp { corr_id, .. } => Some(*corr_id),
+            Self::FetchObject { corr_id, .. } => Some(*corr_id),
+            Self::WriteOp { corr_id, .. } => Some(*corr_id),
+            Self::HeartBeat => None,
+            Self::PartitionFetchCompletion { corr_id, .. } => Some(*corr_id),
+        }
+    }
 }
 
 #[repr(u8)]
@@ -167,6 +152,7 @@ impl TryFrom<Status> for CorylusError {
     }
 }
 
+// TODO: Check
 impl TryFrom<u8> for Status {
     type Error = ();
 
@@ -180,7 +166,7 @@ impl TryFrom<u8> for Status {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum Reply {
+pub enum Reply<'a> {
     WhoIs {
         id: Uuid,
     },
@@ -191,12 +177,12 @@ pub enum Reply {
     GetOp {
         corr_id: Uuid,
         status: Status,
-        result: Vec<u8>,
+        result: &'a [u8],
     },
     FetchObject {
         corr_id: Uuid,
         status: Status,
-        result: Vec<u8>,
+        result: &'a [u8],
     },
 
     PartitionFetchCompletion {
@@ -205,7 +191,7 @@ pub enum Reply {
     },
 }
 
-impl Reply {
+impl Reply<'_> {
     pub fn correlation_id(&self) -> Option<Uuid> {
         match self {
             Reply::WhoIs { .. } => None,
@@ -217,20 +203,16 @@ impl Reply {
     }
 }
 
-impl Packet {
+impl Packet<'_> {
     pub fn kind(&self) -> Kind {
         match self {
             Self::Request(val) => match val {
-                Request::Read(val) => match val {
-                    Read::WhoIs { .. } => Kind::WhoIsRequest,
-                    Read::GetOp { .. } => Kind::GetOpRequest,
-                    Read::FetchObject { .. } => Kind::FetchObjectRequest,
-                },
-                Request::Write(val) => match val {
-                    Write::WriteOp { .. } => Kind::WriteOpRequest,
-                    Write::HeartBeat => Kind::HeartBeatRequest,
-                    Write::PartitionFetchCompletion { .. } => Kind::PartitionFetchCompletionRequest,
-                },
+                Request::WhoIs { .. } => Kind::WhoIsRequest,
+                Request::GetOp { .. } => Kind::GetOpRequest,
+                Request::FetchObject { .. } => Kind::FetchObjectRequest,
+                Request::WriteOp { .. } => Kind::WriteOpRequest,
+                Request::HeartBeat => Kind::HeartBeatRequest,
+                Request::PartitionFetchCompletion { .. } => Kind::PartitionFetchCompletionRequest,
             },
             Self::Reply(val) => match val {
                 Reply::WhoIs { .. } => Kind::WhoIsReply,
@@ -250,7 +232,7 @@ impl Packet {
     }
 }
 
-impl From<&Packet> for Vec<u8> {
+impl From<&Packet<'_>> for Vec<u8> {
     fn from(packet: &Packet) -> Self {
         let kind = packet.kind();
         let mut buffer = kind.buffer();
@@ -268,92 +250,85 @@ impl From<&Packet> for Vec<u8> {
 
         match packet {
             Packet::Request(req) => match req {
-                Request::Read(read) => match read {
-                    Read::WhoIs { id, addr } => {
-                        buffer.extend_from_slice(id.as_bytes());
+                Request::WhoIs { id, addr } => {
+                    buffer.extend_from_slice(id.as_bytes());
 
-                        let addr = addr.to_string().into_bytes();
-                        buffer.extend_from_slice(addr.as_slice());
+                    let addr = addr.to_string().into_bytes();
+                    buffer.extend_from_slice(addr.as_slice());
+                }
+
+                Request::GetOp {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                    op_id,
+                    raw_op,
+                } => {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.extend_from_slice(&part_id.to_le_bytes());
+
+                    let obj_id_len: u16 = obj_id.len() as u16;
+                    buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                    buffer.extend_from_slice(obj_id.as_bytes());
+
+                    let op_id_len: u16 = op_id.len() as u16;
+                    buffer.extend_from_slice(&op_id_len.to_le_bytes());
+                    buffer.extend_from_slice(op_id.as_bytes());
+
+                    if !raw_op.is_empty() {
+                        buffer.extend_from_slice(raw_op);
                     }
+                }
+                Request::FetchObject {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                } => {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.extend_from_slice(&part_id.to_le_bytes());
 
-                    Read::GetOp {
-                        v,
-                        corr_id,
-                        part_id,
-                        obj_id,
-                        opart_id,
-                        raw_op,
-                    } => {
-                        buffer.extend_from_slice(&v.to_le_bytes());
-                        buffer.extend_from_slice(corr_id.as_bytes());
-                        buffer.extend_from_slice(&part_id.to_le_bytes());
+                    let obj_id_len: u16 = obj_id.len() as u16;
+                    buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                    buffer.extend_from_slice(obj_id.as_bytes());
+                }
+                Request::HeartBeat => {}
+                Request::WriteOp {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                    op_id,
+                    raw_op,
+                } => {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.extend_from_slice(&part_id.to_le_bytes());
 
-                        let obj_id_len: u16 = obj_id.len() as u16;
-                        buffer.extend_from_slice(&obj_id_len.to_le_bytes());
-                        buffer.extend_from_slice(obj_id.as_bytes());
+                    let obj_id_len: u16 = obj_id.len() as u16;
+                    buffer.extend_from_slice(&obj_id_len.to_le_bytes());
+                    buffer.extend_from_slice(obj_id.as_bytes());
 
-                        let opart_id_len: u16 = opart_id.len() as u16;
-                        buffer.extend_from_slice(&opart_id_len.to_le_bytes());
-                        buffer.extend_from_slice(opart_id.as_bytes());
+                    let op_id_len: u16 = op_id.len() as u16;
+                    buffer.extend_from_slice(&op_id_len.to_le_bytes());
+                    buffer.extend_from_slice(op_id.as_bytes());
 
-                        if !raw_op.is_empty() {
-                            buffer.extend_from_slice(raw_op.as_slice());
-                        }
+                    if !raw_op.is_empty() {
+                        buffer.extend_from_slice(raw_op);
                     }
-                    Read::FetchObject {
-                        v,
-                        corr_id,
-                        part_id,
-                        obj_id,
-                    } => {
-                        buffer.extend_from_slice(&v.to_le_bytes());
-                        buffer.extend_from_slice(corr_id.as_bytes());
-                        buffer.extend_from_slice(&part_id.to_le_bytes());
-
-                        let obj_id_len: u16 = obj_id.len() as u16;
-                        buffer.extend_from_slice(&obj_id_len.to_le_bytes());
-                        buffer.extend_from_slice(obj_id.as_bytes());
-                    }
-                },
-
-                Request::Write(write) => match write {
-                    Write::HeartBeat => {}
-
-                    Write::WriteOp {
-                        v,
-                        corr_id,
-                        part_id,
-                        obj_id,
-                        opart_id,
-                        raw_op,
-                    } => {
-                        buffer.extend_from_slice(&v.to_le_bytes());
-                        buffer.extend_from_slice(corr_id.as_bytes());
-                        buffer.extend_from_slice(&part_id.to_le_bytes());
-
-                        let obj_id_len: u16 = obj_id.len() as u16;
-                        buffer.extend_from_slice(&obj_id_len.to_le_bytes());
-                        buffer.extend_from_slice(obj_id.as_bytes());
-
-                        let opart_id_len: u16 = opart_id.len() as u16;
-                        buffer.extend_from_slice(&opart_id_len.to_le_bytes());
-                        buffer.extend_from_slice(opart_id.as_bytes());
-
-                        if !raw_op.is_empty() {
-                            buffer.extend_from_slice(raw_op.as_slice());
-                        }
-                    }
-
-                    Write::PartitionFetchCompletion {
-                        v,
-                        corr_id,
-                        part_id,
-                    } => {
-                        buffer.extend_from_slice(&v.to_le_bytes());
-                        buffer.extend_from_slice(corr_id.as_bytes());
-                        buffer.extend_from_slice(&part_id.to_le_bytes());
-                    }
-                },
+                }
+                Request::PartitionFetchCompletion {
+                    v,
+                    corr_id,
+                    part_id,
+                } => {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                    buffer.extend_from_slice(corr_id.as_bytes());
+                    buffer.extend_from_slice(&part_id.to_le_bytes());
+                }
             },
 
             Packet::Reply(rep) => match rep {
@@ -374,7 +349,7 @@ impl From<&Packet> for Vec<u8> {
                     buffer.push(*status as u8);
 
                     if !result.is_empty() {
-                        buffer.extend_from_slice(result.as_slice());
+                        buffer.extend_from_slice(result);
                     }
                 }
                 Reply::FetchObject {
@@ -386,7 +361,7 @@ impl From<&Packet> for Vec<u8> {
                     buffer.push(*status as u8);
 
                     if !result.is_empty() {
-                        buffer.extend_from_slice(result.as_slice());
+                        buffer.extend_from_slice(result);
                     }
                 }
 
@@ -406,244 +381,21 @@ impl From<&Packet> for Vec<u8> {
     }
 }
 
-impl<'a> From<Raw<'a>> for Packet {
-    fn from(value: Raw<'_>) -> Self {
-        let mut offset = size_of::<u8>();
-
+impl<'a> From<&'a Raw> for Packet<'a> {
+    fn from(value: &'a Raw) -> Self {
         match value.kind() {
-            Kind::WhoIsRequest => {
-                let id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let addr: SocketAddr = std::str::from_utf8(&value[offset..])
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-
-                Packet::Request(Request::Read(Read::WhoIs { id, addr }))
-            }
-
-            Kind::WhoIsReply => Packet::Reply(Reply::WhoIs {
-                id: Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap(),
-            }),
-
-            Kind::HeartBeatRequest => Packet::Request(Request::Write(Write::HeartBeat)),
-
-            Kind::WriteOpRequest => {
-                let v = u128::from_le_bytes(
-                    value[offset..offset + size_of::<u128>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                offset += size_of::<u128>();
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let part_id = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                );
-                offset += size_of::<u16>();
-
-                let obj_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
-                    .unwrap()
-                    .to_string();
-                offset += obj_id_len;
-
-                let opart_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let opart_id = std::str::from_utf8(&value[offset..offset + opart_id_len])
-                    .unwrap()
-                    .to_string();
-                offset += opart_id_len;
-
-                let raw_op = if offset >= value.len() {
-                    vec![]
-                } else {
-                    value[offset..].to_vec()
-                };
-
-                Packet::Request(Request::Write(Write::WriteOp {
-                    v,
-                    corr_id,
-                    part_id,
-                    obj_id,
-                    opart_id,
-                    raw_op,
-                }))
-            }
-
-            Kind::WriteOpReply => {
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let status = Status::try_from(value[offset]).unwrap();
-
-                Packet::Reply(Reply::WriteOp { corr_id, status })
-            }
-
-            Kind::GetOpRequest => {
-                let v = u128::from_le_bytes(
-                    value[offset..offset + size_of::<u128>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                offset += size_of::<u128>();
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let part_id = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                );
-                offset += size_of::<u16>();
-
-                let obj_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
-                    .unwrap()
-                    .to_string();
-                offset += obj_id_len;
-
-                let opart_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let opart_id = std::str::from_utf8(&value[offset..offset + opart_id_len])
-                    .unwrap()
-                    .to_string();
-                offset += opart_id_len;
-
-                let raw_op = if offset >= value.len() {
-                    vec![]
-                } else {
-                    value[offset..].to_vec()
-                };
-
-                Packet::Request(Request::Read(Read::GetOp {
-                    v,
-                    corr_id,
-                    part_id,
-                    obj_id,
-                    opart_id,
-                    raw_op,
-                }))
-            }
-
-            Kind::GetOpReply => {
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let status = Status::try_from(value[offset]).unwrap();
-                offset += size_of::<u8>();
-
-                let result = if offset >= value.len() {
-                    vec![]
-                } else {
-                    value[offset..].to_vec()
-                };
-
-                Packet::Reply(Reply::GetOp {
-                    corr_id,
-                    status,
-                    result,
-                })
-            }
-
-            Kind::FetchObjectRequest => {
-                let v = u128::from_le_bytes(
-                    value[offset..offset + size_of::<u128>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                offset += size_of::<u128>();
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let part_id = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                );
-                offset += size_of::<u16>();
-
-                let obj_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len])
-                    .unwrap()
-                    .to_string();
-
-                Packet::Request(Request::Read(Read::FetchObject {
-                    v,
-                    corr_id,
-                    part_id,
-                    obj_id,
-                }))
-            }
-
-            Kind::FetchObjectReply => {
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let status = Status::try_from(value[offset]).unwrap();
-                offset += size_of::<u8>();
-
-                let result = if offset >= value.len() {
-                    vec![]
-                } else {
-                    value[offset..].to_vec()
-                };
-
-                Packet::Reply(Reply::FetchObject {
-                    corr_id,
-                    status,
-                    result,
-                })
-            }
-
-            Kind::PartitionFetchCompletionRequest => {
-                let v = u128::from_le_bytes(
-                    value[offset..offset + size_of::<u128>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                offset += size_of::<u128>();
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let part_id = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                );
-
-                Packet::Request(Request::Write(Write::PartitionFetchCompletion {
-                    v,
-                    corr_id,
-                    part_id,
-                }))
-            }
-
-            Kind::PartitionFetchCompletionReply => {
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let status = Status::try_from(value[offset]).unwrap();
-
-                Packet::Reply(Reply::PartitionFetchCompletion { corr_id, status })
+            Kind::PartitionFetchCompletionReply
+            | Kind::FetchObjectReply
+            | Kind::GetOpReply
+            | Kind::WriteOpReply
+            | Kind::WhoIsReply => Packet::Reply(Reply::try_from(value).expect("TODO")),
+            Kind::WhoIsRequest
+            | Kind::HeartBeatRequest
+            | Kind::WriteOpRequest
+            | Kind::GetOpRequest
+            | Kind::FetchObjectRequest
+            | Kind::PartitionFetchCompletionRequest => {
+                Packet::Request(Request::try_from(value).expect("TODO"))
             }
         }
     }
@@ -722,15 +474,259 @@ impl Kind {
     }
 }
 
-pub struct Raw<'a>(Cow<'a, [u8]>);
+impl<'a> TryFrom<&'a Raw> for Request<'a> {
+    type Error = ();
 
-impl<'a> Raw<'a> {
-    pub fn owned(buffer: Vec<u8>) -> Self {
-        Self(Cow::Owned(buffer))
+    fn try_from(value: &'a Raw) -> Result<Self, Self::Error> {
+        let mut offset = size_of::<u8>();
+
+        match value.kind() {
+            Kind::WhoIsRequest => {
+                let id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let addr: SocketAddr = std::str::from_utf8(&value[offset..])
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+
+                Ok(Request::WhoIs { id, addr })
+            }
+            Kind::HeartBeatRequest => Ok(Request::HeartBeat),
+            Kind::WriteOpRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
+
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
+
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
+                offset += obj_id_len;
+
+                let op_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
+
+                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len]).unwrap();
+                offset += op_id_len;
+
+                let raw_op = if offset >= value.len() {
+                    &[]
+                } else {
+                    &value[offset..]
+                };
+
+                Ok(Request::WriteOp {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                    op_id,
+                    raw_op,
+                })
+            }
+            Kind::GetOpRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
+
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
+
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
+                offset += obj_id_len;
+
+                let op_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
+
+                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len]).unwrap();
+                offset += op_id_len;
+
+                let raw_op = if offset >= value.len() {
+                    &[]
+                } else {
+                    &value[offset..]
+                };
+
+                Ok(Request::GetOp {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                    op_id,
+                    raw_op,
+                })
+            }
+            Kind::FetchObjectRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+                offset += size_of::<u16>();
+
+                let obj_id_len = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                ) as usize;
+                offset += size_of::<u16>();
+
+                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
+
+                Ok(Request::FetchObject {
+                    v,
+                    corr_id,
+                    part_id,
+                    obj_id,
+                })
+            }
+            Kind::PartitionFetchCompletionRequest => {
+                let v = u128::from_le_bytes(
+                    value[offset..offset + size_of::<u128>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                offset += size_of::<u128>();
+
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let part_id = u16::from_le_bytes(
+                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
+                );
+
+                Ok(Request::PartitionFetchCompletion {
+                    v,
+                    corr_id,
+                    part_id,
+                })
+            }
+
+            Kind::WhoIsReply
+            | Kind::WriteOpReply
+            | Kind::GetOpReply
+            | Kind::FetchObjectReply
+            | Kind::PartitionFetchCompletionReply => Err(()),
+        }
     }
+}
+impl<'a> TryFrom<&'a Raw> for Reply<'a> {
+    type Error = ();
 
-    pub fn borrowed(buffer: &'a [u8]) -> Self {
-        Self(Cow::Borrowed(buffer))
+    fn try_from(value: &'a Raw) -> Result<Self, Self::Error> {
+        let mut offset = size_of::<u8>();
+
+        match value.kind() {
+            Kind::WhoIsReply => Ok(Reply::WhoIs {
+                id: Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap(),
+            }),
+            Kind::WriteOpReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let status = Status::try_from(value[offset]).unwrap();
+
+                Ok(Reply::WriteOp { corr_id, status })
+            }
+            Kind::GetOpReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let status = Status::try_from(value[offset]).unwrap();
+                offset += size_of::<u8>();
+
+                let result = if offset >= value.len() {
+                    &[]
+                } else {
+                    &value[offset..]
+                };
+
+                Ok(Reply::GetOp {
+                    corr_id,
+                    status,
+                    result,
+                })
+            }
+            Kind::FetchObjectReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let status = Status::try_from(value[offset]).unwrap();
+                offset += size_of::<u8>();
+
+                let result = if offset >= value.len() {
+                    &[]
+                } else {
+                    &value[offset..]
+                };
+
+                Ok(Reply::FetchObject {
+                    corr_id,
+                    status,
+                    result,
+                })
+            }
+            Kind::PartitionFetchCompletionReply => {
+                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
+                offset += size_of::<Uuid>();
+
+                let status = Status::try_from(value[offset]).unwrap();
+
+                Ok(Reply::PartitionFetchCompletion { corr_id, status })
+            }
+            Kind::WhoIsRequest
+            | Kind::HeartBeatRequest
+            | Kind::WriteOpRequest
+            | Kind::GetOpRequest
+            | Kind::FetchObjectRequest
+            | Kind::PartitionFetchCompletionRequest => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Raw(Vec<u8>);
+
+impl Raw {
+    pub fn new(buffer: Vec<u8>) -> Self {
+        Self(buffer)
     }
 
     pub fn kind(&self) -> Kind {
@@ -752,7 +748,7 @@ impl<'a> Raw<'a> {
     }
 }
 
-impl<'a> std::ops::Deref for Raw<'a> {
+impl std::ops::Deref for Raw {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {

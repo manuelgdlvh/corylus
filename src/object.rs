@@ -24,7 +24,7 @@ pub trait Raw: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
     fn as_mut_any(&mut self) -> &mut dyn Any;
     fn as_raw(&self) -> Vec<u8>;
-    fn rebuild(&mut self, raw: Vec<u8>);
+    fn rebuild(&mut self, raw: &[u8]);
 }
 
 #[derive(Copy, Clone)]

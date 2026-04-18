@@ -45,13 +45,12 @@ where
         buffer
     }
 
-    fn rebuild(&mut self, raw: Vec<u8>) {
+    fn rebuild(&mut self, raw: &[u8]) {
         let mut result;
         let mut offset = 0;
         if raw.is_empty() {
             result = HashMap::new();
         } else {
-            // TODO: Adapt all others using like this
             let size = u32::from_le_bytes(raw[offset..size_of::<u32>()].try_into().unwrap());
             offset += size_of::<u32>();
 
