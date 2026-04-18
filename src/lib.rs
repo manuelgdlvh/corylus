@@ -36,8 +36,6 @@ pub struct Instance {
     inner: Arc<instance::Inner>,
 }
 
-// TODO: Do architecture overall stabilization procedure
-
 impl Instance {
     fn new(
         id: Uuid,

@@ -195,7 +195,7 @@ impl Registry {
             )?;
 
             let packet_raw = r.read(Some(self.as_ref().config.timeout.read))?;
-            match packet::Reply::try_from(&packet_raw).expect("TODO") {
+            match packet::Reply::try_from(&packet_raw).unwrap() {
                 packet::Reply::WhoIs { id } => {
                     let v = w.v;
                     self.register(id, peer_addr, w);

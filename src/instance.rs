@@ -417,7 +417,7 @@ impl Inner {
             )?;
 
             let raw = response.get(Duration::from_secs(1))?;
-            match Reply::try_from(&raw).expect("TODO") {
+            match Reply::try_from(&raw).unwrap() {
                 Reply::WriteOp { status, .. } => match status {
                     packet::Status::Success => Ok(()),
                     s => Err(CorylusError::try_from(s).unwrap()),
@@ -476,7 +476,7 @@ impl Inner {
 
                     for response in responses {
                         let raw = response.get(Duration::from_secs(1))?;
-                        match Reply::try_from(&raw).expect("TODO") {
+                        match Reply::try_from(&raw).unwrap() {
                             Reply::WriteOp { status, .. } => match status {
                                 packet::Status::Success => Ok(()),
                                 s => Err(CorylusError::try_from(s).unwrap()),
@@ -554,9 +554,8 @@ impl Inner {
             )?;
 
             let raw = response.get(Duration::from_secs(1))?;
-            match Reply::try_from(&raw).expect("TODO") {
+            match Reply::try_from(&raw).unwrap() {
                 packet::Reply::GetOp { status, result, .. } => match status {
-                    // TODO: Check
                     packet::Status::Success => Ok(result.to_vec()),
                     s => Err(CorylusError::try_from(s).unwrap()),
                 },

@@ -40,7 +40,7 @@ impl Task {
                             segments: HashSet<&'a String>,
                         }
 
-                        info!(id = %ref_.id, "STARTED REBALANCE");
+                        info!(id = %ref_.id, "rebalance has started");
 
                         ref_.part_group
                             .set_all_lifecycle(partition::Lifecycle::Migration);
@@ -53,7 +53,6 @@ impl Task {
                                     partition::MembershipChange::MasterChanged { old, new } => {
                                         if new.eq(&ref_.id) {
                                             let old_alive = members.contains(&old);
-                                            // TODO: Check also replicators
                                             if old_alive {
                                                 ready = false;
                                                 fetch.insert(
@@ -148,11 +147,11 @@ impl Task {
                                             },
                                             None,
                                         )
-                                        .expect("TODO: Handle this error");
+                                        .unwrap();
 
                                     response_map
                                         .get_mut(&req.part_id)
-                                        .expect("TODO")
+                                        .unwrap()
                                         .push(FetchResponse::Completion(response));
 
                                     continue;
@@ -171,9 +170,9 @@ impl Task {
                                             },
                                             None,
                                         )
-                                        .expect("TODO: Handle this error");
+                                        .unwrap();
 
-                                    response_map.get_mut(&req.part_id).expect("TODO").push(
+                                    response_map.get_mut(&req.part_id).unwrap().push(
                                         FetchResponse::FetchObject {
                                             obj_id,
                                             resp: response,
@@ -189,14 +188,14 @@ impl Task {
                                             match resp.get(timeout) {
                                                 Ok(raw) => {
                                                     if let Reply::FetchObject { result, .. } =
-                                                        Reply::try_from(&raw).expect("TODO")
+                                                        Reply::try_from(&raw).unwrap()
                                                     {
                                                         ref_.rebuild(
                                                             obj_id,
                                                             part_id as u16,
                                                             result,
                                                         )
-                                                        .expect("TODO");
+                                                        .unwrap();
                                                         fetch
                                                             .get_mut(&part_id)
                                                             .expect("Always available")
@@ -233,10 +232,9 @@ impl Task {
 
                     ref_.part_group.update_version(&members);
                     ref_.part_group.initialize();
-                    // TODO: This should not be needed and was masking errors
                     ref_.part_group
                         .set_all_lifecycle(partition::Lifecycle::Ready);
-                    info!(id = %ref_.id, "REBALANCE FINISHED");
+                    info!(id = %ref_.id, "Rebalance has finished");
                 }
             }
 

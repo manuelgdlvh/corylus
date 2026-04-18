@@ -152,19 +152,26 @@ impl TryFrom<Status> for CorylusError {
     }
 }
 
-// TODO: Check
 impl TryFrom<u8> for Status {
     type Error = ();
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Status::Success),
-            1 => Ok(Status::Success),
+            1 => Ok(Status::Rebalance),
+            2 => Ok(Status::OperationNotFound),
+            3 => Ok(Status::PartitionNotFound),
+            4 => Ok(Status::ObjectNotFound),
+            5 => Ok(Status::IoError),
+            6 => Ok(Status::SerdeInvalidBufferSize),
+            7 => Ok(Status::SerdeUnknown),
+            8 => Ok(Status::SerdeInvalidUtf8),
+            9 => Ok(Status::NotEnoughReplicas),
+            10 => Ok(Status::PartitionNotReady),
             _ => Err(()),
         }
     }
 }
-
 #[derive(Debug, Eq, PartialEq)]
 pub enum Reply<'a> {
     WhoIs {
@@ -388,14 +395,14 @@ impl<'a> From<&'a Raw> for Packet<'a> {
             | Kind::FetchObjectReply
             | Kind::GetOpReply
             | Kind::WriteOpReply
-            | Kind::WhoIsReply => Packet::Reply(Reply::try_from(value).expect("TODO")),
+            | Kind::WhoIsReply => Packet::Reply(Reply::try_from(value).unwrap()),
             Kind::WhoIsRequest
             | Kind::HeartBeatRequest
             | Kind::WriteOpRequest
             | Kind::GetOpRequest
             | Kind::FetchObjectRequest
             | Kind::PartitionFetchCompletionRequest => {
-                Packet::Request(Request::try_from(value).expect("TODO"))
+                Packet::Request(Request::try_from(value).unwrap())
             }
         }
     }

@@ -273,9 +273,8 @@ impl Receiver {
                                 | Kind::GetOpReply
                                 | Kind::WriteOpReply
                                 | Kind::WhoIsReply => {
-                                    let packet = Reply::try_from(&inbound.p).expect("TODO");
-                                    let corr_id = packet.correlation_id();
-                                    if let Some(corr_id) = corr_id
+                                    if let Ok(packet) = Reply::try_from(&inbound.p)
+                                        && let Some(corr_id) = packet.correlation_id()
                                         && let Some(entry) = self.ack_holder.unregister(corr_id)
                                     {
                                         let _ = entry.try_send(inbound.p);
