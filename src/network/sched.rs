@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
+    convert::TryFrom,
     io,
     net::TcpListener,
     thread::{self, JoinHandle},
@@ -55,7 +56,9 @@ pub(crate) fn hb(
                 let mut peer_v = HashMap::new();
                 connected_peers.iter().for_each(|id| {
                     let (v, reconnect) = registry.with_writers_read(|writers| {
-                        let writer = writers.get(id).expect("Checked existence before");
+                        let writer = writers
+                            .get(id)
+                            .expect("writer must exist for each id returned by connected_peers");
                         let reconnect =
                             match writer.write(&Packet::Request(packet::Request::HeartBeat)
                                                , Some(config.timeout.write)) {
@@ -88,13 +91,17 @@ pub(crate) fn hb(
                 });
 
                 connected_peers.iter().for_each(|id| {
-                    let hb = registry.hb(*id).expect("Checked existence before");
+                    let hb = registry
+                        .hb(*id)
+                        .expect("heartbeat Instant must exist for each id in connected_peers");
                     if hb
                         .checked_add(hb_tolerance)
-                        .expect("Always Instant representable")
+                        .expect("heartbeat deadline overflow (last_seen + tolerance)")
                         < Instant::now()
                     {
-                        let v = peer_v.get(id).expect("Checked existence before");
+                        let v = peer_v
+                            .get(id)
+                            .expect("connection version must exist for each id in connected_peers");
                         registry.unregister(*id, *v);
                     }
                 });
@@ -141,9 +148,14 @@ pub(crate) fn listener(config: network::Config, registry: Registry) -> io::Resul
                             }
                         };
 
-                        let (peer_id, peer_addr) = match Packet::from(&who_is_req) {
-                            Packet::Request(packet::Request::WhoIs { id, addr }) => (id, addr),
-                            _ => continue,
+                        let (peer_id, peer_addr) = match Packet::try_from(&who_is_req) {
+                            Ok(Packet::Request(packet::Request::WhoIs { id, addr })) => {
+                                (id, addr)
+                            }
+                            Ok(_) | Err(_) => {
+                                error!(id = %registry.as_ref().id, "Peer connection accept failed: expected WhoIs request");
+                                continue;
+                            }
                         };
 
                         if let Err(err) = w.write(&Packet::Reply(packet::Reply::WhoIs { id: registry.as_ref().id })

@@ -42,6 +42,7 @@ impl Instance {
         net: network::Sender,
         part_group: partition::Group,
         objects: HashMap<object::Id, object::Metadata>,
+        config: instance::Config,
         shutdown: Shutdown,
     ) -> Self {
         let membership = Membership::new();
@@ -50,6 +51,7 @@ impl Instance {
         let inner = Arc::new(instance::Inner {
             id,
             net,
+            config,
             part_group,
             membership,
             objects,

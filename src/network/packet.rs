@@ -1,7 +1,47 @@
 use std::fmt::Display;
+use std::io;
 use std::net::SocketAddr;
 
 use uuid::Uuid;
+
+pub(crate) fn wire_err(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+fn take_slice<'a>(v: &'a [u8], off: &mut usize, len: usize) -> io::Result<&'a [u8]> {
+    let end = off
+        .checked_add(len)
+        .ok_or_else(|| wire_err("packet offset overflow"))?;
+    let r = v
+        .get(*off..end)
+        .ok_or_else(|| wire_err("truncated packet"))?;
+    *off = end;
+    Ok(r)
+}
+
+fn parse_uuid(v: &[u8], off: &mut usize) -> io::Result<Uuid> {
+    let s = take_slice(v, off, 16)?;
+    Uuid::from_slice(s).map_err(|_| wire_err("invalid uuid"))
+}
+
+fn u128_le(v: &[u8], off: &mut usize) -> io::Result<u128> {
+    let b: [u8; 16] = take_slice(v, off, 16)?
+        .try_into()
+        .map_err(|_| wire_err("u128 slice"))?;
+    Ok(u128::from_le_bytes(b))
+}
+
+fn u16_le(v: &[u8], off: &mut usize) -> io::Result<u16> {
+    let b: [u8; 2] = take_slice(v, off, 2)?
+        .try_into()
+        .map_err(|_| wire_err("u16 slice"))?;
+    Ok(u16::from_le_bytes(b))
+}
+
+fn status_byte(value: &[u8], offset: &mut usize) -> io::Result<Status> {
+    let b = take_slice(value, offset, 1)?[0];
+    Status::try_from(b).map_err(|_| wire_err("invalid status byte"))
+}
 
 use crate::{CorylusError, object, partition, serde};
 
@@ -388,21 +428,23 @@ impl From<&Packet<'_>> for Vec<u8> {
     }
 }
 
-impl<'a> From<&'a Raw> for Packet<'a> {
-    fn from(value: &'a Raw) -> Self {
-        match value.kind() {
+impl<'a> TryFrom<&'a Raw> for Packet<'a> {
+    type Error = io::Error;
+
+    fn try_from(value: &'a Raw) -> Result<Self, Self::Error> {
+        match value.try_kind()? {
             Kind::PartitionFetchCompletionReply
             | Kind::FetchObjectReply
             | Kind::GetOpReply
             | Kind::WriteOpReply
-            | Kind::WhoIsReply => Packet::Reply(Reply::try_from(value).unwrap()),
+            | Kind::WhoIsReply => Ok(Packet::Reply(Reply::try_from(value)?)),
             Kind::WhoIsRequest
             | Kind::HeartBeatRequest
             | Kind::WriteOpRequest
             | Kind::GetOpRequest
             | Kind::FetchObjectRequest
             | Kind::PartitionFetchCompletionRequest => {
-                Packet::Request(Request::try_from(value).unwrap())
+                Ok(Packet::Request(Request::try_from(value)?))
             }
         }
     }
@@ -482,58 +524,35 @@ impl Kind {
 }
 
 impl<'a> TryFrom<&'a Raw> for Request<'a> {
-    type Error = ();
+    type Error = io::Error;
 
     fn try_from(value: &'a Raw) -> Result<Self, Self::Error> {
         let mut offset = size_of::<u8>();
 
-        match value.kind() {
+        match value.try_kind()? {
             Kind::WhoIsRequest => {
-                let id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let addr: SocketAddr = std::str::from_utf8(&value[offset..])
-                    .unwrap()
+                let id = parse_uuid(value, &mut offset)?;
+                let rest = &value[offset..];
+                let addr: SocketAddr = std::str::from_utf8(rest)
+                    .map_err(|_| wire_err("invalid utf8 in WhoIs address"))?
                     .parse()
-                    .unwrap();
+                    .map_err(|_| wire_err("invalid socket address in WhoIs"))?;
 
                 Ok(Request::WhoIs { id, addr })
             }
             Kind::HeartBeatRequest => Ok(Request::HeartBeat),
             Kind::WriteOpRequest => {
-                let v = u128::from_le_bytes(
-                    value[offset..offset + size_of::<u128>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                offset += size_of::<u128>();
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let part_id = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                );
-                offset += size_of::<u16>();
-
-                let obj_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
-                offset += obj_id_len;
-
-                let op_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len]).unwrap();
-                offset += op_id_len;
-
+                let v = u128_le(value, &mut offset)?;
+                let corr_id = parse_uuid(value, &mut offset)?;
+                let part_id = u16_le(value, &mut offset)?;
+                let obj_id_len = u16_le(value, &mut offset)? as usize;
+                let obj_id = std::str::from_utf8(take_slice(value, &mut offset, obj_id_len)?)
+                    .map_err(|_| wire_err("invalid utf8 in WriteOp obj_id"))?;
+                let op_id_len = u16_le(value, &mut offset)? as usize;
+                let op_id = std::str::from_utf8(take_slice(value, &mut offset, op_id_len)?)
+                    .map_err(|_| wire_err("invalid utf8 in WriteOp op_id"))?;
                 let raw_op = if offset >= value.len() {
-                    &[]
+                    &[][..]
                 } else {
                     &value[offset..]
                 };
@@ -548,39 +567,17 @@ impl<'a> TryFrom<&'a Raw> for Request<'a> {
                 })
             }
             Kind::GetOpRequest => {
-                let v = u128::from_le_bytes(
-                    value[offset..offset + size_of::<u128>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                offset += size_of::<u128>();
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let part_id = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                );
-                offset += size_of::<u16>();
-
-                let obj_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
-                offset += obj_id_len;
-
-                let op_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let op_id = std::str::from_utf8(&value[offset..offset + op_id_len]).unwrap();
-                offset += op_id_len;
-
+                let v = u128_le(value, &mut offset)?;
+                let corr_id = parse_uuid(value, &mut offset)?;
+                let part_id = u16_le(value, &mut offset)?;
+                let obj_id_len = u16_le(value, &mut offset)? as usize;
+                let obj_id = std::str::from_utf8(take_slice(value, &mut offset, obj_id_len)?)
+                    .map_err(|_| wire_err("invalid utf8 in GetOp obj_id"))?;
+                let op_id_len = u16_le(value, &mut offset)? as usize;
+                let op_id = std::str::from_utf8(take_slice(value, &mut offset, op_id_len)?)
+                    .map_err(|_| wire_err("invalid utf8 in GetOp op_id"))?;
                 let raw_op = if offset >= value.len() {
-                    &[]
+                    &[][..]
                 } else {
                     &value[offset..]
                 };
@@ -595,27 +592,12 @@ impl<'a> TryFrom<&'a Raw> for Request<'a> {
                 })
             }
             Kind::FetchObjectRequest => {
-                let v = u128::from_le_bytes(
-                    value[offset..offset + size_of::<u128>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                offset += size_of::<u128>();
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let part_id = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                );
-                offset += size_of::<u16>();
-
-                let obj_id_len = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                ) as usize;
-                offset += size_of::<u16>();
-
-                let obj_id = std::str::from_utf8(&value[offset..offset + obj_id_len]).unwrap();
+                let v = u128_le(value, &mut offset)?;
+                let corr_id = parse_uuid(value, &mut offset)?;
+                let part_id = u16_le(value, &mut offset)?;
+                let obj_id_len = u16_le(value, &mut offset)? as usize;
+                let obj_id = std::str::from_utf8(take_slice(value, &mut offset, obj_id_len)?)
+                    .map_err(|_| wire_err("invalid utf8 in FetchObject obj_id"))?;
 
                 Ok(Request::FetchObject {
                     v,
@@ -625,19 +607,9 @@ impl<'a> TryFrom<&'a Raw> for Request<'a> {
                 })
             }
             Kind::PartitionFetchCompletionRequest => {
-                let v = u128::from_le_bytes(
-                    value[offset..offset + size_of::<u128>()]
-                        .try_into()
-                        .unwrap(),
-                );
-                offset += size_of::<u128>();
-
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let part_id = u16::from_le_bytes(
-                    value[offset..offset + size_of::<u16>()].try_into().unwrap(),
-                );
+                let v = u128_le(value, &mut offset)?;
+                let corr_id = parse_uuid(value, &mut offset)?;
+                let part_id = u16_le(value, &mut offset)?;
 
                 Ok(Request::PartitionFetchCompletion {
                     v,
@@ -650,37 +622,32 @@ impl<'a> TryFrom<&'a Raw> for Request<'a> {
             | Kind::WriteOpReply
             | Kind::GetOpReply
             | Kind::FetchObjectReply
-            | Kind::PartitionFetchCompletionReply => Err(()),
+            | Kind::PartitionFetchCompletionReply => Err(wire_err("expected request packet")),
         }
     }
 }
 impl<'a> TryFrom<&'a Raw> for Reply<'a> {
-    type Error = ();
+    type Error = io::Error;
 
     fn try_from(value: &'a Raw) -> Result<Self, Self::Error> {
         let mut offset = size_of::<u8>();
 
-        match value.kind() {
+        match value.try_kind()? {
             Kind::WhoIsReply => Ok(Reply::WhoIs {
-                id: Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap(),
+                id: parse_uuid(value, &mut offset)?,
             }),
             Kind::WriteOpReply => {
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let status = Status::try_from(value[offset]).unwrap();
+                let corr_id = parse_uuid(value, &mut offset)?;
+                let status = status_byte(value, &mut offset)?;
 
                 Ok(Reply::WriteOp { corr_id, status })
             }
             Kind::GetOpReply => {
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let status = Status::try_from(value[offset]).unwrap();
-                offset += size_of::<u8>();
+                let corr_id = parse_uuid(value, &mut offset)?;
+                let status = status_byte(value, &mut offset)?;
 
                 let result = if offset >= value.len() {
-                    &[]
+                    &[][..]
                 } else {
                     &value[offset..]
                 };
@@ -692,14 +659,11 @@ impl<'a> TryFrom<&'a Raw> for Reply<'a> {
                 })
             }
             Kind::FetchObjectReply => {
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let status = Status::try_from(value[offset]).unwrap();
-                offset += size_of::<u8>();
+                let corr_id = parse_uuid(value, &mut offset)?;
+                let status = status_byte(value, &mut offset)?;
 
                 let result = if offset >= value.len() {
-                    &[]
+                    &[][..]
                 } else {
                     &value[offset..]
                 };
@@ -711,10 +675,8 @@ impl<'a> TryFrom<&'a Raw> for Reply<'a> {
                 })
             }
             Kind::PartitionFetchCompletionReply => {
-                let corr_id = Uuid::from_slice(&value[offset..offset + size_of::<Uuid>()]).unwrap();
-                offset += size_of::<Uuid>();
-
-                let status = Status::try_from(value[offset]).unwrap();
+                let corr_id = parse_uuid(value, &mut offset)?;
+                let status = status_byte(value, &mut offset)?;
 
                 Ok(Reply::PartitionFetchCompletion { corr_id, status })
             }
@@ -723,7 +685,7 @@ impl<'a> TryFrom<&'a Raw> for Reply<'a> {
             | Kind::WriteOpRequest
             | Kind::GetOpRequest
             | Kind::FetchObjectRequest
-            | Kind::PartitionFetchCompletionRequest => Err(()),
+            | Kind::PartitionFetchCompletionRequest => Err(wire_err("expected reply packet")),
         }
     }
 }
@@ -736,21 +698,25 @@ impl Raw {
         Self(buffer)
     }
 
-    pub fn kind(&self) -> Kind {
-        let discriminant = self.0[0];
+    pub fn try_kind(&self) -> io::Result<Kind> {
+        let discriminant = self
+            .0
+            .first()
+            .copied()
+            .ok_or_else(|| wire_err("empty packet buffer"))?;
         match discriminant {
-            1 => Kind::WhoIsRequest,
-            2 => Kind::WhoIsReply,
-            3 => Kind::HeartBeatRequest,
-            6 => Kind::WriteOpRequest,
-            7 => Kind::WriteOpReply,
-            8 => Kind::GetOpRequest,
-            9 => Kind::GetOpReply,
-            10 => Kind::FetchObjectRequest,
-            11 => Kind::FetchObjectReply,
-            12 => Kind::PartitionFetchCompletionRequest,
-            13 => Kind::PartitionFetchCompletionReply,
-            _ => panic!("Unknown packet"),
+            1 => Ok(Kind::WhoIsRequest),
+            2 => Ok(Kind::WhoIsReply),
+            3 => Ok(Kind::HeartBeatRequest),
+            6 => Ok(Kind::WriteOpRequest),
+            7 => Ok(Kind::WriteOpReply),
+            8 => Ok(Kind::GetOpRequest),
+            9 => Ok(Kind::GetOpReply),
+            10 => Ok(Kind::FetchObjectRequest),
+            11 => Ok(Kind::FetchObjectReply),
+            12 => Ok(Kind::PartitionFetchCompletionRequest),
+            13 => Ok(Kind::PartitionFetchCompletionReply),
+            _ => Err(wire_err("unknown packet discriminant")),
         }
     }
 }

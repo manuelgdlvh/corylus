@@ -58,7 +58,9 @@ macro_rules! impl_fixed_serde {
                 if buffer.len() != N {
                     return Err(serde::Error::InvalidBufferSize);
                 }
-                Ok(<$t>::from_le_bytes(buffer.try_into().unwrap()))
+                Ok(<$t>::from_le_bytes(buffer.try_into().expect(
+                    "infallible: buffer.len() already checked for this fixed-size type",
+                )))
             }
         }
     };

@@ -20,8 +20,12 @@ pub fn should_put_and_get_map_successfully(
     instance_1: Instance,
     instance_2: Instance,
 ) -> CorylusResult<()> {
-    let map_1 = instance_1.get_map::<String, String>("str-str").unwrap();
-    let map_2 = instance_2.get_map::<String, String>("str-str").unwrap();
+    let map_1 = instance_1
+        .get_map::<String, String>("str-str")
+        .expect("fixture registers str-str map");
+    let map_2 = instance_2
+        .get_map::<String, String>("str-str")
+        .expect("fixture registers str-str map");
 
     // Local write
     map_1.put("key-1".to_string(), "value-1".to_string())?;

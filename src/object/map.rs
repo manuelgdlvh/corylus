@@ -51,21 +51,33 @@ where
         if raw.is_empty() {
             result = HashMap::new();
         } else {
-            let size = u32::from_le_bytes(raw[offset..size_of::<u32>()].try_into().unwrap());
+            let size = u32::from_le_bytes(
+                raw[offset..offset + size_of::<u32>()]
+                    .try_into()
+                    .expect("4-byte slice: header count length"),
+            );
             offset += size_of::<u32>();
 
             result = HashMap::with_capacity(size as usize);
             for _ in 0..size {
-                let key_len =
-                    u32::from_le_bytes(raw[offset..offset + size_of::<u32>()].try_into().unwrap());
+                let key_len = u32::from_le_bytes(
+                    raw[offset..offset + size_of::<u32>()]
+                        .try_into()
+                        .expect("4-byte slice: entry key length"),
+                );
                 offset += size_of::<u32>();
-                let key = K::deserialize(&raw[offset..offset + key_len as usize]).unwrap();
+                let key = K::deserialize(&raw[offset..offset + key_len as usize])
+                    .expect("map snapshot key deserialize failed (corrupt or incompatible data)");
                 offset += key_len as usize;
 
-                let value_len =
-                    u32::from_le_bytes(raw[offset..offset + size_of::<u32>()].try_into().unwrap());
+                let value_len = u32::from_le_bytes(
+                    raw[offset..offset + size_of::<u32>()]
+                        .try_into()
+                        .expect("4-byte slice: entry value length"),
+                );
                 offset += size_of::<u32>();
-                let value = V::deserialize(&raw[offset..offset + value_len as usize]).unwrap();
+                let value = V::deserialize(&raw[offset..offset + value_len as usize])
+                    .expect("map snapshot value deserialize failed (corrupt or incompatible data)");
                 offset += value_len as usize;
 
                 result.insert(key, value);
@@ -133,7 +145,7 @@ where
         let map = segment
             .as_mut_any()
             .downcast_mut::<HashMap<K, V>>()
-            .expect("segment is not HashMap<K,V>");
+            .expect("Write target segment must be HashMap<K,V> for this operation");
 
         map.insert(self.key.clone(), self.value.clone());
     }
@@ -150,7 +162,11 @@ where
                 "buffer too short for key length",
             ));
         }
-        let key_len = u32::from_be_bytes(val[pos..pos + 4].try_into().unwrap()) as usize;
+        let key_len = u32::from_be_bytes(
+            val[pos..pos + 4]
+                .try_into()
+                .expect("exactly 4 bytes: checked val.len() >= pos + 4 above"),
+        ) as usize;
         pos += 4;
 
         if val.len() < pos + key_len {
@@ -169,7 +185,11 @@ where
                 "buffer too short for value length",
             ));
         }
-        let val_len = u32::from_be_bytes(val[pos..pos + 4].try_into().unwrap()) as usize;
+        let val_len = u32::from_be_bytes(
+            val[pos..pos + 4]
+                .try_into()
+                .expect("exactly 4 bytes: checked val.len() >= pos + 4 above"),
+        ) as usize;
         pos += 4;
 
         if val.len() < pos + val_len {
@@ -241,7 +261,7 @@ where
         let map = segment
             .as_any()
             .downcast_ref::<HashMap<K, V>>()
-            .expect("segment is not HashMap<K,V>");
+            .expect("Read target segment must be HashMap<K,V> for this operation");
 
         match map.get(&self.key) {
             Some(val) => val.serialize(),
@@ -263,7 +283,11 @@ where
                 "buffer too short for key length",
             ));
         }
-        let key_len = u32::from_be_bytes(val[pos..pos + 4].try_into().unwrap()) as usize;
+        let key_len = u32::from_be_bytes(
+            val[pos..pos + 4]
+                .try_into()
+                .expect("exactly 4 bytes: checked val.len() >= pos + 4 above"),
+        ) as usize;
         pos += 4;
 
         if val.len() < pos + key_len {

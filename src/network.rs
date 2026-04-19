@@ -50,20 +50,20 @@ impl AckHolder {
         }
     }
 
-    pub(crate) fn register(&self, corr_id: Uuid) -> Response<'_> {
+    pub(crate) fn register(&self, corr_id: Uuid, recv_timeout: Duration) -> Response<'_> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.entries
             .lock()
-            .expect("Cannot be poisoned")
+            .expect("ack correlation map mutex poisoned")
             .insert(corr_id, tx);
 
-        Response::new(corr_id, self, rx)
+        Response::new(corr_id, self, rx, recv_timeout)
     }
 
     pub(crate) fn unregister(&self, corr_id: Uuid) -> Option<SyncSender<packet::Raw>> {
         self.entries
             .lock()
-            .expect("Cannot be poisoned")
+            .expect("ack correlation map mutex poisoned")
             .remove(&corr_id)
     }
 }
@@ -72,6 +72,7 @@ pub struct Response<'a> {
     corr_id: Uuid,
     reg: &'a AckHolder,
     receiver: mpsc::Receiver<packet::Raw>,
+    recv_timeout: Duration,
 }
 
 impl<'a> Response<'a> {
@@ -79,15 +80,21 @@ impl<'a> Response<'a> {
         corr_id: Uuid,
         reg: &'a AckHolder,
         receiver: mpsc::Receiver<packet::Raw>,
+        recv_timeout: Duration,
     ) -> Self {
         Self {
             corr_id,
             reg,
             receiver,
+            recv_timeout,
         }
     }
 
-    pub fn get(&self, timeout: Duration) -> Result<packet::Raw, io::Error> {
+    pub fn get(&self) -> Result<packet::Raw, io::Error> {
+        self.get_with_timeout(self.recv_timeout)
+    }
+
+    pub fn get_with_timeout(&self, timeout: Duration) -> Result<packet::Raw, io::Error> {
         self.receiver
             .recv_timeout(timeout)
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
@@ -107,40 +114,35 @@ pub struct Sender {
 }
 
 impl Sender {
-    pub fn request_sync(
-        &self,
-        id: Uuid,
-        packet: packet::Request,
-        timeout: Option<Duration>,
-    ) -> io::Result<Response<'_>> {
+    pub(crate) fn read_timeout(&self) -> Duration {
+        self.registry.as_ref().config.timeout.read
+    }
+
+    fn write_timeout(&self) -> Option<Duration> {
+        Some(self.registry.as_ref().config.timeout.write)
+    }
+
+    pub fn request_sync(&self, id: Uuid, packet: packet::Request) -> io::Result<Response<'_>> {
         if let Some(corr_id) = packet.correlation_id() {
-            let response = self.ack_holder.register(corr_id);
-            self.send_internal(id, Packet::Request(packet), timeout)?;
+            let recv_timeout = self.read_timeout();
+            let response = self.ack_holder.register(corr_id, recv_timeout);
+            self.send_internal(id, Packet::Request(packet))?;
             Ok(response)
         } else {
             unreachable!("All packets must have informed correlation_id")
         }
     }
 
-    pub fn request(
-        &self,
-        id: Uuid,
-        packet: packet::Request,
-        timeout: Option<Duration>,
-    ) -> io::Result<()> {
-        self.send_internal(id, Packet::Request(packet), timeout)
+    pub fn request(&self, id: Uuid, packet: packet::Request) -> io::Result<()> {
+        self.send_internal(id, Packet::Request(packet))
     }
 
-    pub fn reply(
-        &self,
-        id: Uuid,
-        packet: packet::Reply,
-        timeout: Option<Duration>,
-    ) -> io::Result<()> {
-        self.send_internal(id, Packet::Reply(packet), timeout)
+    pub fn reply(&self, id: Uuid, packet: packet::Reply) -> io::Result<()> {
+        self.send_internal(id, Packet::Reply(packet))
     }
 
-    fn send_internal(&self, id: Uuid, packet: Packet, timeout: Option<Duration>) -> io::Result<()> {
+    fn send_internal(&self, id: Uuid, packet: Packet) -> io::Result<()> {
+        let timeout = self.write_timeout();
         let (result, v) = self.registry.with_writers_read(|writers| {
             if let Some(writer) = writers.get(&id) {
                 match writer.write(&packet, timeout) {
@@ -232,19 +234,18 @@ impl Receiver {
             None => Some(
                 self.rx_msg
                     .recv()
-                    .expect("There is always a sender available"),
+                    .expect("network message channel closed (sender dropped before receiver)"),
             ),
         }
     }
 
     pub fn start(self, instance: instance::Weak) -> io::Result<JoinHandle<()>> {
-        let task_executor = task::Executor::new();
-
-        let id = instance
+        let inner = instance
             .as_ref()
             .upgrade()
-            .expect("No possibility to be destroyed yet")
-            .id;
+            .expect("Instance dropped before packet receiver thread started");
+        let id = inner.id;
+        let task_executor = task::Executor::new(inner.config.task);
 
         thread::Builder::new()
             .name(format!("pckt-receiver-{}", id))
@@ -257,28 +258,38 @@ impl Receiver {
 
                     if let Some(message) = self.recv(Some(Duration::from_secs(1))) {
                         match message {
-                            Message::Packet(inbound) => match inbound.p.kind() {
-                                Kind::WhoIsRequest
-                                | Kind::GetOpRequest
-                                | Kind::FetchObjectRequest => {
-                                    task_executor.spawn(instance.clone(), Task::Read(inbound));
-                                }
-                                Kind::HeartBeatRequest
-                                | Kind::WriteOpRequest
-                                | Kind::PartitionFetchCompletionRequest => {
-                                    task_executor.spawn(instance.clone(), Task::Write(inbound));
-                                }
-                                Kind::PartitionFetchCompletionReply
-                                | Kind::FetchObjectReply
-                                | Kind::GetOpReply
-                                | Kind::WriteOpReply
-                                | Kind::WhoIsReply => {
-                                    if let Ok(packet) = Reply::try_from(&inbound.p)
-                                        && let Some(corr_id) = packet.correlation_id()
-                                        && let Some(entry) = self.ack_holder.unregister(corr_id)
-                                    {
-                                        let _ = entry.try_send(inbound.p);
+                            Message::Packet(inbound) => match inbound.p.try_kind() {
+                                Ok(kind) => match kind {
+                                    Kind::WhoIsRequest
+                                    | Kind::GetOpRequest
+                                    | Kind::FetchObjectRequest => {
+                                        task_executor.spawn(instance.clone(), Task::Read(inbound));
                                     }
+                                    Kind::HeartBeatRequest
+                                    | Kind::WriteOpRequest
+                                    | Kind::PartitionFetchCompletionRequest => {
+                                        task_executor.spawn(instance.clone(), Task::Write(inbound));
+                                    }
+                                    Kind::PartitionFetchCompletionReply
+                                    | Kind::FetchObjectReply
+                                    | Kind::GetOpReply
+                                    | Kind::WriteOpReply
+                                    | Kind::WhoIsReply => match Reply::try_from(&inbound.p) {
+                                        Ok(packet) => {
+                                            if let Some(corr_id) = packet.correlation_id()
+                                                && let Some(entry) =
+                                                    self.ack_holder.unregister(corr_id)
+                                            {
+                                                let _ = entry.try_send(inbound.p);
+                                            }
+                                        }
+                                        Err(err) => {
+                                            warn!(err = %err, "Invalid reply packet");
+                                        }
+                                    },
+                                },
+                                Err(err) => {
+                                    warn!(err = %err, "Invalid packet discriminant");
                                 }
                             },
                             Message::Event(event) => match event {
