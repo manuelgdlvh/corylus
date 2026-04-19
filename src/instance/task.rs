@@ -9,7 +9,7 @@ use crate::{
 use rayon::ThreadPoolBuilder;
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -90,7 +90,9 @@ impl Task {
                                         .part_group
                                         .replicas_of(part_id as u64, 1)
                                         .first()
-                                        .expect("CHECK");
+                                        .expect(
+                                            "replicas_of(..., 1) must return one replica for fetch",
+                                        );
                                     fetch.insert(
                                         part_id,
                                         FetchEntry {
@@ -123,7 +125,7 @@ impl Task {
                                 continue 'rebalance;
                             }
 
-                            let mut timeout = Duration::from_secs(2);
+                            let mut timeout = ref_.config.partition.rebalance_timeout;
                             let start = Instant::now();
                             let mut response_map = HashMap::new();
                             for (part_id, req) in fetch.iter() {
@@ -136,48 +138,51 @@ impl Task {
                                     Vec::with_capacity(req.segments.len().max(1)),
                                 );
                                 if req.segments.is_empty() {
-                                    let response = ref_
-                                        .net
-                                        .request_sync(
-                                            req.member_id,
-                                            packet::Request::PartitionFetchCompletion {
-                                                v,
-                                                corr_id: Uuid::new_v4(),
-                                                part_id: *part_id as u16,
-                                            },
-                                            None,
-                                        )
-                                        .unwrap();
-
-                                    response_map
-                                        .get_mut(&req.part_id)
-                                        .unwrap()
-                                        .push(FetchResponse::Completion(response));
+                                    match ref_.net.request_sync(
+                                        req.member_id,
+                                        packet::Request::PartitionFetchCompletion {
+                                            v,
+                                            corr_id: Uuid::new_v4(),
+                                            part_id: *part_id as u16,
+                                        },
+                                    ) {
+                                        Ok(response) => {
+                                            if let Some(entry) = response_map.get_mut(&req.part_id)
+                                            {
+                                                entry.push(FetchResponse::Completion(response));
+                                            }
+                                        }
+                                        Err(err) => {
+                                            error!(err = %err, "PartitionFetchCompletion request failed");
+                                        }
+                                    }
 
                                     continue;
                                 }
 
                                 for &obj_id in req.segments.iter() {
-                                    let response = ref_
-                                        .net
-                                        .request_sync(
-                                            req.member_id,
-                                            packet::Request::FetchObject {
-                                                v,
-                                                corr_id: Uuid::new_v4(),
-                                                part_id: req.part_id as u16,
-                                                obj_id,
-                                            },
-                                            None,
-                                        )
-                                        .unwrap();
-
-                                    response_map.get_mut(&req.part_id).unwrap().push(
-                                        FetchResponse::FetchObject {
+                                    match ref_.net.request_sync(
+                                        req.member_id,
+                                        packet::Request::FetchObject {
+                                            v,
+                                            corr_id: Uuid::new_v4(),
+                                            part_id: req.part_id as u16,
                                             obj_id,
-                                            resp: response,
                                         },
-                                    );
+                                    ) {
+                                        Ok(response) => {
+                                            if let Some(entry) = response_map.get_mut(&req.part_id)
+                                            {
+                                                entry.push(FetchResponse::FetchObject {
+                                                    obj_id,
+                                                    resp: response,
+                                                });
+                                            }
+                                        }
+                                        Err(err) => {
+                                            error!(err = %err, "FetchObject request failed");
+                                        }
+                                    }
                                 }
                             }
 
@@ -185,31 +190,37 @@ impl Task {
                                 for entry in responses {
                                     match entry {
                                         FetchResponse::FetchObject { obj_id, resp } => {
-                                            match resp.get(timeout) {
-                                                Ok(raw) => {
-                                                    if let Reply::FetchObject { result, .. } =
-                                                        Reply::try_from(&raw).unwrap()
-                                                    {
-                                                        ref_.rebuild(
+                                            match resp.get_with_timeout(timeout) {
+                                                Ok(raw) => match Reply::try_from(&raw) {
+                                                    Ok(Reply::FetchObject { result, .. }) => {
+                                                        if let Err(err) = ref_.rebuild(
                                                             obj_id,
                                                             part_id as u16,
                                                             result,
-                                                        )
-                                                        .unwrap();
-                                                        fetch
-                                                            .get_mut(&part_id)
-                                                            .expect("Always available")
-                                                            .segments
-                                                            .remove(obj_id);
+                                                        ) {
+                                                            error!(err = %err, "rebuild failed");
+                                                        } else if let Some(entry) =
+                                                            fetch.get_mut(&part_id)
+                                                        {
+                                                            entry.segments.remove(obj_id);
+                                                        }
                                                     }
-                                                }
+                                                    Ok(_) => {
+                                                        error!(
+                                                            "unexpected reply variant for FetchObject"
+                                                        );
+                                                    }
+                                                    Err(err) => {
+                                                        error!(err = %err, "FetchObject reply decode failed");
+                                                    }
+                                                },
                                                 Err(err) => {
                                                     error!(err = %err, "Fetch object error");
                                                 }
                                             }
                                         }
                                         FetchResponse::Completion(resp) => {
-                                            match resp.get(timeout) {
+                                            match resp.get_with_timeout(timeout) {
                                                 Ok(_) => {
                                                     pending_partitions.remove(&part_id);
                                                     ref_.part_group.set_lifecycle(
@@ -268,7 +279,6 @@ impl Task {
                                         status,
                                         result: &result,
                                     },
-                                    None,
                                 );
                             }
                         }
@@ -292,7 +302,6 @@ impl Task {
                                         status,
                                         result: &result,
                                     },
-                                    None,
                                 );
                             }
                         }
@@ -327,9 +336,7 @@ impl Task {
                                     .map(|_| Status::Success)
                                     .unwrap_or_else(Status::from);
 
-                                let _ =
-                                    ref_.net
-                                        .reply(from, Reply::WriteOp { corr_id, status }, None);
+                                let _ = ref_.net.reply(from, Reply::WriteOp { corr_id, status });
                             }
                         }
                         Request::PartitionFetchCompletion {
@@ -346,7 +353,6 @@ impl Task {
                                         corr_id,
                                         status: Status::Success,
                                     },
-                                    None,
                                 );
                             }
                         }
@@ -369,24 +375,24 @@ pub struct Executor {
 
 impl Default for Executor {
     fn default() -> Self {
-        Self::new()
+        Self::new(instance::TaskConfig::default())
     }
 }
 
 impl Executor {
-    pub fn new() -> Self {
+    pub fn new(task: instance::TaskConfig) -> Self {
         let vacuum = ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
-            .expect("Failed to build thread pool");
+            .expect("rayon vacuum thread pool: OS refused or thread count invalid");
         let read = ThreadPoolBuilder::new()
-            .num_threads(16)
+            .num_threads(task.read_threads)
             .build()
-            .expect("Failed to build thread pool");
+            .expect("rayon read-ops thread pool: OS refused or thread count invalid");
         let write = ThreadPoolBuilder::new()
-            .num_threads(4)
+            .num_threads(task.write_threads)
             .build()
-            .expect("Failed to build thread pool");
+            .expect("rayon write-ops thread pool: OS refused or thread count invalid");
 
         Self {
             vacuum,

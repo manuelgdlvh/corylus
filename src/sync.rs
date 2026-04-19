@@ -21,7 +21,7 @@ impl<T: Default + Eq + PartialEq + Copy + Copy> State<T> {
     }
 
     pub fn await_until(&self, status: T, timeout: Option<Duration>) -> bool {
-        let state = self.state.lock().expect("Cannot be poisoned");
+        let state = self.state.lock().expect("sync::State inner mutex poisoned");
         if status.eq(&*state) {
             return true;
         }
@@ -37,7 +37,7 @@ impl<T: Default + Eq + PartialEq + Copy + Copy> State<T> {
 
     pub fn update(&self, value: T) {
         {
-            let mut state = self.state.lock().expect("Cannot be poisoned");
+            let mut state = self.state.lock().expect("sync::State inner mutex poisoned");
             *state = value;
         }
 

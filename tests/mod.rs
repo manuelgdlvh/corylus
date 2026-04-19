@@ -49,6 +49,8 @@ fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
                 },
                 ..Default::default()
             },
+            partition: Default::default(),
+            task: Default::default(),
         })
         .with_discovery(Discovery::List {
             addresses: vec![
@@ -70,6 +72,8 @@ fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
                 },
                 ..Default::default()
             },
+            partition: Default::default(),
+            task: Default::default(),
         })
         .with_discovery(Discovery::List {
             addresses: vec![

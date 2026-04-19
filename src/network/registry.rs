@@ -42,7 +42,9 @@ impl Limiter {
         addr.hash(&mut hasher);
         let id = (hasher.finish() as usize) & (CONN_STRIPES_LEN - 1);
 
-        let _guard = &self.stripes[id].lock().expect("Cannot be poisoned");
+        let _guard = &self.stripes[id]
+            .lock()
+            .expect("connection limiter stripe mutex poisoned");
         f()
     }
 }
@@ -93,12 +95,12 @@ impl Registry {
             .as_ref()
             .addrs
             .lock()
-            .expect("Cannot be poisoned")
+            .expect("peer addrs mutex poisoned")
             .insert(peer_id, *peer_addr);
         self.as_ref()
             .writers
             .write()
-            .expect("Cannot be poisoned")
+            .expect("peer writers RwLock poisoned")
             .insert(peer_id, writer);
         if old_addr.is_none()
             && let Err(err) = self
@@ -115,7 +117,7 @@ impl Registry {
             .as_ref()
             .writers
             .write()
-            .expect("Cannot be poisoned")
+            .expect("peer writers RwLock poisoned")
             .entry(peer_id)
         {
             std::collections::hash_map::Entry::Occupied(entry) => {
@@ -133,7 +135,7 @@ impl Registry {
         self.as_ref()
             .addrs
             .lock()
-            .expect("Cannot be poisoned")
+            .expect("peer addrs mutex poisoned")
             .remove_entry(&peer_id);
         let _ = self
             .as_ref()
@@ -147,7 +149,7 @@ impl Registry {
         self.as_ref()
             .writers
             .read()
-            .expect("Cannot be poisoned")
+            .expect("peer writers RwLock poisoned")
             .get(&id)
             .map(|w| w.v)
     }
@@ -195,7 +197,7 @@ impl Registry {
             )?;
 
             let packet_raw = r.read(Some(self.as_ref().config.timeout.read))?;
-            match packet::Reply::try_from(&packet_raw).unwrap() {
+            match packet::Reply::try_from(&packet_raw)? {
                 packet::Reply::WhoIs { id } => {
                     let v = w.v;
                     self.register(id, peer_addr, w);
@@ -219,7 +221,11 @@ impl Registry {
     }
 
     fn peer_id_from_addr(&self, addr: &SocketAddr) -> Option<Uuid> {
-        let addrs = self.as_ref().addrs.lock().expect("Cannot be poisoned");
+        let addrs = self
+            .as_ref()
+            .addrs
+            .lock()
+            .expect("peer addrs mutex poisoned");
         for (id, peer_addr) in addrs.iter() {
             if addr.eq(peer_addr) {
                 return Some(*id);
@@ -241,7 +247,7 @@ impl Registry {
         self.as_ref()
             .addrs
             .lock()
-            .expect("Cannot be poisoned")
+            .expect("peer addrs mutex poisoned")
             .get(&id)
             .copied()
     }
@@ -266,7 +272,11 @@ impl Registry {
     where
         F: Fn(RwLockReadGuard<'_, HashMap<Uuid, PeerWrite>>) -> O,
     {
-        let guard = self.as_ref().writers.read().expect("Cannot be poisoned");
+        let guard = self
+            .as_ref()
+            .writers
+            .read()
+            .expect("peer writers RwLock poisoned");
         f(guard)
     }
 }
@@ -290,18 +300,21 @@ impl PeerWrite {
 
     pub fn write(&self, packet: &Packet, timeout: Option<Duration>) -> io::Result<()> {
         let raw: Vec<u8> = packet.into();
-        let mut stream = self.stream.lock().expect("Cannot be poisoned");
+        let mut stream = self
+            .stream
+            .lock()
+            .expect("PeerWrite TcpStream mutex poisoned");
         stream.set_write_timeout(timeout)?;
         stream.write_all(raw.as_slice())
     }
 
     pub fn update_hb(&self) {
-        let mut hb = self.hb.lock().expect("Cannot be poisoned");
+        let mut hb = self.hb.lock().expect("PeerWrite heartbeat mutex poisoned");
         *hb = Instant::now();
     }
 
     pub fn hb(&self) -> Instant {
-        *self.hb.lock().expect("Cannot be poisoned")
+        *self.hb.lock().expect("PeerWrite heartbeat mutex poisoned")
     }
 }
 
@@ -349,7 +362,13 @@ impl PeerRead {
 
                     match self.read(Some(registry.as_ref().config.timeout.read)) {
                         Ok(packet) => {
-                            let kind = packet.kind();
+                            let kind = match packet.try_kind() {
+                                Ok(k) => k,
+                                Err(err) => {
+                                    error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, err = %err, "Invalid packet kind");
+                                    continue;
+                                }
+                            };
                             if matches!(kind, packet::Kind::HeartBeatRequest) {
                                 info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "Heartbeat packet received");
                                 registry.update_hb(peer_id);

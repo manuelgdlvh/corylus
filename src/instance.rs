@@ -122,15 +122,21 @@ impl Builder<Ready> {
     }
 
     pub fn build(self) -> io::Result<Instance> {
-        let id = self.id.expect("Forced to always be filled");
-        let d = self.d.expect("Forced to always be filled");
-        let c = self.c.expect("Forced to always be filled");
+        let id = self
+            .id
+            .expect("Builder<Ready>: with_id must have been called");
+        let d = self
+            .d
+            .expect("Builder<Ready>: with_discovery must have been called");
+        let c = self
+            .c
+            .expect("Builder<Ready>: with_config must have been called");
 
         let shutdown = Shutdown::new();
 
         let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
         let partition = partition::Group::new(id, self.segment_fns.as_slice());
-        let instance = Instance::new(id, net_sender, partition, self.objects, shutdown.clone());
+        let instance = Instance::new(id, net_sender, partition, self.objects, c, shutdown.clone());
 
         shutdown.register(net_receiver.start(instance.downgrade())?);
 
@@ -170,7 +176,10 @@ mod shutdown {
         where
             F: FnOnce(&mut Vec<JoinHandle<()>>) -> O,
         {
-            let mut handles = self.handles.lock().expect("Cannot be poisoned");
+            let mut handles = self
+                .handles
+                .lock()
+                .expect("shutdown join-handles mutex poisoned");
             f(&mut handles)
         }
 
@@ -223,8 +232,44 @@ impl Shutdown {
     }
 }
 
+/// Thread pool sizing for inbound packet tasks. Rebalance uses a fixed single-thread pool.
+#[derive(Clone, Copy)]
+pub struct TaskConfig {
+    pub read_threads: usize,
+    pub write_threads: usize,
+}
+
+impl Default for TaskConfig {
+    fn default() -> Self {
+        Self {
+            read_threads: 16,
+            write_threads: 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PartitionConfig {
+    /// Initial budget for partition fetch / completion waits during rebalance (shared across responses in one iteration).
+    pub rebalance_timeout: Duration,
+    /// Max time to wait for partition readiness before read/write paths fail.
+    pub ready_timeout: Duration,
+}
+
+impl Default for PartitionConfig {
+    fn default() -> Self {
+        Self {
+            rebalance_timeout: Duration::from_secs(2),
+            ready_timeout: Duration::from_secs(3),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 pub struct Config {
     pub network: network::Config,
+    pub partition: PartitionConfig,
+    pub task: TaskConfig,
 }
 
 #[derive(Clone)]
@@ -258,12 +303,12 @@ impl Membership {
     }
 
     pub(crate) fn remove(&self, id: Uuid) {
-        let mut members = self.0.lock().expect("Cannot be poisoned");
+        let mut members = self.0.lock().expect("cluster membership mutex poisoned");
         members.remove(&id);
     }
 
     pub(crate) fn add(&self, id: Uuid) {
-        let mut members = self.0.lock().expect("Cannot be poisoned");
+        let mut members = self.0.lock().expect("cluster membership mutex poisoned");
         members.insert(id);
     }
 
@@ -271,7 +316,7 @@ impl Membership {
         let mut member_ids = self
             .0
             .lock()
-            .expect("Cannot be poisoned")
+            .expect("cluster membership mutex poisoned")
             .iter()
             .copied()
             .collect::<Vec<_>>();
@@ -280,13 +325,17 @@ impl Membership {
     }
 
     pub(crate) fn size(&self) -> usize {
-        self.0.lock().expect("Cannot be poisoned").len()
+        self.0
+            .lock()
+            .expect("cluster membership mutex poisoned")
+            .len()
     }
 }
 
 pub struct Inner {
     pub(crate) id: Uuid,
     pub(crate) net: network::Sender,
+    pub(crate) config: Config,
     pub(crate) part_group: partition::Group,
     pub(crate) objects: HashMap<object::Id, object::Metadata>,
     pub(crate) membership: Membership,
@@ -337,7 +386,7 @@ impl Inner {
         }
 
         self.part_group
-            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
         if !self.part_group.version().eq(&v) {
             return Err(partition::Error::Rebalance.into());
         }
@@ -369,7 +418,7 @@ impl Inner {
         // If partition version is correct is ensured that this node is master or replica.
 
         self.part_group
-            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
         if !self.part_group.version().eq(&v) {
             return Err(partition::Error::Rebalance.into());
         }
@@ -391,7 +440,7 @@ impl Inner {
         let part_id = self.part_group.partition_of(&key);
 
         self.part_group
-            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
         let owner = self.part_group.owner_of(part_id);
 
         if self.id.eq(&owner) {
@@ -413,14 +462,19 @@ impl Inner {
                     op_id: op.id(),
                     raw_op: &raw_op,
                 },
-                None,
             )?;
 
-            let raw = response.get(Duration::from_secs(1))?;
-            match Reply::try_from(&raw).unwrap() {
+            let raw: packet::Raw = response.get()?;
+            let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
+            match reply {
                 Reply::WriteOp { status, .. } => match status {
                     packet::Status::Success => Ok(()),
-                    s => Err(CorylusError::try_from(s).unwrap()),
+                    s => Err(CorylusError::try_from(s).unwrap_or_else(|_| {
+                        CorylusError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid WriteOp status",
+                        ))
+                    })),
                 },
                 _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),
             }
@@ -469,17 +523,22 @@ impl Inner {
                                 op_id: op.id(),
                                 raw_op: &raw_op,
                             },
-                            None,
                         )?;
                         responses.push(response);
                     }
 
                     for response in responses {
-                        let raw = response.get(Duration::from_secs(1))?;
-                        match Reply::try_from(&raw).unwrap() {
+                        let raw = response.get()?;
+                        let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
+                        match reply {
                             Reply::WriteOp { status, .. } => match status {
                                 packet::Status::Success => Ok(()),
-                                s => Err(CorylusError::try_from(s).unwrap()),
+                                s => Err(CorylusError::try_from(s).unwrap_or_else(|_| {
+                                    CorylusError::Io(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "invalid WriteOp status",
+                                    ))
+                                })),
                             },
                             _ => {
                                 Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")
@@ -500,7 +559,6 @@ impl Inner {
                                 op_id: op.id(),
                                 raw_op: &raw_op,
                             },
-                            None,
                         )?;
                     }
                 }
@@ -519,7 +577,7 @@ impl Inner {
         let part_id = self.part_group.partition_of(&key);
 
         self.part_group
-            .await_ready(part_id as usize, Some(Duration::from_secs(3)))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
         let owner = self.part_group.owner_of(part_id);
 
         let metadata = self
@@ -550,14 +608,19 @@ impl Inner {
                     op_id: op.id(),
                     raw_op: &raw_op,
                 },
-                None,
             )?;
 
-            let raw = response.get(Duration::from_secs(1))?;
-            match Reply::try_from(&raw).unwrap() {
+            let raw = response.get()?;
+            let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
+            match reply {
                 packet::Reply::GetOp { status, result, .. } => match status {
                     packet::Status::Success => Ok(result.to_vec()),
-                    s => Err(CorylusError::try_from(s).unwrap()),
+                    s => Err(CorylusError::try_from(s).unwrap_or_else(|_| {
+                        CorylusError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid GetOp status",
+                        ))
+                    })),
                 },
                 _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),
             }

@@ -93,7 +93,7 @@ impl Group {
         let metadata = partition
             .metadata
             .read()
-            .expect("Critical section cannot be poisoned");
+            .expect("partition metadata RwLock poisoned");
 
         metadata.master_id
     }
@@ -107,7 +107,7 @@ impl Group {
         let metadata = partition
             .metadata
             .read()
-            .expect("Critical section cannot be poisoned");
+            .expect("partition metadata RwLock poisoned");
 
         metadata.replica_ids[0..size].to_vec()
     }
@@ -124,7 +124,7 @@ impl Group {
             let p_metadata = partition
                 .metadata
                 .read()
-                .expect("Critical section cannot be poisoned");
+                .expect("partition metadata RwLock poisoned");
 
             p_metadata.replica_ids[0..repl_factor].contains(&member_id)
         }
@@ -155,7 +155,10 @@ impl Group {
     }
 
     pub fn update_version(&self, member_ids: &[Uuid]) {
-        let mut version = self.version.lock().expect("Cannot be poisoned");
+        let mut version = self
+            .version
+            .lock()
+            .expect("partition group version mutex poisoned");
         *version = partition::version(member_ids);
     }
 
@@ -176,9 +179,9 @@ impl Group {
         let segment = partition
             .segments
             .get(obj_id)
-            .expect("existence is a precondtion")
+            .expect("segment must exist for object id (caller precondition)")
             .read()
-            .expect("Cannot be poisoned");
+            .expect("segment RwLock poisoned");
         Ok(f(&segment))
     }
 
@@ -199,15 +202,18 @@ impl Group {
         let mut segment = partition
             .segments
             .get(obj_id)
-            .expect("existence is a precondtion")
+            .expect("segment must exist for object id (caller precondition)")
             .write()
-            .expect("Cannot be poisoned");
+            .expect("segment RwLock poisoned");
         f(&mut segment);
         Ok(())
     }
 
     pub fn version(&self) -> u128 {
-        *self.version.lock().expect("Cannot be poisoned")
+        *self
+            .version
+            .lock()
+            .expect("partition group version mutex poisoned")
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -252,7 +258,7 @@ impl Partition {
         let mut metadata = self
             .metadata
             .write()
-            .expect("Critical section cannot be poisoned");
+            .expect("partition metadata RwLock poisoned");
         let (master_id, replica_ids) = members_rank(metadata.id, member_ids);
         metadata.update(master_id, replica_ids)
     }
@@ -357,7 +363,7 @@ fn members_rank(part_id: usize, member_ids: &[Uuid]) -> (Uuid, Vec<Uuid>) {
 
     let master_id = top_k
         .pop()
-        .expect("No zero member list previously checked")
+        .expect("BinaryHeap must yield master: member_ids was non-empty")
         .1;
 
     let replicas_len = top_k.len();
@@ -365,7 +371,7 @@ fn members_rank(part_id: usize, member_ids: &[Uuid]) -> (Uuid, Vec<Uuid>) {
     for _ in 0..replicas_len {
         let replica_id = top_k
             .pop()
-            .expect("Replica availability previously checked")
+            .expect("BinaryHeap pop count must match replica slot count")
             .1;
 
         replica_ids.push(replica_id);
