@@ -1,4 +1,5 @@
 use crate::network::packet::{Kind, Reply};
+use crate::runtime::{Logger, Spawner};
 use crate::{
     instance::{
         self, Shutdown,
@@ -239,7 +240,10 @@ impl Receiver {
         }
     }
 
-    pub fn start(self, instance: instance::Weak) -> io::Result<JoinHandle<()>> {
+    pub fn start<S: Spawner, L: Logger>(
+        self,
+        instance: instance::Weak<S, L>,
+    ) -> io::Result<JoinHandle<()>> {
         let inner = instance
             .as_ref()
             .upgrade()

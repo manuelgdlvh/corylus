@@ -5,12 +5,14 @@ use uuid::Uuid;
 use crate::{
     instance::{Membership, Shutdown},
     object::DistributedMap,
+    runtime::{Logger, Spawner},
 };
 
 pub mod instance;
 pub mod network;
 pub mod object;
 pub mod partition;
+pub mod runtime;
 pub mod serde;
 mod sync;
 
@@ -32,13 +34,14 @@ pub enum CorylusError {
 }
 
 #[derive(Clone)]
-pub struct Instance {
-    inner: Arc<instance::Inner>,
+pub struct Instance<S: Spawner, L: Logger> {
+    inner: Arc<instance::Inner<S, L>>,
 }
 
-impl Instance {
+impl<S: Spawner, L: Logger> Instance<S, L> {
     fn new(
         id: Uuid,
+        runtime: runtime::Context<S, L>,
         net: network::Sender,
         part_group: partition::Group,
         objects: HashMap<object::Id, object::Metadata>,
@@ -50,6 +53,7 @@ impl Instance {
 
         let inner = Arc::new(instance::Inner {
             id,
+            runtime,
             net,
             config,
             part_group,
@@ -61,7 +65,7 @@ impl Instance {
         Self { inner }
     }
 
-    fn downgrade(&self) -> instance::Weak {
+    fn downgrade(&self) -> instance::Weak<S, L> {
         instance::Weak::new(Arc::downgrade(&self.inner))
     }
 
@@ -77,7 +81,7 @@ impl Instance {
         self.inner.id
     }
 
-    pub fn get_map<K, V>(&self, id: &str) -> Option<DistributedMap<K, V>>
+    pub fn get_map<K, V>(&self, id: &str) -> Option<DistributedMap<K, V, S, L>>
     where
         K: map::Key,
         V: map::Value,

@@ -9,8 +9,6 @@ use std::{
 
 use uuid::Uuid;
 
-use crate::network::packet::Reply;
-use crate::object::operation;
 use crate::{
     CorylusError, CorylusResult, Instance,
     network::{
@@ -22,7 +20,10 @@ use crate::{
         map::{Get, Put},
     },
     partition::{self, Segment},
+    runtime::Logger,
 };
+use crate::{network::packet::Reply, runtime::Spawner};
+use crate::{object::operation, runtime};
 
 pub mod task;
 
@@ -121,7 +122,11 @@ impl Builder<Ready> {
         self
     }
 
-    pub fn build(self) -> io::Result<Instance> {
+    pub fn build<S: runtime::Spawner, L: runtime::Logger>(
+        self,
+        spawner: S,
+        logger: L,
+    ) -> io::Result<Instance<S, L>> {
         let id = self
             .id
             .expect("Builder<Ready>: with_id must have been called");
@@ -136,7 +141,16 @@ impl Builder<Ready> {
 
         let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
         let partition = partition::Group::new(id, self.segment_fns.as_slice());
-        let instance = Instance::new(id, net_sender, partition, self.objects, c, shutdown.clone());
+        let runtime = runtime::Context::new(spawner, logger);
+        let instance = Instance::new(
+            id,
+            runtime,
+            net_sender,
+            partition,
+            self.objects,
+            c,
+            shutdown.clone(),
+        );
 
         shutdown.register(net_receiver.start(instance.downgrade())?);
 
@@ -285,18 +299,18 @@ pub struct Config {
 }
 
 #[derive(Clone)]
-pub struct Weak {
-    inner: sync::Weak<Inner>,
+pub struct Weak<S: Spawner, L: Logger> {
+    inner: sync::Weak<Inner<S, L>>,
 }
 
-impl Weak {
-    pub fn new(inner: sync::Weak<Inner>) -> Self {
+impl<S: Spawner, L: Logger> Weak<S, L> {
+    pub fn new(inner: sync::Weak<Inner<S, L>>) -> Self {
         Self { inner }
     }
 }
 
-impl AsRef<sync::Weak<Inner>> for Weak {
-    fn as_ref(&self) -> &sync::Weak<Inner> {
+impl<S: Spawner, L: Logger> AsRef<sync::Weak<Inner<S, L>>> for Weak<S, L> {
+    fn as_ref(&self) -> &sync::Weak<Inner<S, L>> {
         &self.inner
     }
 }
@@ -344,8 +358,9 @@ impl Membership {
     }
 }
 
-pub struct Inner {
+pub struct Inner<S: Spawner, L: Logger> {
     pub(crate) id: Uuid,
+    pub(crate) runtime: runtime::Context<S, L>,
     pub(crate) net: network::Sender,
     pub(crate) config: Config,
     pub(crate) part_group: partition::Group,
@@ -354,13 +369,13 @@ pub struct Inner {
     pub(crate) shutdown: Shutdown,
 }
 
-impl Drop for Inner {
+impl<S: Spawner, L: Logger> Drop for Inner<S, L> {
     fn drop(&mut self) {
         self.shutdown.destroy();
     }
 }
 
-impl Inner {
+impl<S: Spawner, L: Logger> Inner<S, L> {
     pub(crate) fn rebuild(&self, obj_id: &str, part_id: u16, raw: &[u8]) -> CorylusResult<()> {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));

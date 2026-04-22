@@ -11,6 +11,7 @@ use corylus::{
     network::{self, Discovery},
     object,
     partition::{self},
+    runtime::{self, ThreadSpawner},
 };
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
@@ -21,6 +22,13 @@ mod map;
 mod rebalance;
 #[path = "cases/repl.rs"]
 mod repl;
+
+#[derive(Copy, Clone, Default)]
+pub struct TracingLogger {}
+
+impl runtime::Logger for TracingLogger {
+    fn log(&self, message: &str, level: runtime::LogLevel) {}
+}
 
 pub static WITH_INSTANCES_LOCK: Mutex<()> = Mutex::new(());
 
@@ -54,7 +62,7 @@ pub(crate) fn new_instance(
             ],
         })
         .with_map::<String, String>("str-str", repl_config)
-        .build()
+        .build(ThreadSpawner::default(), TracingLogger::default())
 }
 
 fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(

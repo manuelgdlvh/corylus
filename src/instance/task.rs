@@ -1,5 +1,6 @@
 use crate::network::Response;
 use crate::network::packet::{Inbound, Reply, Request, Status};
+use crate::runtime::{Logger, Spawner};
 use crate::{
     CorylusError,
     instance::{self},
@@ -21,7 +22,7 @@ pub enum Task {
 }
 
 impl Task {
-    pub fn execute(self, instance: instance::Weak) {
+    pub fn execute<S: Spawner, L: Logger>(self, instance: instance::Weak<S, L>) {
         match self {
             Self::PartitionRebalance => {
                 if let Some(ref_) = instance.as_ref().upgrade() {
@@ -406,7 +407,7 @@ impl Executor {
             write,
         }
     }
-    pub fn spawn(&self, instance: instance::Weak, task: Task) {
+    pub fn spawn<S: Spawner, L: Logger>(&self, instance: instance::Weak<S, L>, task: Task) {
         let pool = match task {
             Task::PartitionRebalance => &self.vacuum,
             Task::Read { .. } => &self.read,
