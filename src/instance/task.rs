@@ -42,31 +42,31 @@ impl Task {
 
                         info!(id = %ref_.id, "rebalance has started");
 
-                        ref_.part_group
-                            .set_all_lifecycle(partition::Lifecycle::Migration);
+                        ref_.part_group.with_partitions_read(|part| {
+                            part.set_state(partition::Lifecycle::Ready);
+                        });
 
                         let mut fetch: HashMap<usize, FetchEntry> = HashMap::new();
-                        for (part_id, changes) in ref_.part_group.update(members.as_slice()) {
+                        for (part_id, changes) in
+                            ref_.part_group.update_partitions(members.as_slice())
+                        {
                             let mut ready = true;
                             for change in changes {
                                 match change {
                                     partition::MembershipChange::MasterChanged { old, new } => {
-                                        if new.eq(&ref_.id) {
-                                            let old_alive = members.contains(&old);
-                                            if old_alive {
-                                                ready = false;
-                                                fetch.insert(
+                                        if new.eq(&ref_.id) && members.contains(&old) {
+                                            ready = false;
+                                            fetch.insert(
+                                                part_id,
+                                                FetchEntry {
                                                     part_id,
-                                                    FetchEntry {
-                                                        part_id,
-                                                        member_id: old,
-                                                        segments: ref_
-                                                            .objects
-                                                            .keys()
-                                                            .collect::<HashSet<_>>(),
-                                                    },
-                                                );
-                                            }
+                                                    member_id: old,
+                                                    segments: ref_
+                                                        .objects
+                                                        .keys()
+                                                        .collect::<HashSet<_>>(),
+                                                },
+                                            );
                                         }
 
                                         if old.eq(&ref_.id) {
@@ -84,7 +84,10 @@ impl Task {
                             if ready {
                                 if ref_.part_group.is_initialized() {
                                     ref_.part_group
-                                        .set_lifecycle(part_id, partition::Lifecycle::Ready);
+                                        .with_partition_read(part_id, |part| {
+                                            part.set_state(partition::Lifecycle::Ready)
+                                        })
+                                        .expect("partition must exist");
                                 } else if ref_.part_group.owner_of(part_id as u64).eq(&ref_.id) {
                                     let member_id = *ref_
                                         .part_group
@@ -120,7 +123,7 @@ impl Task {
                                 break 'rebalance;
                             }
 
-                            // Some peers changed in the meeantime, restarting process
+                            // Some peers changed in the meantime, restarting process
                             if !members.eq(&ref_.membership.all()) {
                                 continue 'rebalance;
                             }
@@ -223,10 +226,13 @@ impl Task {
                                             match resp.get_with_timeout(timeout) {
                                                 Ok(_) => {
                                                     pending_partitions.remove(&part_id);
-                                                    ref_.part_group.set_lifecycle(
-                                                        part_id,
-                                                        partition::Lifecycle::Ready,
-                                                    );
+                                                    ref_.part_group
+                                                        .with_partition_read(part_id, |part| {
+                                                            part.set_state(
+                                                                partition::Lifecycle::Ready,
+                                                            );
+                                                        })
+                                                        .expect("partition must exist");
                                                 }
                                                 Err(err) => {
                                                     error!(err = %err, "Partition Completion error");
@@ -244,7 +250,8 @@ impl Task {
                     ref_.part_group.update_version(&members);
                     ref_.part_group.initialize();
                     ref_.part_group
-                        .set_all_lifecycle(partition::Lifecycle::Ready);
+                        .with_partitions_read(|part| part.set_state(partition::Lifecycle::Ready));
+
                     info!(id = %ref_.id, "Rebalance has finished");
                 }
             }
@@ -345,8 +352,7 @@ impl Task {
                             part_id,
                         } => {
                             if let Some(ref_) = instance.as_ref().upgrade() {
-                                ref_.part_group
-                                    .set_lifecycle(part_id as usize, partition::Lifecycle::Ready);
+                                // Delete obsolete data.
                                 let _ = ref_.net.reply(
                                     from,
                                     Reply::PartitionFetchCompletion {

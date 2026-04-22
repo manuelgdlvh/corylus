@@ -136,6 +136,7 @@ pub enum Status {
     SerdeInvalidUtf8 = 8,
     NotEnoughReplicas = 9,
     PartitionNotReady = 10,
+    NotEnoughMembers = 11,
 }
 
 impl From<CorylusError> for Status {
@@ -147,6 +148,7 @@ impl From<CorylusError> for Status {
                 partition::Error::Rebalance => Status::Rebalance,
                 partition::Error::NotEnoughReplicas => Status::NotEnoughReplicas,
                 partition::Error::PartitionNotReady => Status::PartitionNotReady,
+                partition::Error::NotEnoughMembers => Status::NotEnoughMembers,
             },
             CorylusError::Object(err) => match err {
                 Error::OperationNotFound => Status::OperationNotFound,
@@ -188,6 +190,9 @@ impl TryFrom<Status> for CorylusError {
             Status::PartitionNotReady => {
                 Ok(CorylusError::Partition(partition::Error::PartitionNotReady))
             }
+            Status::NotEnoughMembers => {
+                Ok(CorylusError::Partition(partition::Error::NotEnoughMembers))
+            }
         }
     }
 }
@@ -208,6 +213,7 @@ impl TryFrom<u8> for Status {
             8 => Ok(Status::SerdeInvalidUtf8),
             9 => Ok(Status::NotEnoughReplicas),
             10 => Ok(Status::PartitionNotReady),
+            11 => Ok(Status::NotEnoughMembers),
             _ => Err(()),
         }
     }

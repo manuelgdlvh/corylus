@@ -20,12 +20,14 @@ const PARTITION_HASH_SEED: u64 = 1234;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Partition not found ")]
+    #[error("Partition not found")]
     PartitionNotFound,
     #[error("Partition not ready")]
     PartitionNotReady,
     #[error("Rebalance in progress")]
     Rebalance,
+    #[error("Not enough members")]
+    NotEnoughMembers,
     #[error("Not enough replicas")]
     NotEnoughReplicas,
 }
@@ -130,18 +132,28 @@ impl Group {
         }
     }
 
-    pub fn set_all_lifecycle(&self, lifecycle: Lifecycle) {
-        for part_id in 0..RING_CAPACITY {
-            self.set_lifecycle(part_id, lifecycle);
+    pub fn with_partition_read<F, O>(&self, part_id: usize, f: F) -> Result<O, Error>
+    where
+        F: FnOnce(&Partition) -> O,
+    {
+        if part_id >= RING_CAPACITY {
+            return Err(Error::PartitionNotFound);
+        }
+
+        let partition = &self.partitions[part_id];
+        Ok(f(partition))
+    }
+
+    pub fn with_partitions_read<F>(&self, f: F)
+    where
+        F: Fn(&Partition),
+    {
+        for part in self.partitions.iter() {
+            f(part);
         }
     }
 
-    pub fn set_lifecycle(&self, part_id: usize, lifecycle: Lifecycle) {
-        let partition = &self.partitions[part_id];
-        partition.state.update(lifecycle);
-    }
-
-    pub fn update(&self, member_ids: &[Uuid]) -> HashMap<usize, Vec<MembershipChange>> {
+    pub fn update_partitions(&self, member_ids: &[Uuid]) -> HashMap<usize, Vec<MembershipChange>> {
         let mut result = HashMap::with_capacity(RING_CAPACITY);
         for part_id in 0..RING_CAPACITY {
             let partition = &self.partitions[part_id];
@@ -254,13 +266,17 @@ impl Partition {
         self
     }
 
-    fn update(&self, member_ids: &[Uuid]) -> Vec<MembershipChange> {
+    pub fn update(&self, member_ids: &[Uuid]) -> Vec<MembershipChange> {
         let mut metadata = self
             .metadata
             .write()
             .expect("partition metadata RwLock poisoned");
         let (master_id, replica_ids) = members_rank(metadata.id, member_ids);
         metadata.update(master_id, replica_ids)
+    }
+
+    pub fn set_state(&self, lifecycle: Lifecycle) {
+        self.state.update(lifecycle);
     }
 
     pub fn await_ready(&self, timeout: Option<Duration>) -> bool {

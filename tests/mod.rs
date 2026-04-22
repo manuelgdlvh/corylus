@@ -1,4 +1,5 @@
 use std::{
+    io,
     net::{Ipv4Addr, SocketAddr},
     sync::Mutex,
     thread::sleep,
@@ -14,15 +15,46 @@ use corylus::{
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
 
+#[path = "cases/map.rs"]
 mod map;
+#[path = "cases/rebalance.rs"]
+mod rebalance;
+#[path = "cases/repl.rs"]
 mod repl;
 
 pub static WITH_INSTANCES_LOCK: Mutex<()> = Mutex::new(());
 
-fn with_instances_no_repl<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
-    f: F,
-) -> CorylusResult<()> {
-    with_instances(f, object::ReplicationConfig::default())
+pub(crate) fn new_instance(
+    id: Uuid,
+    port: u16,
+    repl_config: object::ReplicationConfig,
+) -> io::Result<Instance> {
+    instance::Builder::new()
+        .with_id(id)
+        .with_config(instance::Config {
+            network: network::Config {
+                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                hb: network::HeartbeatConfig {
+                    poll_interval: Duration::from_secs(1),
+                    tolerance: Duration::from_secs(3),
+                },
+                ..Default::default()
+            },
+            cluster: Default::default(),
+            partition: Default::default(),
+            task: Default::default(),
+        })
+        .with_discovery(Discovery::List {
+            addresses: vec![
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 8092)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 8093)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 8094)),
+            ],
+        })
+        .with_map::<String, String>("str-str", repl_config)
+        .build()
 }
 
 fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
@@ -34,78 +66,29 @@ fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
     let subscriber = FmtSubscriber::new();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    let id_1 = Uuid::from_u128(1);
-    let id_2 = Uuid::from_u128(2);
-    let version = partition::version(&[id_1, id_2]);
+    let instance_1 = new_instance(Uuid::from_u128(1), 8090, repl_config)?;
+    let instance_2 = new_instance(Uuid::from_u128(2), 8091, repl_config)?;
 
-    let instance_1 = instance::Builder::new()
-        .with_id(Uuid::from_u128(1))
-        .with_config(instance::Config {
-            network: network::Config {
-                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                hb: network::HeartbeatConfig {
-                    poll_interval: Duration::from_secs(1),
-                    tolerance: Duration::from_secs(3),
-                },
-                ..Default::default()
-            },
-            partition: Default::default(),
-            task: Default::default(),
-        })
-        .with_discovery(Discovery::List {
-            addresses: vec![
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-            ],
-        })
-        .with_map::<String, String>("str-str", repl_config)
-        .build()?;
-
-    let instance_2 = instance::Builder::new()
-        .with_id(Uuid::from_u128(2))
-        .with_config(instance::Config {
-            network: network::Config {
-                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-                hb: network::HeartbeatConfig {
-                    poll_interval: Duration::from_secs(1),
-                    tolerance: Duration::from_secs(3),
-                },
-                ..Default::default()
-            },
-            partition: Default::default(),
-            task: Default::default(),
-        })
-        .with_discovery(Discovery::List {
-            addresses: vec![
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 8090)),
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 8091)),
-            ],
-        })
-        .with_map::<String, String>("str-str", repl_config)
-        .build()?;
-
-    wait_until(
-        || {
-            instance_1.members().iter().any(|id| id.eq(&id_2))
-                && instance_1.part_group_version() == version
-        },
-        Duration::from_millis(100),
-        Duration::from_secs(10),
-    );
-
-    wait_until(
-        || {
-            instance_2.members().iter().any(|id| id.eq(&id_1))
-                && instance_2.part_group_version() == version
-        },
-        Duration::from_millis(100),
-        Duration::from_secs(10),
-    );
+    wait_until_ready(&[&instance_1, &instance_2]);
 
     f(instance_1, instance_2)
 }
 
-fn wait_until<F>(f: F, poll_interval: Duration, timeout: Duration)
+pub(crate) fn wait_until_ready(instances: &[&Instance]) {
+    let mut member_ids = instances.iter().map(|inst| inst.id()).collect::<Vec<_>>();
+    member_ids.sort_unstable();
+
+    let version = partition::version(member_ids.as_slice());
+    for inst in instances {
+        wait_until(
+            || inst.part_group_version() == version,
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+        );
+    }
+}
+
+pub(crate) fn wait_until<F>(f: F, poll_interval: Duration, timeout: Duration)
 where
     F: Fn() -> bool,
 {
@@ -129,15 +112,15 @@ mod tests {
     mod map {
         use corylus::CorylusResult;
 
-        use crate::{map, with_instances_no_repl};
+        use crate::{map, with_instances};
         #[test]
         pub fn should_register_map_successfully() -> CorylusResult<()> {
-            with_instances_no_repl(map::should_register_map_successfully)
+            with_instances(map::should_register_map_successfully, Default::default())
         }
 
         #[test]
         pub fn should_put_and_get_map_successfully() -> CorylusResult<()> {
-            with_instances_no_repl(map::should_put_and_get_map_successfully)
+            with_instances(map::should_put_and_get_map_successfully, Default::default())
         }
     }
 
@@ -159,6 +142,20 @@ mod tests {
             with_instances(
                 repl::should_read_fail_when_sync_repl_and_no_allow_replica_read,
                 ReplicationConfig::synchronous(1, false),
+            )
+        }
+    }
+
+    mod rebalance {
+        use corylus::CorylusResult;
+
+        use crate::{rebalance, with_instances};
+
+        #[test]
+        pub fn should_transfer_partition_ownership_after_rebalance() -> CorylusResult<()> {
+            with_instances(
+                rebalance::should_transfer_partition_ownership_after_rebalance,
+                Default::default(),
             )
         }
     }

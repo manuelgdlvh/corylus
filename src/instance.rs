@@ -265,11 +265,23 @@ impl Default for PartitionConfig {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ClusterConfig {
+    pub min_size: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self { min_size: 1 }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct Config {
     pub network: network::Config,
     pub partition: PartitionConfig,
     pub task: TaskConfig,
+    pub cluster: ClusterConfig,
 }
 
 #[derive(Clone)]
@@ -436,6 +448,11 @@ impl Inner {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
+
+        if self.config.cluster.min_size > self.membership.size() {
+            return Err(CorylusError::Partition(partition::Error::NotEnoughMembers));
+        }
+
         let key = op.partition_key();
         let part_id = self.part_group.partition_of(&key);
 

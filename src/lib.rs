@@ -73,6 +73,10 @@ impl Instance {
         self.inner.part_group.version()
     }
 
+    pub fn id(&self) -> Uuid {
+        self.inner.id
+    }
+
     pub fn get_map<K, V>(&self, id: &str) -> Option<DistributedMap<K, V>>
     where
         K: map::Key,
