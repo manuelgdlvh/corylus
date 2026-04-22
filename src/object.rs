@@ -1,5 +1,5 @@
 use crate::object::operation::{ReadBuilder, WriteBuilder};
-use crate::runtime::{Logger, Spawner};
+use crate::runtime::Logger;
 use crate::{
     CorylusResult,
     instance::{self},
@@ -107,26 +107,24 @@ impl Metadata {
     }
 }
 
-pub struct DistributedMap<K, V, S, L>
+pub struct DistributedMap<K, V, L>
 where
     K: map::Key,
     V: map::Value,
-    S: Spawner,
     L: Logger,
 {
-    instance: instance::Weak<S, L>,
+    instance: instance::Weak<L>,
     id: String,
     _state: PhantomData<(K, V)>,
 }
 
-impl<K, V, S, L> DistributedMap<K, V, S, L>
+impl<K, V, L> DistributedMap<K, V, L>
 where
     K: map::Key,
     V: map::Value,
-    S: Spawner,
     L: Logger,
 {
-    pub fn new(id: String, instance: instance::Weak<S, L>) -> Self {
+    pub fn new(id: String, instance: instance::Weak<L>) -> Self {
         Self {
             id,
             instance,

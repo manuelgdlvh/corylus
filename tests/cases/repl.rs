@@ -1,4 +1,6 @@
-use corylus::{CorylusResult, Instance};
+use corylus::CorylusResult;
+
+use crate::Instance;
 
 pub fn should_read_success_when_sync_repl_and_allow_replica_read(
     instance_1: Instance,

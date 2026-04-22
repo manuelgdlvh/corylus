@@ -7,11 +7,11 @@ use std::{
 };
 
 use corylus::{
-    CorylusResult, Instance, instance,
+    CorylusResult, instance,
     network::{self, Discovery},
     object,
     partition::{self},
-    runtime::{self, ThreadSpawner},
+    runtime,
 };
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
@@ -27,8 +27,28 @@ mod repl;
 pub struct TracingLogger {}
 
 impl runtime::Logger for TracingLogger {
-    fn log(&self, message: &str, level: runtime::LogLevel) {}
+    fn info(&self, message: std::fmt::Arguments<'_>) {
+        tracing::event!(tracing::Level::INFO, "{}", message);
+    }
+
+    fn debug(&self, message: std::fmt::Arguments<'_>) {
+        tracing::event!(tracing::Level::DEBUG, "{}", message);
+    }
+
+    fn trace(&self, message: std::fmt::Arguments<'_>) {
+        tracing::event!(tracing::Level::TRACE, "{}", message);
+    }
+
+    fn warn(&self, message: std::fmt::Arguments<'_>) {
+        tracing::event!(tracing::Level::WARN, "{}", message);
+    }
+
+    fn error(&self, message: std::fmt::Arguments<'_>) {
+        tracing::event!(tracing::Level::ERROR, "{}", message);
+    }
 }
+
+pub type Instance = corylus::Instance<TracingLogger>;
 
 pub static WITH_INSTANCES_LOCK: Mutex<()> = Mutex::new(());
 
@@ -62,7 +82,7 @@ pub(crate) fn new_instance(
             ],
         })
         .with_map::<String, String>("str-str", repl_config)
-        .build(ThreadSpawner::default(), TracingLogger::default())
+        .build(TracingLogger::default())
 }
 
 fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(

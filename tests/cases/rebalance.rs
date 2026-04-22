@@ -1,6 +1,7 @@
-use corylus::{CorylusResult, Instance};
+use corylus::CorylusResult;
 use uuid::Uuid;
 
+use crate::Instance;
 use crate::{new_instance, wait_until_ready};
 
 pub fn should_transfer_partition_ownership_after_rebalance(

@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::network::packet::Inbound;
@@ -23,6 +22,7 @@ use crate::{
         self, Message,
         packet::{self, Event, PACKET_LENGTH, Packet},
     },
+    runtime::Logger,
 };
 
 const CONN_STRIPES_LEN: usize = 8;
@@ -50,38 +50,41 @@ impl Limiter {
 }
 
 #[derive(Clone)]
-pub(crate) struct Registry {
-    inner: Arc<Inner>,
+pub(crate) struct Registry<L: Logger> {
+    inner: Arc<Inner<L>>,
 }
 
-pub(crate) struct Inner {
+pub(crate) struct Inner<L: Logger> {
     pub(crate) id: Uuid,
     pub(crate) config: network::Config,
     pub(crate) tx_msg: SyncSender<Message>,
     pub(crate) sigterm: Shutdown,
+    pub(crate) logger: L,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
     writers: RwLock<HashMap<Uuid, PeerWrite>>,
     limiter: Limiter,
 }
 
-impl AsRef<Inner> for Registry {
-    fn as_ref(&self) -> &Inner {
+impl<L: Logger> AsRef<Inner<L>> for Registry<L> {
+    fn as_ref(&self) -> &Inner<L> {
         &self.inner
     }
 }
 
-impl Registry {
+impl<L: Logger> Registry<L> {
     pub fn new(
         id: Uuid,
         config: network::Config,
         tx_msg: SyncSender<Message>,
         sigterm: Shutdown,
+        logger: L,
     ) -> Self {
         let inner = Arc::new(Inner {
             id,
             config,
             tx_msg,
             sigterm,
+            logger,
             addrs: Mutex::new(HashMap::new()),
             writers: RwLock::new(HashMap::new()),
             limiter: Limiter::new(),
@@ -108,7 +111,10 @@ impl Registry {
                 .tx_msg
                 .send(Message::Event(Event::PeerAdded { id: peer_id }))
         {
-            error!(err = %err, "Peer added event enqueue failed");
+            self.as_ref().logger.error(format_args!(
+                "Peer added event enqueue failed. Err: {}.",
+                err
+            ));
         }
     }
 
@@ -142,7 +148,11 @@ impl Registry {
             .tx_msg
             .send(Message::Event(Event::PeerRemoved { id: peer_id }));
 
-        info!(id = %self.as_ref().id, peer_id = %peer_id, "Peer disconnected successfully");
+        self.as_ref().logger.info(format_args!(
+            "Peer disconnected successfully. Id: {}. Peer id: {}.",
+            self.as_ref().id,
+            peer_id
+        ));
     }
 
     pub fn version(&self, id: Uuid) -> Option<u64> {
@@ -338,9 +348,9 @@ impl PeerRead {
         Ok(packet::Raw::new(payload_buffer))
     }
 
-    pub fn start(
+    pub fn start<L: Logger>(
         mut self,
-        registry: Registry,
+        registry: Registry<L>,
         peer_id: Uuid,
         version: u64,
     ) -> io::Result<JoinHandle<()>> {
@@ -348,7 +358,12 @@ impl PeerRead {
             .name(format!("tcp-{}-{}", peer_id, version))
             .stack_size(128 * 1024)
             .spawn(move || {
-                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "tcp connection initialized");
+                registry.as_ref().logger.info(format_args!(
+                    "TCP connection initialized. Id: {}. Peer id: {}. V: {}.",
+                    registry.as_ref().id,
+                    peer_id,
+                    version
+                ));
 
                 loop {
                     match registry.version(peer_id) {
@@ -365,17 +380,35 @@ impl PeerRead {
                             let kind = match packet.try_kind() {
                                 Ok(k) => k,
                                 Err(err) => {
-                                    error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, err = %err, "Invalid packet kind");
+                                    registry.as_ref().logger.error(format_args!(
+                                        "Invalid packet kind. Id: {}. Peer id: {}. V: {}. Err: {}.",
+                                        registry.as_ref().id,
+                                        peer_id,
+                                        version,
+                                        err
+                                    ));
                                     continue;
                                 }
                             };
                             if matches!(kind, packet::Kind::HeartBeatRequest) {
-                                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "Heartbeat packet received");
+                                registry.as_ref().logger.info(format_args!(
+                                    "Heartbeat packet received. Id: {}. Peer id: {}. V: {}.",
+                                    registry.as_ref().id,
+                                    peer_id,
+                                    version
+                                ));
                                 registry.update_hb(peer_id);
                             } else if let Err(err) =
                                 registry.as_ref().tx_msg.send(Message::Packet (Inbound::new(peer_id, packet) ))
                             {
-                                error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, kind = %kind, err = %err, "Packet enqueue failed");
+                                registry.as_ref().logger.error(format_args!(
+                                    "Packet enqueue failed. Id: {}. Peer id: {}. V: {}. Kind: {}. Err: {}.",
+                                    registry.as_ref().id,
+                                    peer_id,
+                                    version,
+                                    kind,
+                                    err
+                                ));
                             }
                         }
                         Err(err)
@@ -394,13 +427,25 @@ impl PeerRead {
                             if !matches!(
                                 err.kind(),
                                 io::ErrorKind::WouldBlock) {
-                                error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, kind = %err.kind(), err = %err, "Packet read failed");
+                                registry.as_ref().logger.error(format_args!(
+                                    "Packet read failed. Id: {}. Peer id: {}. V: {}. Kind: {:?}. Err: {}.",
+                                    registry.as_ref().id,
+                                    peer_id,
+                                    version,
+                                    err.kind(),
+                                    err
+                                ));
                             }
                         }
                     }
                 }
 
-                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "tcp connection destroyed");
+                registry.as_ref().logger.info(format_args!(
+                    "TCP connection destroyed. Id: {}. Peer id: {}. V: {}.",
+                    registry.as_ref().id,
+                    peer_id,
+                    version
+                ));
             })
     }
 }

@@ -1,5 +1,5 @@
 use crate::network::packet::{Kind, Reply};
-use crate::runtime::{Logger, Spawner};
+use crate::runtime::Logger;
 use crate::{
     instance::{
         self, Shutdown,
@@ -21,7 +21,6 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
-use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub mod packet;
@@ -109,12 +108,12 @@ impl Drop for Response<'_> {
 }
 
 #[derive(Clone)]
-pub struct Sender {
-    registry: Registry,
+pub struct Sender<L: Logger> {
+    registry: Registry<L>,
     ack_holder: AckHolder,
 }
 
-impl Sender {
+impl<L: Logger> Sender<L> {
     pub(crate) fn read_timeout(&self) -> Duration {
         self.registry.as_ref().config.timeout.read
     }
@@ -169,18 +168,33 @@ impl Sender {
 
         match result {
             Some(Err(err)) => {
-                error!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(), err = %err, "Packet send failed");
+                self.registry.as_ref().logger.error(format_args!(
+                    "Packet send failed. Id: {}. Peer id: {}. Kind: {}. Err: {}.",
+                    self.registry.as_ref().id,
+                    id,
+                    packet.kind(),
+                    err
+                ));
                 Err(err)
             }
             Some(Ok(_)) => {
-                debug!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(),  "Packet send successfully");
+                self.registry.as_ref().logger.debug(format_args!(
+                    "Packet sent successfully. Id: {}. Peer id: {}. Kind: {}.",
+                    self.registry.as_ref().id,
+                    id,
+                    packet.kind()
+                ));
                 Ok(())
             }
             None => {
                 let addr = match self.registry.addr(id) {
                     Some(addr) => addr,
                     None => {
-                        warn!(id = %self.registry.as_ref().id, peer_id = %id, "Connection to peer failed due to no addr found");
+                        self.registry.as_ref().logger.warn(format_args!(
+                            "Connection to peer failed due to no addr found. Id: {}. Peer id: {}.",
+                            self.registry.as_ref().id,
+                            id
+                        ));
                         return Err(io::Error::new(
                             io::ErrorKind::AddrNotAvailable,
                             "No peer connection found",
@@ -189,7 +203,12 @@ impl Sender {
                 };
 
                 if let Err(err) = self.registry.connect(&addr, v) {
-                    error!(id = %self.registry.as_ref().id, peer_id= %id, err = %err, "Connection to peer failed");
+                    self.registry.as_ref().logger.error(format_args!(
+                        "Connection to peer failed. Id: {}. Peer id: {}. Err: {}.",
+                        self.registry.as_ref().id,
+                        id,
+                        err
+                    ));
                     return Err(err);
                 }
 
@@ -203,11 +222,22 @@ impl Sender {
                         )),
                     }) {
                     Err(err) => {
-                        error!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(), err = %err, "Packet send failed");
+                        self.registry.as_ref().logger.error(format_args!(
+                            "Packet send failed. Id: {}. Peer id: {}. Kind: {}. Err: {}.",
+                            self.registry.as_ref().id,
+                            id,
+                            packet.kind(),
+                            err
+                        ));
                         Err(err)
                     }
                     Ok(_) => {
-                        debug!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(),  "Packet send successfully");
+                        self.registry.as_ref().logger.debug(format_args!(
+                            "Packet sent successfully. Id: {}. Peer id: {}. Kind: {}.",
+                            self.registry.as_ref().id,
+                            id,
+                            packet.kind()
+                        ));
                         Ok(())
                     }
                 }
@@ -222,13 +252,13 @@ pub enum Message {
     Event(Event),
 }
 
-pub struct Receiver {
+pub struct Receiver<L: Logger> {
     rx_msg: mpsc::Receiver<Message>,
     ack_holder: AckHolder,
-    registry: Registry,
+    registry: Registry<L>,
 }
 
-impl Receiver {
+impl<L: Logger> Receiver<L> {
     pub fn recv(&self, timeout: Option<Duration>) -> Option<Message> {
         match timeout {
             Some(val) => self.rx_msg.recv_timeout(val).ok(),
@@ -240,21 +270,19 @@ impl Receiver {
         }
     }
 
-    pub fn start<S: Spawner, L: Logger>(
-        self,
-        instance: instance::Weak<S, L>,
-    ) -> io::Result<JoinHandle<()>> {
+    pub fn start(self, instance: instance::Weak<L>) -> io::Result<JoinHandle<()>> {
         let inner = instance
             .as_ref()
             .upgrade()
             .expect("Instance dropped before packet receiver thread started");
         let id = inner.id;
         let task_executor = task::Executor::new(inner.config.task);
+        let logger = inner.logger.clone();
 
         thread::Builder::new()
             .name(format!("pckt-receiver-{}", id))
             .spawn(move || {
-                info!(id = %id, "pckt-receiver started");
+                logger.info(format_args!("Packet receiver started. Id: {}.", id));
                 loop {
                     if !self.registry.as_ref().sigterm.checkpoint(None) {
                         break;
@@ -288,12 +316,18 @@ impl Receiver {
                                             }
                                         }
                                         Err(err) => {
-                                            warn!(err = %err, "Invalid reply packet");
+                                            logger.warn(format_args!(
+                                                "Invalid reply packet. Err: {}.",
+                                                err
+                                            ));
                                         }
                                     },
                                 },
                                 Err(err) => {
-                                    warn!(err = %err, "Invalid packet discriminant");
+                                    logger.warn(format_args!(
+                                        "Invalid packet discriminant. Err: {}.",
+                                        err
+                                    ));
                                 }
                             },
                             Message::Event(event) => match event {
@@ -315,7 +349,7 @@ impl Receiver {
                     }
                 }
 
-                info!(id = %id, "pckt-receiver destroyed");
+                logger.info(format_args!("Packet receiver stopped. Id: {}.", id));
             })
     }
 }
@@ -371,15 +405,16 @@ impl Default for HeartbeatConfig {
     }
 }
 
-pub fn handle(
+pub fn handle<L: Logger>(
     id: Uuid,
     d: Discovery,
     shutdown: Shutdown,
     c: network::Config,
-) -> io::Result<(Sender, Receiver)> {
+    logger: L,
+) -> io::Result<(Sender<L>, Receiver<L>)> {
     let (tx_msg, rx_msg) = mpsc::sync_channel(c.msg_buf_len);
 
-    let registry = Registry::new(id, c, tx_msg, shutdown.clone());
+    let registry = Registry::new(id, c, tx_msg, shutdown.clone(), logger);
 
     shutdown.register(sched::listener(c, registry.clone())?);
     shutdown.register(sched::hb(c, d, registry.clone())?);

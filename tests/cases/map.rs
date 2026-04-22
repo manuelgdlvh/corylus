@@ -1,4 +1,6 @@
-use corylus::{CorylusResult, Instance};
+use corylus::CorylusResult;
+
+use crate::Instance;
 
 pub fn should_register_map_successfully(
     instance_1: Instance,
