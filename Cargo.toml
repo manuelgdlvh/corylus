@@ -6,12 +6,12 @@ edition = "2024"
 [dependencies]
 uuid = { version = "1.22.0", features = ["v4"] }
 twox-hash = "2.1.2"
-rayon = "1.11.0"
+async-io = "2.6.0"
 rand = "0.10.0"
 thiserror = "2.0.18"
+event-listener = "5.4.1"
 oneshot = { version = "0.2.1", features = ["std", "async"] }
 futures = "0.3"
-futures-timer = "3"
 log = "0.4"
 
 [dev-dependencies]

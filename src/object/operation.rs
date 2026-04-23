@@ -2,7 +2,7 @@ use std::{collections::HashMap, io};
 
 use crate::{object, serde};
 
-pub trait Base: serde::Serializer {
+pub trait Base: serde::Serializer + Send {
     fn static_id() -> &'static str
     where
         Self: Sized;

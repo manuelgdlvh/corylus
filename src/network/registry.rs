@@ -29,6 +29,10 @@ struct Limiter {
     stripes: [Mutex<()>; CONN_STRIPES_LEN],
 }
 
+// TODO: In input path use async Async<TcpStream> and read path blocking (No need to await just lightweight thread per reader)
+// TODO: Remove writer mutexes and just use packet-sender with one-shot channel.
+// TODO: Local Vec (or map) resulting futures if terminated not blocking and coupling processing with resulting wait.
+
 impl Limiter {
     pub fn new() -> Self {
         Self {

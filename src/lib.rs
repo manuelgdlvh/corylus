@@ -11,6 +11,7 @@ pub mod instance;
 pub mod network;
 pub mod object;
 pub mod partition;
+pub mod runtime;
 pub mod serde;
 mod sync;
 
@@ -31,11 +32,7 @@ pub enum CorylusError {
     Serde(#[from] serde::Error),
 }
 
-// TODO: Think about futures::block_on problems before being used as sync-async bridge.
-// Then allow replicate to await all of them concurrently.
-// Check blocking paths in read(), write() like partition Lifecycle await readiness (Async condvar?)
-// Probably is good idea to use agnostic runtime for read write tasks (task.rs). And the internal network side? This will remove the need of futures::block_on in some parts.
-// Migration ordering should be State await, remote read/write and network internals with agnostic tcp streams.
+// network internals with agnostic tcp streams.
 
 #[derive(Clone)]
 pub struct Instance {

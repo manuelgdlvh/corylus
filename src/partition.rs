@@ -1,3 +1,6 @@
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Instant;
 use std::{
     array,
     collections::{BinaryHeap, HashMap, HashSet},
@@ -5,15 +8,17 @@ use std::{
         Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::Duration,
 };
-
 use thiserror::Error;
 use twox_hash::{XxHash3_64, XxHash3_128};
 use uuid::Uuid;
 
-use crate::sync::State;
-use crate::{object, partition};
+use crate::network::packet::Reply;
+use crate::network::{Response, packet};
+use crate::sync::AsyncState;
+use crate::{instance, object, partition};
 
 const RING_CAPACITY: usize = 1024;
 const PARTITION_HASH_SEED: u64 = 1234;
@@ -69,13 +74,17 @@ impl Group {
         }
     }
 
-    pub fn await_ready(&self, part_id: usize, timeout: Option<Duration>) -> Result<(), Error> {
+    pub async fn await_ready(
+        &self,
+        part_id: usize,
+        timeout: Option<Duration>,
+    ) -> Result<(), Error> {
         if part_id >= RING_CAPACITY {
             return Err(Error::PartitionNotFound);
         }
 
         let partition = &self.partitions[part_id];
-        if !partition.await_ready(timeout) {
+        if !partition.await_ready(timeout).await {
             return Err(Error::PartitionNotReady);
         }
 
@@ -240,7 +249,7 @@ impl Group {
 pub struct Partition {
     metadata: RwLock<Metadata>,
     segments: HashMap<object::Id, RwLock<Segment>>,
-    state: State<Lifecycle>,
+    state: AsyncState<Lifecycle>,
 }
 
 impl Partition {
@@ -256,7 +265,7 @@ impl Partition {
         Self {
             metadata: RwLock::new(Metadata::new(id, master_id, replica_ids)),
             segments,
-            state: State::new(),
+            state: AsyncState::new(),
         }
     }
 
@@ -279,7 +288,7 @@ impl Partition {
         self.state.update(lifecycle);
     }
 
-    pub fn await_ready(&self, timeout: Option<Duration>) -> bool {
+    pub fn await_ready(&self, timeout: Option<Duration>) -> impl Future<Output = bool> {
         self.state.await_until(Lifecycle::Ready, timeout)
     }
 }
@@ -394,4 +403,280 @@ fn members_rank(part_id: usize, member_ids: &[Uuid]) -> (Uuid, Vec<Uuid>) {
     }
 
     (master_id, replica_ids)
+}
+
+pub struct RebalanceScheduler {
+    tx: mpsc::Sender<()>,
+}
+
+impl RebalanceScheduler {
+    pub fn schedule(&self) {
+        self.tx.send(()).expect("Failed to invoke rebalance");
+    }
+}
+
+pub(crate) fn rebalance_sched(instance: instance::Weak) -> (RebalanceScheduler, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let id = instance.as_ref().upgrade().unwrap().id;
+    let h = thread::Builder::new()
+        .name("partition-rebalance".to_string())
+        .spawn(move || {
+            log::info!("Partition rebalance scheduler initialized. Id: {}.", id);
+
+            while rx.recv().is_ok() {
+                if let Some(ref_) = instance.as_ref().upgrade() {
+                    let mut members;
+
+                    'rebalance: loop {
+                        members = ref_.membership.all();
+                        let target_version = version(members.as_slice());
+                        if target_version.eq(&ref_.part_group.version()) {
+                            break 'rebalance;
+                        }
+
+                        struct FetchEntry<'a> {
+                            part_id: usize,
+                            member_id: Uuid,
+                            segments: HashSet<&'a String>,
+                        }
+
+                        log::info!("rebalance has started. Id: {}.", ref_.id);
+
+                        ref_.part_group.with_partitions_read(|part| {
+                            part.set_state(Lifecycle::Ready);
+                        });
+
+                        let mut fetch: HashMap<usize, FetchEntry> = HashMap::new();
+                        for (part_id, changes) in
+                            ref_.part_group.update_partitions(members.as_slice())
+                        {
+                            let mut ready = true;
+                            for change in changes {
+                                match change {
+                                    MembershipChange::MasterChanged { old, new } => {
+                                        if new.eq(&ref_.id) && members.contains(&old) {
+                                            ready = false;
+                                            fetch.insert(
+                                                part_id,
+                                                FetchEntry {
+                                                    part_id,
+                                                    member_id: old,
+                                                    segments: ref_
+                                                        .objects
+                                                        .keys()
+                                                        .collect::<HashSet<_>>(),
+                                                },
+                                            );
+                                        }
+
+                                        if old.eq(&ref_.id) {
+                                            ready = false;
+                                        }
+                                    }
+
+                                    MembershipChange::ReplicasChanged {
+                                        added: _,
+                                        removed: _,
+                                    } => {}
+                                }
+                            }
+
+                            if ready {
+                                if ref_.part_group.is_initialized() {
+                                    ref_.part_group
+                                        .with_partition_read(part_id, |part| {
+                                            part.set_state(Lifecycle::Ready)
+                                        })
+                                        .expect("partition must exist");
+                                } else if ref_.part_group.owner_of(part_id as u64).eq(&ref_.id) {
+                                    let member_id = *ref_
+                                        .part_group
+                                        .replicas_of(part_id as u64, 1)
+                                        .first()
+                                        .expect(
+                                            "replicas_of(..., 1) must return one replica for fetch",
+                                        );
+                                    fetch.insert(
+                                        part_id,
+                                        FetchEntry {
+                                            part_id,
+                                            member_id,
+                                            segments: ref_.objects.keys().collect::<HashSet<_>>(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+
+                        enum FetchResponse<'a> {
+                            FetchObject {
+                                obj_id: &'a String,
+                                resp: Response<'a>,
+                            },
+                            Completion(Response<'a>),
+                        }
+
+                        let v = ref_.part_group.version();
+                        let mut pending_partitions = fetch.keys().copied().collect::<HashSet<_>>();
+                        loop {
+                            if pending_partitions.is_empty() {
+                                break 'rebalance;
+                            }
+
+                            // Some peers changed in the meantime, restarting process
+                            if !members.eq(&ref_.membership.all()) {
+                                continue 'rebalance;
+                            }
+
+                            let mut timeout = ref_.config.partition.rebalance_timeout;
+                            let start = Instant::now();
+                            let mut response_map = HashMap::new();
+                            for (part_id, req) in fetch.iter() {
+                                if !pending_partitions.contains(part_id) {
+                                    continue;
+                                }
+
+                                response_map.insert(
+                                    req.part_id,
+                                    Vec::with_capacity(req.segments.len().max(1)),
+                                );
+                                if req.segments.is_empty() {
+                                    match ref_.net.request_sync(
+                                        req.member_id,
+                                        packet::Request::PartitionFetchCompletion {
+                                            v,
+                                            corr_id: Uuid::new_v4(),
+                                            part_id: *part_id as u16,
+                                        },
+                                    ) {
+                                        Ok(response) => {
+                                            if let Some(entry) = response_map.get_mut(&req.part_id)
+                                            {
+                                                entry.push(FetchResponse::Completion(response));
+                                            }
+                                        }
+                                        Err(err) => {
+                                            log::error!(
+                                                "PartitionFetchCompletion request failed. Err: {}.",
+                                                err
+                                            );
+                                        }
+                                    }
+
+                                    continue;
+                                }
+
+                                for &obj_id in req.segments.iter() {
+                                    match ref_.net.request_sync(
+                                        req.member_id,
+                                        packet::Request::FetchObject {
+                                            v,
+                                            corr_id: Uuid::new_v4(),
+                                            part_id: req.part_id as u16,
+                                            obj_id,
+                                        },
+                                    ) {
+                                        Ok(response) => {
+                                            if let Some(entry) = response_map.get_mut(&req.part_id)
+                                            {
+                                                entry.push(FetchResponse::FetchObject {
+                                                    obj_id,
+                                                    resp: response,
+                                                });
+                                            }
+                                        }
+                                        Err(err) => {
+                                            log::error!(
+                                                "FetchObject request failed. Err: {}.",
+                                                err
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            for (part_id, responses) in response_map {
+                                for entry in responses {
+                                    match entry {
+                                        FetchResponse::FetchObject { obj_id, resp } => {
+                                            match resp.blocking_recv_timeout(timeout) {
+                                                Ok(raw) => match Reply::try_from(&raw) {
+                                                    Ok(Reply::FetchObject { result, .. }) => {
+                                                        if let Err(err) = ref_.rebuild(
+                                                            obj_id,
+                                                            part_id as u16,
+                                                            result,
+                                                        ) {
+                                                            log::error!(
+                                                                "rebuild failed. Err: {}.",
+                                                                err
+                                                            );
+                                                        } else if let Some(entry) =
+                                                            fetch.get_mut(&part_id)
+                                                        {
+                                                            entry.segments.remove(obj_id);
+                                                        }
+                                                    }
+                                                    Ok(_) => {
+                                                        log::error!(
+                                                            "unexpected reply variant for FetchObject."
+                                                        );
+                                                    }
+                                                    Err(err) => {
+                                                        log::error!(
+                                                            "FetchObject reply decode failed. Err: {}.",
+                                                            err
+                                                        );
+                                                    }
+                                                },
+                                                Err(err) => {
+                                                    log::error!(
+                                                        "Fetch object error. Err: {}.",
+                                                        err
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        FetchResponse::Completion(resp) => {
+                                            match resp.blocking_recv_timeout(timeout) {
+                                                Ok(_) => {
+                                                    pending_partitions.remove(&part_id);
+                                                    ref_.part_group
+                                                        .with_partition_read(part_id, |part| {
+                                                            part.set_state(
+                                                                partition::Lifecycle::Ready,
+                                                            );
+                                                        })
+                                                        .expect("partition must exist");
+                                                }
+                                                Err(err) => {
+                                                    log::error!(
+                                                        "Partition Completion error. Err: {}.",
+                                                        err
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    timeout = timeout.saturating_sub(start.elapsed());
+                                }
+                            }
+                        }
+                    }
+
+                    ref_.part_group.update_version(&members);
+                    ref_.part_group.initialize();
+                    ref_.part_group
+                        .with_partitions_read(|part| part.set_state(Lifecycle::Ready));
+
+                    log::info!("Rebalance has finished. Id: {}.", ref_.id);
+                }
+            }
+
+            log::info!("Partition rebalance scheduler destroyed. Id: {}.", id);
+        })
+        .expect("partition rebalance thread: OS refused or thread count invalid");
+
+    (RebalanceScheduler { tx }, h)
 }

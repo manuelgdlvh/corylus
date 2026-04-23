@@ -242,3 +242,9 @@ pub(crate) fn listener(config: network::Config, registry: Registry) -> io::Resul
             log::info!("Listener scheduler destroyed. Id: {}.", registry.as_ref().id);
         })
 }
+
+/*
+TODO
+pub(crate) async fn pckt_sender(registry: Registry, ack_holder: AckHolder) -> Sender {
+}
+*/

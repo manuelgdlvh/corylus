@@ -22,6 +22,7 @@ use crate::{
         map::{Get, Put},
     },
     partition::{self, Segment},
+    runtime,
 };
 
 pub mod task;
@@ -121,7 +122,10 @@ impl Builder<Ready> {
         self
     }
 
-    pub fn build(self) -> io::Result<Instance> {
+    pub fn build<B>(self, runtime: B) -> io::Result<Instance>
+    where
+        B: runtime::Builder<Runtime: Send + 'static>,
+    {
         let id = self
             .id
             .expect("Builder<Ready>: with_id must have been called");
@@ -138,7 +142,12 @@ impl Builder<Ready> {
         let partition = partition::Group::new(id, self.segment_fns.as_slice());
         let instance = Instance::new(id, net_sender, partition, self.objects, c, shutdown.clone());
 
-        shutdown.register(net_receiver.start(instance.downgrade())?);
+        let weak = instance.downgrade();
+        let (reb_h, h) = partition::rebalance_sched(weak.clone());
+        shutdown.register(h);
+
+        let h = net_receiver.start(runtime, weak, reb_h)?;
+        shutdown.register(h);
 
         Ok(instance)
     }
@@ -381,7 +390,7 @@ impl Inner {
             .map_err(|err| err.into())
     }
 
-    pub(crate) fn remote_write<O: operation::Write>(
+    pub(crate) async fn forwarded_write<O: operation::Write>(
         &self,
         obj_id: &str,
         part_id: u16,
@@ -391,14 +400,15 @@ impl Inner {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
-        let owner = self.part_group.owner_of(part_id as u64);
 
+        let owner = self.part_group.owner_of(part_id as u64);
         if self.id.eq(&owner) {
             self.check_repl_requirements(obj_id)?;
         }
 
         self.part_group
-            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))
+            .await?;
         if !self.part_group.version().eq(&v) {
             return Err(partition::Error::Rebalance.into());
         }
@@ -410,14 +420,14 @@ impl Inner {
                 op.execute(&mut *segment.data);
             })?;
 
-        // TODO: Check and review all code changes from PR
-
-        futures::executor::block_on(self.replicate(obj_id, part_id as u64, op))?;
+        if self.id.eq(&owner) {
+            self.replicate(obj_id, part_id as u64, op).await?;
+        }
 
         Ok(())
     }
 
-    pub(crate) fn remote_read<O: operation::Read>(
+    pub(crate) async fn forwarded_read<O: operation::Read>(
         &self,
         obj_id: &str,
         part_id: u16,
@@ -430,7 +440,9 @@ impl Inner {
         // If partition version is correct is ensured that this node is master or replica.
 
         self.part_group
-            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))
+            .await?;
+
         if !self.part_group.version().eq(&v) {
             return Err(partition::Error::Rebalance.into());
         }
@@ -461,7 +473,8 @@ impl Inner {
         let part_id = self.part_group.partition_of(&key);
 
         self.part_group
-            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))
+            .await?;
         let owner = self.part_group.owner_of(part_id);
 
         if self.id.eq(&owner) {
@@ -551,7 +564,7 @@ impl Inner {
                     })
                     .collect::<io::Result<Vec<_>>>()?;
 
-                let futs = responses.into_iter().map(|resp| async move {
+                let futures = responses.into_iter().map(|resp| async move {
                     let raw = resp.recv().await?;
                     let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
                     match reply {
@@ -568,7 +581,7 @@ impl Inner {
                     }
                 });
 
-                futures::future::try_join_all(futs).await?;
+                futures::future::try_join_all(futures).await?;
             }
             object::Replication::Async => {
                 for replica_id in replica_ids {
@@ -603,7 +616,8 @@ impl Inner {
         let part_id = self.part_group.partition_of(&key);
 
         self.part_group
-            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))
+            .await?;
         let owner = self.part_group.owner_of(part_id);
 
         let metadata = self

@@ -1,15 +1,18 @@
-use crate::network::packet::{Kind, Reply};
+use crate::network::packet::{Kind, Raw, Reply};
 use crate::{
     instance::{
         self, Shutdown,
         task::{self, Task},
     },
     network::{
-        self,
         packet::{Event, Packet},
         registry::Registry,
     },
+    runtime,
 };
+
+use crate::partition::RebalanceScheduler;
+use async_io::Timer;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::sync::{Arc, Mutex};
@@ -23,7 +26,6 @@ use std::{
 use uuid::Uuid;
 use {
     futures::{future::FutureExt, pin_mut, select},
-    futures_timer::Delay,
     oneshot,
 };
 
@@ -75,7 +77,7 @@ impl AckHolder {
 pub struct Response<'a> {
     corr_id: Uuid,
     reg: &'a AckHolder,
-    receiver: Option<oneshot::Receiver<packet::Raw>>,
+    receiver: Option<oneshot::Receiver<Raw>>,
     recv_timeout: Duration,
 }
 
@@ -99,9 +101,15 @@ impl<'a> Response<'a> {
         self.blocking_recv_timeout(timeout)
     }
 
-    // TODO: Think about it, right now this is used in a specific single thread for partition rebalance. Maybe is better using blocking facade of oneshot.
-    pub fn blocking_recv_timeout(self, timeout: Duration) -> Result<packet::Raw, io::Error> {
-        futures::executor::block_on(self.recv_timeout(timeout))
+    pub fn blocking_recv_timeout(mut self, timeout: Duration) -> Result<packet::Raw, io::Error> {
+        let receiver = self
+            .receiver
+            .take()
+            .expect("Response receiver consumed twice");
+        match receiver.recv_timeout(timeout) {
+            Ok(val) => Ok(val),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
+        }
     }
 
     pub async fn recv(self) -> Result<packet::Raw, io::Error> {
@@ -116,13 +124,13 @@ impl<'a> Response<'a> {
             .take()
             .expect("Response receiver consumed twice");
         let recv_fut = receiver.into_future().fuse();
-        let delay_fut = Delay::new(timeout).fuse();
+        let delay_fut = Timer::after(timeout).fuse();
         pin_mut!(recv_fut);
         pin_mut!(delay_fut);
 
         select! {
             v = recv_fut => v.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Response channel closed")),
-            () = delay_fut => Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
+            _ = delay_fut => Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
         }
     }
 }
@@ -163,10 +171,11 @@ impl Sender {
         self.send_internal(id, Packet::Request(packet))
     }
 
-    pub fn reply(&self, id: Uuid, packet: packet::Reply) -> io::Result<()> {
+    pub fn reply(&self, id: Uuid, packet: Reply) -> io::Result<()> {
         self.send_internal(id, Packet::Reply(packet))
     }
 
+    // TODO: Make this async
     fn send_internal(&self, id: Uuid, packet: Packet) -> io::Result<()> {
         let timeout = self.write_timeout();
         let (result, v) = self.registry.with_writers_read(|writers| {
@@ -285,7 +294,7 @@ pub struct Receiver {
 }
 
 impl Receiver {
-    pub fn recv(&self, timeout: Option<Duration>) -> Option<Message> {
+    fn recv(&self, timeout: Option<Duration>) -> Option<Message> {
         match timeout {
             Some(val) => self.rx_msg.recv_timeout(val).ok(),
             None => Some(
@@ -296,13 +305,21 @@ impl Receiver {
         }
     }
 
-    pub fn start(self, instance: instance::Weak) -> io::Result<JoinHandle<()>> {
+    pub fn start<B>(
+        self,
+        runtime: B,
+        instance: instance::Weak,
+        rebalance_sched: RebalanceScheduler,
+    ) -> io::Result<JoinHandle<()>>
+    where
+        B: runtime::Builder<Runtime: Send + 'static>,
+    {
         let inner = instance
             .as_ref()
             .upgrade()
             .expect("Instance dropped before packet receiver thread started");
         let id = inner.id;
-        let task_executor = task::Executor::new(inner.config.task);
+        let task_executor = task::Executor::new(inner.config.task, runtime);
 
         thread::Builder::new()
             .name(format!("pckt-receiver-{}", id))
@@ -361,7 +378,7 @@ impl Receiver {
                                     }
                                 }
                                 Event::Checkpoint => {
-                                    task_executor.spawn(instance.clone(), Task::PartitionRebalance);
+                                    rebalance_sched.schedule();
                                 }
                             },
                         }
@@ -428,16 +445,15 @@ pub fn handle(
     id: Uuid,
     d: Discovery,
     shutdown: Shutdown,
-    c: network::Config,
+    c: Config,
 ) -> io::Result<(Sender, Receiver)> {
     let (tx_msg, rx_msg) = mpsc::sync_channel(c.msg_buf_len);
+    let ack_holder = AckHolder::new();
 
     let registry = Registry::new(id, c, tx_msg, shutdown.clone());
 
     shutdown.register(sched::listener(c, registry.clone())?);
     shutdown.register(sched::hb(c, d, registry.clone())?);
-
-    let ack_holder = AckHolder::new();
 
     let net_tx = Sender {
         registry: registry.clone(),

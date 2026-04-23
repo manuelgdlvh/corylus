@@ -6,11 +6,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use corylus::runtime::{Options, Runtime};
 use corylus::{
     CorylusResult, instance,
     network::{self, Discovery},
     object,
     partition::{self},
+    runtime,
 };
 use log::LevelFilter;
 use uuid::Uuid;
@@ -23,6 +25,42 @@ mod rebalance;
 mod repl;
 
 pub type Instance = corylus::Instance;
+
+pub struct TokioRuntime {
+    runtime: tokio::runtime::Runtime,
+}
+
+impl Runtime for TokioRuntime {
+    fn spawn<F>(&self, f: F)
+    where
+        F: Future<Output = ()> + 'static + Send,
+    {
+        self.runtime.spawn(f);
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct TokioBuilder {}
+
+impl runtime::Builder for TokioBuilder {
+    type Runtime = TokioRuntime;
+
+    fn build(&self, opts: Options) -> io::Result<Self::Runtime> {
+        let mut builder;
+        if opts.threads > 1 {
+            builder = tokio::runtime::Builder::new_multi_thread();
+        } else {
+            builder = tokio::runtime::Builder::new_current_thread();
+        }
+        let runtime = builder
+            .thread_name(opts.name)
+            .enable_all()
+            .worker_threads(opts.threads)
+            .build()?;
+
+        Ok(TokioRuntime { runtime })
+    }
+}
 
 pub static WITH_INSTANCES_LOCK: Mutex<()> = Mutex::new(());
 
@@ -56,13 +94,13 @@ pub(crate) fn new_instance(
             ],
         })
         .with_map::<String, String>("str-str", repl_config)
-        .build()
+        .build(TokioBuilder::default())
 }
 
 async fn with_instances<F, Fut>(f: F, repl_config: object::ReplicationConfig) -> CorylusResult<()>
 where
     F: FnOnce(Instance, Instance) -> Fut,
-    Fut: std::future::Future<Output = CorylusResult<()>>,
+    Fut: Future<Output = CorylusResult<()>>,
 {
     let _guard = WITH_INSTANCES_LOCK.lock();
 
