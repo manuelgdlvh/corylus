@@ -11,9 +11,8 @@ use corylus::{
     network::{self, Discovery},
     object,
     partition::{self},
-    runtime,
 };
-use tracing_subscriber::FmtSubscriber;
+use log::LevelFilter;
 use uuid::Uuid;
 
 #[path = "cases/map.rs"]
@@ -23,32 +22,7 @@ mod rebalance;
 #[path = "cases/repl.rs"]
 mod repl;
 
-#[derive(Copy, Clone, Default)]
-pub struct TracingLogger {}
-
-impl runtime::Logger for TracingLogger {
-    fn info(&self, message: std::fmt::Arguments<'_>) {
-        tracing::event!(tracing::Level::INFO, "{}", message);
-    }
-
-    fn debug(&self, message: std::fmt::Arguments<'_>) {
-        tracing::event!(tracing::Level::DEBUG, "{}", message);
-    }
-
-    fn trace(&self, message: std::fmt::Arguments<'_>) {
-        tracing::event!(tracing::Level::TRACE, "{}", message);
-    }
-
-    fn warn(&self, message: std::fmt::Arguments<'_>) {
-        tracing::event!(tracing::Level::WARN, "{}", message);
-    }
-
-    fn error(&self, message: std::fmt::Arguments<'_>) {
-        tracing::event!(tracing::Level::ERROR, "{}", message);
-    }
-}
-
-pub type Instance = corylus::Instance<TracingLogger>;
+pub type Instance = corylus::Instance;
 
 pub static WITH_INSTANCES_LOCK: Mutex<()> = Mutex::new(());
 
@@ -82,24 +56,27 @@ pub(crate) fn new_instance(
             ],
         })
         .with_map::<String, String>("str-str", repl_config)
-        .build(TracingLogger::default())
+        .build()
 }
 
-fn with_instances<F: FnOnce(Instance, Instance) -> CorylusResult<()>>(
-    f: F,
-    repl_config: object::ReplicationConfig,
-) -> CorylusResult<()> {
+async fn with_instances<F, Fut>(f: F, repl_config: object::ReplicationConfig) -> CorylusResult<()>
+where
+    F: FnOnce(Instance, Instance) -> Fut,
+    Fut: std::future::Future<Output = CorylusResult<()>>,
+{
     let _guard = WITH_INSTANCES_LOCK.lock();
 
-    let subscriber = FmtSubscriber::new();
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .is_test(true)
+        .filter_level(LevelFilter::Info)
+        .try_init();
 
     let instance_1 = new_instance(Uuid::from_u128(1), 8090, repl_config)?;
     let instance_2 = new_instance(Uuid::from_u128(2), 8091, repl_config)?;
 
     wait_until_ready(&[&instance_1, &instance_2]);
 
-    f(instance_1, instance_2)
+    f(instance_1, instance_2).await
 }
 
 pub(crate) fn wait_until_ready(instances: &[&Instance]) {
@@ -141,14 +118,18 @@ mod tests {
         use corylus::CorylusResult;
 
         use crate::{map, with_instances};
-        #[test]
-        pub fn should_register_map_successfully() -> CorylusResult<()> {
-            with_instances(map::should_register_map_successfully, Default::default())
+        #[tokio::test(flavor = "multi_thread")]
+        pub async fn should_register_map_successfully() -> CorylusResult<()> {
+            with_instances(
+                |a, b| async move { map::should_register_map_successfully(a, b) },
+                Default::default(),
+            )
+            .await
         }
 
-        #[test]
-        pub fn should_put_and_get_map_successfully() -> CorylusResult<()> {
-            with_instances(map::should_put_and_get_map_successfully, Default::default())
+        #[tokio::test(flavor = "multi_thread")]
+        pub async fn should_put_and_get_map_successfully() -> CorylusResult<()> {
+            with_instances(map::should_put_and_get_map_successfully, Default::default()).await
         }
     }
 
@@ -157,20 +138,24 @@ mod tests {
 
         use crate::{repl, with_instances};
 
-        #[test]
-        pub fn should_read_success_when_sync_repl_and_allow_replica_read() -> CorylusResult<()> {
+        #[tokio::test(flavor = "multi_thread")]
+        pub async fn should_read_success_when_sync_repl_and_allow_replica_read() -> CorylusResult<()>
+        {
             with_instances(
                 repl::should_read_success_when_sync_repl_and_allow_replica_read,
                 ReplicationConfig::synchronous(1, true),
             )
+            .await
         }
 
-        #[test]
-        pub fn should_read_fail_when_sync_repl_and_no_allow_replica_read() -> CorylusResult<()> {
+        #[tokio::test(flavor = "multi_thread")]
+        pub async fn should_read_fail_when_sync_repl_and_no_allow_replica_read() -> CorylusResult<()>
+        {
             with_instances(
                 repl::should_read_fail_when_sync_repl_and_no_allow_replica_read,
                 ReplicationConfig::synchronous(1, false),
             )
+            .await
         }
     }
 
@@ -179,12 +164,13 @@ mod tests {
 
         use crate::{rebalance, with_instances};
 
-        #[test]
-        pub fn should_transfer_partition_ownership_after_rebalance() -> CorylusResult<()> {
+        #[tokio::test(flavor = "multi_thread")]
+        pub async fn should_transfer_partition_ownership_after_rebalance() -> CorylusResult<()> {
             with_instances(
                 rebalance::should_transfer_partition_ownership_after_rebalance,
                 Default::default(),
             )
+            .await
         }
     }
 }

@@ -1,5 +1,4 @@
 use crate::object::operation::{ReadBuilder, WriteBuilder};
-use crate::runtime::Logger;
 use crate::{
     CorylusResult,
     instance::{self},
@@ -107,24 +106,22 @@ impl Metadata {
     }
 }
 
-pub struct DistributedMap<K, V, L>
+pub struct DistributedMap<K, V>
 where
     K: map::Key,
     V: map::Value,
-    L: Logger,
 {
-    instance: instance::Weak<L>,
+    instance: instance::Weak,
     id: String,
     _state: PhantomData<(K, V)>,
 }
 
-impl<K, V, L> DistributedMap<K, V, L>
+impl<K, V> DistributedMap<K, V>
 where
     K: map::Key,
     V: map::Value,
-    L: Logger,
 {
-    pub fn new(id: String, instance: instance::Weak<L>) -> Self {
+    pub fn new(id: String, instance: instance::Weak) -> Self {
         Self {
             id,
             instance,
@@ -132,24 +129,24 @@ where
         }
     }
 
-    pub fn put(&self, k: K, v: V) -> CorylusResult<()> {
+    pub async fn put(&self, k: K, v: V) -> CorylusResult<()> {
         let op = Put::<K, V> { key: k, value: v };
 
         if let Some(ref_) = self.instance.as_ref().upgrade() {
-            ref_.write(self.id.as_str(), op)
+            ref_.write(self.id.as_str(), op).await
         } else {
             panic!("Instance was destroyed")
         }
     }
 
-    pub fn get(&self, k: K) -> CorylusResult<Option<V>> {
+    pub async fn get(&self, k: K) -> CorylusResult<Option<V>> {
         let op = Get::<K, V> {
             key: k,
             _value: Default::default(),
         };
 
         if let Some(ref_) = self.instance.as_ref().upgrade() {
-            let result = ref_.read(self.id.as_str(), op)?;
+            let result = ref_.read(self.id.as_str(), op).await?;
             if result.is_empty() {
                 Ok(None)
             } else {

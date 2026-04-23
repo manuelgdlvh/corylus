@@ -10,19 +10,16 @@ use std::{
 
 use rand::RngExt;
 
-use crate::{
-    network::{
-        self, Discovery, Message,
-        packet::{self, Event, Packet},
-        registry::{PeerRead, PeerWrite, Registry},
-    },
-    runtime::Logger,
+use crate::network::{
+    self, Discovery, Message,
+    packet::{self, Event, Packet},
+    registry::{PeerRead, PeerWrite, Registry},
 };
 
-pub(crate) fn hb<L: Logger>(
+pub(crate) fn hb(
     config: network::Config,
     d: Discovery,
-    registry: Registry<L>,
+    registry: Registry,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("heartbeat".to_string())
@@ -30,10 +27,10 @@ pub(crate) fn hb<L: Logger>(
             let poll_interval = config.hb.poll_interval;
             let hb_tolerance = config.hb.tolerance;
 
-            registry.as_ref().logger.info(format_args!(
+            log::info!(
                 "Heartbeat scheduler initialized. Id: {}.",
                 registry.as_ref().id
-            ));
+            );
             loop {
                 let rng = rand::rng().random_range(0.75..=1.0);
                 let millis = poll_interval.as_millis() as f64;
@@ -57,12 +54,12 @@ pub(crate) fn hb<L: Logger>(
                 .filter(|addr| !registry.is_connected(addr))
                 .for_each(|addr| {
                     if let Err(err) = registry.connect(addr, None) {
-                        registry.as_ref().logger.error(format_args!(
+                        log::error!(
                             "Connection to peer failed. Id: {}. Addr: {}. Err: {}.",
                             registry.as_ref().id,
                             addr,
                             err
-                        ));
+                        );
                     }
                 });
 
@@ -90,12 +87,12 @@ pub(crate) fn hb<L: Logger>(
                                 true
                             }
                             Err(err) => {
-                                registry.as_ref().logger.error(format_args!(
+                                log::error!(
                                     "Packet send failed. Id: {}. Peer id: {}. Err: {}.",
                                     registry.as_ref().id,
                                     id,
                                     err
-                                ));
+                                );
                                 false
                             }
                             Ok(_) => false,
@@ -130,33 +127,24 @@ pub(crate) fn hb<L: Logger>(
                     .as_ref()
                     .tx_msg
                     .send(Message::Event(Event::Checkpoint));
-                registry.as_ref().logger.info(format_args!(
-                    "Heartbeat tick finished. Id: {}.",
-                    registry.as_ref().id
-                ));
+                log::info!("Heartbeat tick finished. Id: {}.", registry.as_ref().id);
             }
 
-            registry.as_ref().logger.info(format_args!(
+            log::info!(
                 "Heartbeat scheduler destroyed. Id: {}.",
                 registry.as_ref().id
-            ));
+            );
         })
 }
 
-pub(crate) fn listener<L: Logger>(
-    config: network::Config,
-    registry: Registry<L>,
-) -> io::Result<JoinHandle<()>> {
+pub(crate) fn listener(config: network::Config, registry: Registry) -> io::Result<JoinHandle<()>> {
     let listener = TcpListener::bind(registry.as_ref().config.addr)?;
     listener.set_nonblocking(true)?;
 
     thread::Builder::new()
         .name("listener".to_string())
         .spawn(move || {
-            registry.as_ref().logger.info(format_args!(
-                "Listener scheduler initialized. Id: {}.",
-                registry.as_ref().id
-            ));
+            log::info!("Listener scheduler initialized. Id: {}.", registry.as_ref().id);
             loop {
                 if !registry.as_ref().sigterm.checkpoint(Some(Duration::from_millis(50))) {
                     break;
@@ -167,11 +155,11 @@ pub(crate) fn listener<L: Logger>(
                         let read_stream = match stream.try_clone() {
                             Ok(v) => v,
                             Err(err) => {
-                                registry.as_ref().logger.error(format_args!(
+                                log::error!(
                                     "Peer connection accept failed. Id: {}. Err: {}.",
                                     registry.as_ref().id,
                                     err
-                                ));
+                                );
                                 continue;
                             }
                         };
@@ -182,11 +170,11 @@ pub(crate) fn listener<L: Logger>(
                         let who_is_req = match r.read(Some(config.timeout.read)) {
                             Ok(packet) => packet,
                             Err(err) => {
-                                registry.as_ref().logger.error(format_args!(
+                                log::error!(
                                     "Peer connection accept failed waiting identity discovery. Id: {}. Err: {}.",
                                     registry.as_ref().id,
                                     err
-                                ));
+                                );
                                 continue;
                             }
                         };
@@ -196,22 +184,22 @@ pub(crate) fn listener<L: Logger>(
                                 (id, addr)
                             }
                             Ok(_) | Err(_) => {
-                                registry.as_ref().logger.error(format_args!(
+                                log::error!(
                                     "Peer connection accept failed: expected WhoIs request. Id: {}.",
                                     registry.as_ref().id
-                                ));
+                                );
                                 continue;
                             }
                         };
 
                         if let Err(err) = w.write(&Packet::Reply(packet::Reply::WhoIs { id: registry.as_ref().id })
                                                   , Some(config.timeout.write), ) {
-                            registry.as_ref().logger.error(format_args!(
+                            log::error!(
                                 "Peer connection accept failed sending own identity. Id: {}. Peer id: {}. Err: {}.",
                                 registry.as_ref().id,
                                 peer_id,
                                 err
-                            ));
+                            );
                             continue;
                         }
 
@@ -225,35 +213,32 @@ pub(crate) fn listener<L: Logger>(
                             Err(err) => {
                                 registry.unregister(peer_id, v);
 
-                                registry.as_ref().logger.error(format_args!(
+                                log::error!(
                                     "Peer connection accept failed. Id: {}. Err: {}.",
                                     registry.as_ref().id,
                                     err
-                                ));
+                                );
                             }
                         }
 
-                        registry.as_ref().logger.info(format_args!(
+                        log::info!(
                             "Peer connection accepted. Id: {}. Peer id: {}. V: {}.",
                             registry.as_ref().id,
                             peer_id,
                             v
-                        ));
+                        );
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(err) => {
-                        registry.as_ref().logger.error(format_args!(
+                        log::error!(
                             "Listener threw an error. Id: {}. Err: {}.",
                             registry.as_ref().id,
                             err
-                        ));
+                        );
                     }
                 }
             }
 
-            registry.as_ref().logger.info(format_args!(
-                "Listener scheduler destroyed. Id: {}.",
-                registry.as_ref().id
-            ));
+            log::info!("Listener scheduler destroyed. Id: {}.", registry.as_ref().id);
         })
 }

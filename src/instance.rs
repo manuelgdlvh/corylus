@@ -22,7 +22,6 @@ use crate::{
         map::{Get, Put},
     },
     partition::{self, Segment},
-    runtime::Logger,
 };
 
 pub mod task;
@@ -122,7 +121,7 @@ impl Builder<Ready> {
         self
     }
 
-    pub fn build<L: Logger>(self, logger: L) -> io::Result<Instance<L>> {
+    pub fn build(self) -> io::Result<Instance> {
         let id = self
             .id
             .expect("Builder<Ready>: with_id must have been called");
@@ -135,18 +134,9 @@ impl Builder<Ready> {
 
         let shutdown = Shutdown::new();
 
-        let (net_sender, net_receiver) =
-            network::handle(id, d, shutdown.clone(), c.network, logger.clone())?;
+        let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
         let partition = partition::Group::new(id, self.segment_fns.as_slice());
-        let instance = Instance::new(
-            id,
-            logger,
-            net_sender,
-            partition,
-            self.objects,
-            c,
-            shutdown.clone(),
-        );
+        let instance = Instance::new(id, net_sender, partition, self.objects, c, shutdown.clone());
 
         shutdown.register(net_receiver.start(instance.downgrade())?);
 
@@ -295,18 +285,18 @@ pub struct Config {
 }
 
 #[derive(Clone)]
-pub struct Weak<L: Logger> {
-    inner: sync::Weak<Inner<L>>,
+pub struct Weak {
+    inner: sync::Weak<Inner>,
 }
 
-impl<L: Logger> Weak<L> {
-    pub fn new(inner: sync::Weak<Inner<L>>) -> Self {
+impl Weak {
+    pub fn new(inner: sync::Weak<Inner>) -> Self {
         Self { inner }
     }
 }
 
-impl<L: Logger> AsRef<sync::Weak<Inner<L>>> for Weak<L> {
-    fn as_ref(&self) -> &sync::Weak<Inner<L>> {
+impl AsRef<sync::Weak<Inner>> for Weak {
+    fn as_ref(&self) -> &sync::Weak<Inner> {
         &self.inner
     }
 }
@@ -354,10 +344,9 @@ impl Membership {
     }
 }
 
-pub struct Inner<L: Logger> {
+pub struct Inner {
     pub(crate) id: Uuid,
-    pub(crate) logger: L,
-    pub(crate) net: network::Sender<L>,
+    pub(crate) net: network::Sender,
     pub(crate) config: Config,
     pub(crate) part_group: partition::Group,
     pub(crate) objects: HashMap<object::Id, object::Metadata>,
@@ -365,13 +354,13 @@ pub struct Inner<L: Logger> {
     pub(crate) shutdown: Shutdown,
 }
 
-impl<L: Logger> Drop for Inner<L> {
+impl Drop for Inner {
     fn drop(&mut self) {
         self.shutdown.destroy();
     }
 }
 
-impl<L: Logger> Inner<L> {
+impl Inner {
     pub(crate) fn rebuild(&self, obj_id: &str, part_id: u16, raw: &[u8]) -> CorylusResult<()> {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
@@ -421,11 +410,11 @@ impl<L: Logger> Inner<L> {
                 op.execute(&mut *segment.data);
             })?;
 
-        if self.id.eq(&owner) {
-            self.replicate(obj_id, part_id as u64, op)
-        } else {
-            Ok(())
-        }
+        // TODO: Check and review all code changes from PR
+
+        futures::executor::block_on(self.replicate(obj_id, part_id as u64, op))?;
+
+        Ok(())
     }
 
     pub(crate) fn remote_read<O: operation::Read>(
@@ -455,7 +444,11 @@ impl<L: Logger> Inner<L> {
             .map_err(|err| err.into())
     }
 
-    pub(crate) fn write<O: operation::Write>(&self, obj_id: &str, mut op: O) -> CorylusResult<()> {
+    pub(crate) async fn write<O: operation::Write>(
+        &self,
+        obj_id: &str,
+        mut op: O,
+    ) -> CorylusResult<()> {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
@@ -477,7 +470,7 @@ impl<L: Logger> Inner<L> {
                 .with_segment_write(part_id as usize, obj_id, |segment| {
                     op.execute(&mut *segment.data);
                 })?;
-            self.replicate(obj_id, part_id, op)
+            self.replicate(obj_id, part_id, op).await
         } else {
             let raw_op = op.serialize();
             let response = self.net.request_sync(
@@ -492,7 +485,7 @@ impl<L: Logger> Inner<L> {
                 },
             )?;
 
-            let raw: packet::Raw = response.get()?;
+            let raw: packet::Raw = response.recv().await?;
             let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
             match reply {
                 Reply::WriteOp { status, .. } => match status {
@@ -522,7 +515,7 @@ impl<L: Logger> Inner<L> {
         Ok(())
     }
 
-    fn replicate<O: operation::Write>(
+    async fn replicate<O: operation::Write>(
         &self,
         obj_id: &str,
         part_id: u64,
@@ -533,15 +526,18 @@ impl<L: Logger> Inner<L> {
             .get(obj_id)
             .ok_or(object::Error::ObjectNotFound)?;
         let repl_factor = metadata.repl_factor();
-        if repl_factor != 0 {
-            let raw_op = op.serialize();
-            let replica_ids = self.part_group.replicas_of(part_id, repl_factor);
+        if repl_factor == 0 {
+            return Ok(());
+        }
 
-            match metadata.repl() {
-                object::Replication::Sync => {
-                    let mut responses = Vec::with_capacity(replica_ids.len());
-                    for replica_id in replica_ids {
-                        let response = self.net.request_sync(
+        let raw_op = op.serialize();
+        let replica_ids = self.part_group.replicas_of(part_id, repl_factor);
+        match metadata.repl() {
+            object::Replication::Sync => {
+                let responses = replica_ids
+                    .into_iter()
+                    .map(|replica_id| {
+                        self.net.request_sync(
                             replica_id,
                             packet::Request::WriteOp {
                                 v: self.part_group.version(),
@@ -551,53 +547,55 @@ impl<L: Logger> Inner<L> {
                                 op_id: op.id(),
                                 raw_op: &raw_op,
                             },
-                        )?;
-                        responses.push(response);
-                    }
+                        )
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
 
-                    for response in responses {
-                        let raw = response.get()?;
-                        let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
-                        match reply {
-                            Reply::WriteOp { status, .. } => match status {
-                                packet::Status::Success => Ok(()),
-                                s => Err(CorylusError::try_from(s).unwrap_or_else(|_| {
-                                    CorylusError::Io(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "invalid WriteOp status",
-                                    ))
-                                })),
-                            },
-                            _ => {
-                                Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")
-                                    .into())
-                            }
-                        }?;
+                let futs = responses.into_iter().map(|resp| async move {
+                    let raw = resp.recv().await?;
+                    let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
+                    match reply {
+                        Reply::WriteOp { status, .. } => match status {
+                            packet::Status::Success => Ok(()),
+                            s => Err(CorylusError::try_from(s).unwrap_or_else(|_| {
+                                CorylusError::Io(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "invalid WriteOp status",
+                                ))
+                            })),
+                        },
+                        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),
                     }
-                }
-                object::Replication::Async => {
-                    for replica_id in replica_ids {
-                        self.net.request(
-                            replica_id,
-                            packet::Request::WriteOp {
-                                v: self.part_group.version(),
-                                corr_id: Uuid::new_v4(),
-                                part_id: part_id as u16,
-                                obj_id,
-                                op_id: op.id(),
-                                raw_op: &raw_op,
-                            },
-                        )?;
-                    }
-                }
-                object::Replication::None => {}
+                });
+
+                futures::future::try_join_all(futs).await?;
             }
+            object::Replication::Async => {
+                for replica_id in replica_ids {
+                    self.net.request(
+                        replica_id,
+                        packet::Request::WriteOp {
+                            v: self.part_group.version(),
+                            corr_id: Uuid::new_v4(),
+                            part_id: part_id as u16,
+                            obj_id,
+                            op_id: op.id(),
+                            raw_op: &raw_op,
+                        },
+                    )?;
+                }
+            }
+            object::Replication::None => {}
         }
 
         Ok(())
     }
 
-    pub(crate) fn read<O: operation::Read>(&self, obj_id: &str, op: O) -> CorylusResult<Vec<u8>> {
+    pub(crate) async fn read<O: operation::Read>(
+        &self,
+        obj_id: &str,
+        op: O,
+    ) -> CorylusResult<Vec<u8>> {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
@@ -638,7 +636,7 @@ impl<L: Logger> Inner<L> {
                 },
             )?;
 
-            let raw = response.get()?;
+            let raw = response.recv().await?;
             let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
             match reply {
                 packet::Reply::GetOp { status, result, .. } => match status {

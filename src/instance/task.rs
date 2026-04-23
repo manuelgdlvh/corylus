@@ -1,6 +1,5 @@
 use crate::network::Response;
 use crate::network::packet::{Inbound, Reply, Request, Status};
-use crate::runtime::Logger;
 use crate::{
     CorylusError,
     instance::{self},
@@ -21,7 +20,7 @@ pub enum Task {
 }
 
 impl Task {
-    pub fn execute<L: Logger>(self, instance: instance::Weak<L>) {
+    pub fn execute(self, instance: instance::Weak) {
         match self {
             Self::PartitionRebalance => {
                 if let Some(ref_) = instance.as_ref().upgrade() {
@@ -40,8 +39,7 @@ impl Task {
                             segments: HashSet<&'a String>,
                         }
 
-                        ref_.logger
-                            .info(format_args!("rebalance has started. Id: {}.", ref_.id));
+                        log::info!("rebalance has started. Id: {}.", ref_.id);
 
                         ref_.part_group.with_partitions_read(|part| {
                             part.set_state(partition::Lifecycle::Ready);
@@ -157,10 +155,10 @@ impl Task {
                                             }
                                         }
                                         Err(err) => {
-                                            ref_.logger.error(format_args!(
+                                            log::error!(
                                                 "PartitionFetchCompletion request failed. Err: {}.",
                                                 err
-                                            ));
+                                            );
                                         }
                                     }
 
@@ -187,10 +185,10 @@ impl Task {
                                             }
                                         }
                                         Err(err) => {
-                                            ref_.logger.error(format_args!(
+                                            log::error!(
                                                 "FetchObject request failed. Err: {}.",
                                                 err
-                                            ));
+                                            );
                                         }
                                     }
                                 }
@@ -200,7 +198,7 @@ impl Task {
                                 for entry in responses {
                                     match entry {
                                         FetchResponse::FetchObject { obj_id, resp } => {
-                                            match resp.get_with_timeout(timeout) {
+                                            match resp.blocking_recv_timeout(timeout) {
                                                 Ok(raw) => match Reply::try_from(&raw) {
                                                     Ok(Reply::FetchObject { result, .. }) => {
                                                         if let Err(err) = ref_.rebuild(
@@ -208,10 +206,10 @@ impl Task {
                                                             part_id as u16,
                                                             result,
                                                         ) {
-                                                            ref_.logger.error(format_args!(
+                                                            log::error!(
                                                                 "rebuild failed. Err: {}.",
                                                                 err
-                                                            ));
+                                                            );
                                                         } else if let Some(entry) =
                                                             fetch.get_mut(&part_id)
                                                         {
@@ -219,27 +217,27 @@ impl Task {
                                                         }
                                                     }
                                                     Ok(_) => {
-                                                        ref_.logger.error(format_args!(
+                                                        log::error!(
                                                             "unexpected reply variant for FetchObject."
-                                                        ));
+                                                        );
                                                     }
                                                     Err(err) => {
-                                                        ref_.logger.error(format_args!(
+                                                        log::error!(
                                                             "FetchObject reply decode failed. Err: {}.",
                                                             err
-                                                        ));
+                                                        );
                                                     }
                                                 },
                                                 Err(err) => {
-                                                    ref_.logger.error(format_args!(
+                                                    log::error!(
                                                         "Fetch object error. Err: {}.",
                                                         err
-                                                    ));
+                                                    );
                                                 }
                                             }
                                         }
                                         FetchResponse::Completion(resp) => {
-                                            match resp.get_with_timeout(timeout) {
+                                            match resp.blocking_recv_timeout(timeout) {
                                                 Ok(_) => {
                                                     pending_partitions.remove(&part_id);
                                                     ref_.part_group
@@ -251,10 +249,10 @@ impl Task {
                                                         .expect("partition must exist");
                                                 }
                                                 Err(err) => {
-                                                    ref_.logger.error(format_args!(
+                                                    log::error!(
                                                         "Partition Completion error. Err: {}.",
                                                         err
-                                                    ));
+                                                    );
                                                 }
                                             }
                                         }
@@ -271,8 +269,7 @@ impl Task {
                     ref_.part_group
                         .with_partitions_read(|part| part.set_state(partition::Lifecycle::Ready));
 
-                    ref_.logger
-                        .info(format_args!("Rebalance has finished. Id: {}.", ref_.id));
+                    log::info!("Rebalance has finished. Id: {}.", ref_.id);
                 }
             }
 
@@ -426,7 +423,7 @@ impl Executor {
             write,
         }
     }
-    pub fn spawn<L: Logger>(&self, instance: instance::Weak<L>, task: Task) {
+    pub fn spawn(&self, instance: instance::Weak, task: Task) {
         let pool = match task {
             Task::PartitionRebalance => &self.vacuum,
             Task::Read { .. } => &self.read,
