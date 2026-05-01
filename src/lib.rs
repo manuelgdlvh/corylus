@@ -11,6 +11,7 @@ pub mod instance;
 pub mod network;
 pub mod object;
 pub mod partition;
+pub mod runtime;
 pub mod serde;
 mod sync;
 
@@ -30,6 +31,8 @@ pub enum CorylusError {
     #[error("Serde error")]
     Serde(#[from] serde::Error),
 }
+
+// network internals with agnostic tcp streams.
 
 #[derive(Clone)]
 pub struct Instance {
@@ -71,6 +74,10 @@ impl Instance {
 
     pub fn part_group_version(&self) -> u128 {
         self.inner.part_group.version()
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.inner.id
     }
 
     pub fn get_map<K, V>(&self, id: &str) -> Option<DistributedMap<K, V>>

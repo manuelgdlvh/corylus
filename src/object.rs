@@ -129,24 +129,24 @@ where
         }
     }
 
-    pub fn put(&self, k: K, v: V) -> CorylusResult<()> {
+    pub async fn put(&self, k: K, v: V) -> CorylusResult<()> {
         let op = Put::<K, V> { key: k, value: v };
 
         if let Some(ref_) = self.instance.as_ref().upgrade() {
-            ref_.write(self.id.as_str(), op)
+            ref_.write(self.id.as_str(), op).await
         } else {
             panic!("Instance was destroyed")
         }
     }
 
-    pub fn get(&self, k: K) -> CorylusResult<Option<V>> {
+    pub async fn get(&self, k: K) -> CorylusResult<Option<V>> {
         let op = Get::<K, V> {
             key: k,
             _value: Default::default(),
         };
 
         if let Some(ref_) = self.instance.as_ref().upgrade() {
-            let result = ref_.read(self.id.as_str(), op)?;
+            let result = ref_.read(self.id.as_str(), op).await?;
             if result.is_empty() {
                 Ok(None)
             } else {

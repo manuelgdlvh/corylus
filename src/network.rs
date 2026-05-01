@@ -1,17 +1,20 @@
-use crate::network::packet::{Kind, Reply};
+use crate::network::packet::{Kind, Raw, Reply};
 use crate::{
     instance::{
         self, Shutdown,
         task::{self, Task},
     },
     network::{
-        self,
         packet::{Event, Packet},
         registry::Registry,
     },
+    runtime,
 };
+
+use crate::partition::RebalanceScheduler;
+use async_io::Timer;
 use std::collections::HashMap;
-use std::sync::mpsc::SyncSender;
+use std::future::IntoFuture;
 use std::sync::{Arc, Mutex};
 use std::{
     io::{self},
@@ -20,8 +23,11 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
-use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use {
+    futures::{future::FutureExt, pin_mut, select},
+    oneshot,
+};
 
 pub mod packet;
 pub mod registry;
@@ -34,7 +40,7 @@ pub enum Discovery {
 
 #[derive(Clone)]
 pub struct AckHolder {
-    entries: Arc<Mutex<HashMap<Uuid, SyncSender<packet::Raw>>>>,
+    entries: Arc<Mutex<HashMap<Uuid, oneshot::Sender<packet::Raw>>>>,
 }
 
 impl Default for AckHolder {
@@ -51,7 +57,7 @@ impl AckHolder {
     }
 
     pub(crate) fn register(&self, corr_id: Uuid, recv_timeout: Duration) -> Response<'_> {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = oneshot::channel();
         self.entries
             .lock()
             .expect("ack correlation map mutex poisoned")
@@ -60,7 +66,7 @@ impl AckHolder {
         Response::new(corr_id, self, rx, recv_timeout)
     }
 
-    pub(crate) fn unregister(&self, corr_id: Uuid) -> Option<SyncSender<packet::Raw>> {
+    pub(crate) fn unregister(&self, corr_id: Uuid) -> Option<oneshot::Sender<packet::Raw>> {
         self.entries
             .lock()
             .expect("ack correlation map mutex poisoned")
@@ -71,7 +77,7 @@ impl AckHolder {
 pub struct Response<'a> {
     corr_id: Uuid,
     reg: &'a AckHolder,
-    receiver: mpsc::Receiver<packet::Raw>,
+    receiver: Option<oneshot::Receiver<Raw>>,
     recv_timeout: Duration,
 }
 
@@ -79,25 +85,53 @@ impl<'a> Response<'a> {
     pub(crate) fn new(
         corr_id: Uuid,
         reg: &'a AckHolder,
-        receiver: mpsc::Receiver<packet::Raw>,
+        receiver: oneshot::Receiver<packet::Raw>,
         recv_timeout: Duration,
     ) -> Self {
         Self {
             corr_id,
             reg,
-            receiver,
+            receiver: Some(receiver),
             recv_timeout,
         }
     }
 
-    pub fn get(&self) -> Result<packet::Raw, io::Error> {
-        self.get_with_timeout(self.recv_timeout)
+    pub fn blocking_recv(self) -> Result<packet::Raw, io::Error> {
+        let timeout = self.recv_timeout;
+        self.blocking_recv_timeout(timeout)
     }
 
-    pub fn get_with_timeout(&self, timeout: Duration) -> Result<packet::Raw, io::Error> {
-        self.receiver
-            .recv_timeout(timeout)
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
+    pub fn blocking_recv_timeout(mut self, timeout: Duration) -> Result<packet::Raw, io::Error> {
+        let receiver = self
+            .receiver
+            .take()
+            .expect("Response receiver consumed twice");
+        match receiver.recv_timeout(timeout) {
+            Ok(val) => Ok(val),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
+        }
+    }
+
+    pub async fn recv(self) -> Result<packet::Raw, io::Error> {
+        let timeout = self.recv_timeout;
+        self.recv_timeout(timeout).await
+    }
+
+    pub async fn recv_timeout(self, timeout: Duration) -> Result<packet::Raw, io::Error> {
+        let mut this = self;
+        let receiver = this
+            .receiver
+            .take()
+            .expect("Response receiver consumed twice");
+        let recv_fut = receiver.into_future().fuse();
+        let delay_fut = Timer::after(timeout).fuse();
+        pin_mut!(recv_fut);
+        pin_mut!(delay_fut);
+
+        select! {
+            v = recv_fut => v.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Response channel closed")),
+            _ = delay_fut => Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
+        }
     }
 }
 
@@ -137,10 +171,11 @@ impl Sender {
         self.send_internal(id, Packet::Request(packet))
     }
 
-    pub fn reply(&self, id: Uuid, packet: packet::Reply) -> io::Result<()> {
+    pub fn reply(&self, id: Uuid, packet: Reply) -> io::Result<()> {
         self.send_internal(id, Packet::Reply(packet))
     }
 
+    // TODO: Make this async
     fn send_internal(&self, id: Uuid, packet: Packet) -> io::Result<()> {
         let timeout = self.write_timeout();
         let (result, v) = self.registry.with_writers_read(|writers| {
@@ -168,18 +203,33 @@ impl Sender {
 
         match result {
             Some(Err(err)) => {
-                error!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(), err = %err, "Packet send failed");
+                log::error!(
+                    "Packet send failed. Id: {}. Peer id: {}. Kind: {}. Err: {}.",
+                    self.registry.as_ref().id,
+                    id,
+                    packet.kind(),
+                    err
+                );
                 Err(err)
             }
             Some(Ok(_)) => {
-                debug!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(),  "Packet send successfully");
+                log::debug!(
+                    "Packet sent successfully. Id: {}. Peer id: {}. Kind: {}.",
+                    self.registry.as_ref().id,
+                    id,
+                    packet.kind()
+                );
                 Ok(())
             }
             None => {
                 let addr = match self.registry.addr(id) {
                     Some(addr) => addr,
                     None => {
-                        warn!(id = %self.registry.as_ref().id, peer_id = %id, "Connection to peer failed due to no addr found");
+                        log::warn!(
+                            "Connection to peer failed due to no addr found. Id: {}. Peer id: {}.",
+                            self.registry.as_ref().id,
+                            id
+                        );
                         return Err(io::Error::new(
                             io::ErrorKind::AddrNotAvailable,
                             "No peer connection found",
@@ -188,7 +238,12 @@ impl Sender {
                 };
 
                 if let Err(err) = self.registry.connect(&addr, v) {
-                    error!(id = %self.registry.as_ref().id, peer_id= %id, err = %err, "Connection to peer failed");
+                    log::error!(
+                        "Connection to peer failed. Id: {}. Peer id: {}. Err: {}.",
+                        self.registry.as_ref().id,
+                        id,
+                        err
+                    );
                     return Err(err);
                 }
 
@@ -202,11 +257,22 @@ impl Sender {
                         )),
                     }) {
                     Err(err) => {
-                        error!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(), err = %err, "Packet send failed");
+                        log::error!(
+                            "Packet send failed. Id: {}. Peer id: {}. Kind: {}. Err: {}.",
+                            self.registry.as_ref().id,
+                            id,
+                            packet.kind(),
+                            err
+                        );
                         Err(err)
                     }
                     Ok(_) => {
-                        debug!(id = %self.registry.as_ref().id, peer_id = %id, kind = %packet.kind(),  "Packet send successfully");
+                        log::debug!(
+                            "Packet sent successfully. Id: {}. Peer id: {}. Kind: {}.",
+                            self.registry.as_ref().id,
+                            id,
+                            packet.kind()
+                        );
                         Ok(())
                     }
                 }
@@ -228,7 +294,7 @@ pub struct Receiver {
 }
 
 impl Receiver {
-    pub fn recv(&self, timeout: Option<Duration>) -> Option<Message> {
+    fn recv(&self, timeout: Option<Duration>) -> Option<Message> {
         match timeout {
             Some(val) => self.rx_msg.recv_timeout(val).ok(),
             None => Some(
@@ -239,18 +305,26 @@ impl Receiver {
         }
     }
 
-    pub fn start(self, instance: instance::Weak) -> io::Result<JoinHandle<()>> {
+    pub fn start<B>(
+        self,
+        runtime: B,
+        instance: instance::Weak,
+        rebalance_sched: RebalanceScheduler,
+    ) -> io::Result<JoinHandle<()>>
+    where
+        B: runtime::Builder<Runtime: Send + 'static>,
+    {
         let inner = instance
             .as_ref()
             .upgrade()
             .expect("Instance dropped before packet receiver thread started");
         let id = inner.id;
-        let task_executor = task::Executor::new(inner.config.task);
+        let task_executor = task::Executor::new(inner.config.task, runtime);
 
         thread::Builder::new()
             .name(format!("pckt-receiver-{}", id))
             .spawn(move || {
-                info!(id = %id, "pckt-receiver started");
+                log::info!("Packet receiver started. Id: {}.", id);
                 loop {
                     if !self.registry.as_ref().sigterm.checkpoint(None) {
                         break;
@@ -280,16 +354,16 @@ impl Receiver {
                                                 && let Some(entry) =
                                                     self.ack_holder.unregister(corr_id)
                                             {
-                                                let _ = entry.try_send(inbound.p);
+                                                let _ = entry.send(inbound.p);
                                             }
                                         }
                                         Err(err) => {
-                                            warn!(err = %err, "Invalid reply packet");
+                                            log::warn!("Invalid reply packet. Err: {}.", err);
                                         }
                                     },
                                 },
                                 Err(err) => {
-                                    warn!(err = %err, "Invalid packet discriminant");
+                                    log::warn!("Invalid packet discriminant. Err: {}.", err);
                                 }
                             },
                             Message::Event(event) => match event {
@@ -304,14 +378,14 @@ impl Receiver {
                                     }
                                 }
                                 Event::Checkpoint => {
-                                    task_executor.spawn(instance.clone(), Task::PartitionRebalance);
+                                    rebalance_sched.schedule();
                                 }
                             },
                         }
                     }
                 }
 
-                info!(id = %id, "pckt-receiver destroyed");
+                log::info!("Packet receiver stopped. Id: {}.", id);
             })
     }
 }
@@ -371,16 +445,15 @@ pub fn handle(
     id: Uuid,
     d: Discovery,
     shutdown: Shutdown,
-    c: network::Config,
+    c: Config,
 ) -> io::Result<(Sender, Receiver)> {
     let (tx_msg, rx_msg) = mpsc::sync_channel(c.msg_buf_len);
+    let ack_holder = AckHolder::new();
 
     let registry = Registry::new(id, c, tx_msg, shutdown.clone());
 
     shutdown.register(sched::listener(c, registry.clone())?);
     shutdown.register(sched::hb(c, d, registry.clone())?);
-
-    let ack_holder = AckHolder::new();
 
     let net_tx = Sender {
         registry: registry.clone(),

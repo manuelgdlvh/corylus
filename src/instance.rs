@@ -22,6 +22,7 @@ use crate::{
         map::{Get, Put},
     },
     partition::{self, Segment},
+    runtime,
 };
 
 pub mod task;
@@ -121,7 +122,10 @@ impl Builder<Ready> {
         self
     }
 
-    pub fn build(self) -> io::Result<Instance> {
+    pub fn build<B>(self, runtime: B) -> io::Result<Instance>
+    where
+        B: runtime::Builder<Runtime: Send + 'static>,
+    {
         let id = self
             .id
             .expect("Builder<Ready>: with_id must have been called");
@@ -138,7 +142,12 @@ impl Builder<Ready> {
         let partition = partition::Group::new(id, self.segment_fns.as_slice());
         let instance = Instance::new(id, net_sender, partition, self.objects, c, shutdown.clone());
 
-        shutdown.register(net_receiver.start(instance.downgrade())?);
+        let weak = instance.downgrade();
+        let (reb_h, h) = partition::rebalance_sched(weak.clone());
+        shutdown.register(h);
+
+        let h = net_receiver.start(runtime, weak, reb_h)?;
+        shutdown.register(h);
 
         Ok(instance)
     }
@@ -265,11 +274,23 @@ impl Default for PartitionConfig {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ClusterConfig {
+    pub min_size: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self { min_size: 1 }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct Config {
     pub network: network::Config,
     pub partition: PartitionConfig,
     pub task: TaskConfig,
+    pub cluster: ClusterConfig,
 }
 
 #[derive(Clone)]
@@ -369,7 +390,7 @@ impl Inner {
             .map_err(|err| err.into())
     }
 
-    pub(crate) fn remote_write<O: operation::Write>(
+    pub(crate) async fn forwarded_write<O: operation::Write>(
         &self,
         obj_id: &str,
         part_id: u16,
@@ -379,14 +400,15 @@ impl Inner {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
-        let owner = self.part_group.owner_of(part_id as u64);
 
+        let owner = self.part_group.owner_of(part_id as u64);
         if self.id.eq(&owner) {
             self.check_repl_requirements(obj_id)?;
         }
 
         self.part_group
-            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))
+            .await?;
         if !self.part_group.version().eq(&v) {
             return Err(partition::Error::Rebalance.into());
         }
@@ -399,13 +421,13 @@ impl Inner {
             })?;
 
         if self.id.eq(&owner) {
-            self.replicate(obj_id, part_id as u64, op)
-        } else {
-            Ok(())
+            self.replicate(obj_id, part_id as u64, op).await?;
         }
+
+        Ok(())
     }
 
-    pub(crate) fn remote_read<O: operation::Read>(
+    pub(crate) async fn forwarded_read<O: operation::Read>(
         &self,
         obj_id: &str,
         part_id: u16,
@@ -418,7 +440,9 @@ impl Inner {
         // If partition version is correct is ensured that this node is master or replica.
 
         self.part_group
-            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))
+            .await?;
+
         if !self.part_group.version().eq(&v) {
             return Err(partition::Error::Rebalance.into());
         }
@@ -432,15 +456,25 @@ impl Inner {
             .map_err(|err| err.into())
     }
 
-    pub(crate) fn write<O: operation::Write>(&self, obj_id: &str, mut op: O) -> CorylusResult<()> {
+    pub(crate) async fn write<O: operation::Write>(
+        &self,
+        obj_id: &str,
+        mut op: O,
+    ) -> CorylusResult<()> {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
+
+        if self.config.cluster.min_size > self.membership.size() {
+            return Err(CorylusError::Partition(partition::Error::NotEnoughMembers));
+        }
+
         let key = op.partition_key();
         let part_id = self.part_group.partition_of(&key);
 
         self.part_group
-            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))
+            .await?;
         let owner = self.part_group.owner_of(part_id);
 
         if self.id.eq(&owner) {
@@ -449,7 +483,7 @@ impl Inner {
                 .with_segment_write(part_id as usize, obj_id, |segment| {
                     op.execute(&mut *segment.data);
                 })?;
-            self.replicate(obj_id, part_id, op)
+            self.replicate(obj_id, part_id, op).await
         } else {
             let raw_op = op.serialize();
             let response = self.net.request_sync(
@@ -464,7 +498,7 @@ impl Inner {
                 },
             )?;
 
-            let raw: packet::Raw = response.get()?;
+            let raw: packet::Raw = response.recv().await?;
             let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
             match reply {
                 Reply::WriteOp { status, .. } => match status {
@@ -494,7 +528,7 @@ impl Inner {
         Ok(())
     }
 
-    fn replicate<O: operation::Write>(
+    async fn replicate<O: operation::Write>(
         &self,
         obj_id: &str,
         part_id: u64,
@@ -505,15 +539,18 @@ impl Inner {
             .get(obj_id)
             .ok_or(object::Error::ObjectNotFound)?;
         let repl_factor = metadata.repl_factor();
-        if repl_factor != 0 {
-            let raw_op = op.serialize();
-            let replica_ids = self.part_group.replicas_of(part_id, repl_factor);
+        if repl_factor == 0 {
+            return Ok(());
+        }
 
-            match metadata.repl() {
-                object::Replication::Sync => {
-                    let mut responses = Vec::with_capacity(replica_ids.len());
-                    for replica_id in replica_ids {
-                        let response = self.net.request_sync(
+        let raw_op = op.serialize();
+        let replica_ids = self.part_group.replicas_of(part_id, repl_factor);
+        match metadata.repl() {
+            object::Replication::Sync => {
+                let responses = replica_ids
+                    .into_iter()
+                    .map(|replica_id| {
+                        self.net.request_sync(
                             replica_id,
                             packet::Request::WriteOp {
                                 v: self.part_group.version(),
@@ -523,53 +560,55 @@ impl Inner {
                                 op_id: op.id(),
                                 raw_op: &raw_op,
                             },
-                        )?;
-                        responses.push(response);
-                    }
+                        )
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
 
-                    for response in responses {
-                        let raw = response.get()?;
-                        let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
-                        match reply {
-                            Reply::WriteOp { status, .. } => match status {
-                                packet::Status::Success => Ok(()),
-                                s => Err(CorylusError::try_from(s).unwrap_or_else(|_| {
-                                    CorylusError::Io(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "invalid WriteOp status",
-                                    ))
-                                })),
-                            },
-                            _ => {
-                                Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data")
-                                    .into())
-                            }
-                        }?;
+                let futures = responses.into_iter().map(|resp| async move {
+                    let raw = resp.recv().await?;
+                    let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
+                    match reply {
+                        Reply::WriteOp { status, .. } => match status {
+                            packet::Status::Success => Ok(()),
+                            s => Err(CorylusError::try_from(s).unwrap_or_else(|_| {
+                                CorylusError::Io(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "invalid WriteOp status",
+                                ))
+                            })),
+                        },
+                        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid data").into()),
                     }
-                }
-                object::Replication::Async => {
-                    for replica_id in replica_ids {
-                        self.net.request(
-                            replica_id,
-                            packet::Request::WriteOp {
-                                v: self.part_group.version(),
-                                corr_id: Uuid::new_v4(),
-                                part_id: part_id as u16,
-                                obj_id,
-                                op_id: op.id(),
-                                raw_op: &raw_op,
-                            },
-                        )?;
-                    }
-                }
-                object::Replication::None => {}
+                });
+
+                futures::future::try_join_all(futures).await?;
             }
+            object::Replication::Async => {
+                for replica_id in replica_ids {
+                    self.net.request(
+                        replica_id,
+                        packet::Request::WriteOp {
+                            v: self.part_group.version(),
+                            corr_id: Uuid::new_v4(),
+                            part_id: part_id as u16,
+                            obj_id,
+                            op_id: op.id(),
+                            raw_op: &raw_op,
+                        },
+                    )?;
+                }
+            }
+            object::Replication::None => {}
         }
 
         Ok(())
     }
 
-    pub(crate) fn read<O: operation::Read>(&self, obj_id: &str, op: O) -> CorylusResult<Vec<u8>> {
+    pub(crate) async fn read<O: operation::Read>(
+        &self,
+        obj_id: &str,
+        op: O,
+    ) -> CorylusResult<Vec<u8>> {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
@@ -577,7 +616,8 @@ impl Inner {
         let part_id = self.part_group.partition_of(&key);
 
         self.part_group
-            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))?;
+            .await_ready(part_id as usize, Some(self.config.partition.ready_timeout))
+            .await?;
         let owner = self.part_group.owner_of(part_id);
 
         let metadata = self
@@ -610,7 +650,7 @@ impl Inner {
                 },
             )?;
 
-            let raw = response.get()?;
+            let raw = response.recv().await?;
             let reply = Reply::try_from(&raw).map_err(CorylusError::from)?;
             match reply {
                 packet::Reply::GetOp { status, result, .. } => match status {

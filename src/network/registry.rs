@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::network::packet::Inbound;
@@ -29,6 +28,10 @@ const CONN_STRIPES_LEN: usize = 8;
 struct Limiter {
     stripes: [Mutex<()>; CONN_STRIPES_LEN],
 }
+
+// TODO: In input path use async Async<TcpStream> and read path blocking (No need to await just lightweight thread per reader)
+// TODO: Remove writer mutexes and just use packet-sender with one-shot channel.
+// TODO: Local Vec (or map) resulting futures if terminated not blocking and coupling processing with resulting wait.
 
 impl Limiter {
     pub fn new() -> Self {
@@ -108,7 +111,7 @@ impl Registry {
                 .tx_msg
                 .send(Message::Event(Event::PeerAdded { id: peer_id }))
         {
-            error!(err = %err, "Peer added event enqueue failed");
+            log::error!("Peer added event enqueue failed. Err: {}.", err);
         }
     }
 
@@ -142,7 +145,11 @@ impl Registry {
             .tx_msg
             .send(Message::Event(Event::PeerRemoved { id: peer_id }));
 
-        info!(id = %self.as_ref().id, peer_id = %peer_id, "Peer disconnected successfully");
+        log::info!(
+            "Peer disconnected successfully. Id: {}. Peer id: {}.",
+            self.as_ref().id,
+            peer_id
+        );
     }
 
     pub fn version(&self, id: Uuid) -> Option<u64> {
@@ -348,7 +355,12 @@ impl PeerRead {
             .name(format!("tcp-{}-{}", peer_id, version))
             .stack_size(128 * 1024)
             .spawn(move || {
-                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "tcp connection initialized");
+                log::info!(
+                    "TCP connection initialized. Id: {}. Peer id: {}. V: {}.",
+                    registry.as_ref().id,
+                    peer_id,
+                    version
+                );
 
                 loop {
                     match registry.version(peer_id) {
@@ -365,17 +377,35 @@ impl PeerRead {
                             let kind = match packet.try_kind() {
                                 Ok(k) => k,
                                 Err(err) => {
-                                    error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, err = %err, "Invalid packet kind");
+                                    log::error!(
+                                        "Invalid packet kind. Id: {}. Peer id: {}. V: {}. Err: {}.",
+                                        registry.as_ref().id,
+                                        peer_id,
+                                        version,
+                                        err
+                                    );
                                     continue;
                                 }
                             };
                             if matches!(kind, packet::Kind::HeartBeatRequest) {
-                                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "Heartbeat packet received");
+                                log::info!(
+                                    "Heartbeat packet received. Id: {}. Peer id: {}. V: {}.",
+                                    registry.as_ref().id,
+                                    peer_id,
+                                    version
+                                );
                                 registry.update_hb(peer_id);
                             } else if let Err(err) =
                                 registry.as_ref().tx_msg.send(Message::Packet (Inbound::new(peer_id, packet) ))
                             {
-                                error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, kind = %kind, err = %err, "Packet enqueue failed");
+                                log::error!(
+                                    "Packet enqueue failed. Id: {}. Peer id: {}. V: {}. Kind: {}. Err: {}.",
+                                    registry.as_ref().id,
+                                    peer_id,
+                                    version,
+                                    kind,
+                                    err
+                                );
                             }
                         }
                         Err(err)
@@ -394,13 +424,25 @@ impl PeerRead {
                             if !matches!(
                                 err.kind(),
                                 io::ErrorKind::WouldBlock) {
-                                error!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, kind = %err.kind(), err = %err, "Packet read failed");
+                                log::error!(
+                                    "Packet read failed. Id: {}. Peer id: {}. V: {}. Kind: {:?}. Err: {}.",
+                                    registry.as_ref().id,
+                                    peer_id,
+                                    version,
+                                    err.kind(),
+                                    err
+                                );
                             }
                         }
                     }
                 }
 
-                info!(id = %registry.as_ref().id, peer_id = %peer_id, v = %version, "tcp connection destroyed");
+                log::info!(
+                    "TCP connection destroyed. Id: {}. Peer id: {}. V: {}.",
+                    registry.as_ref().id,
+                    peer_id,
+                    version
+                );
             })
     }
 }
