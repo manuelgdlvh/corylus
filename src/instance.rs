@@ -122,9 +122,10 @@ impl Builder<Ready> {
         self
     }
 
-    pub fn build<B>(self, runtime: B) -> io::Result<Instance>
+    pub async fn build<S, I>(self) -> io::Result<Instance>
     where
-        B: runtime::Builder<Runtime: Send + 'static>,
+        S: runtime::Spawner,
+        I: runtime::Io,
     {
         let id = self
             .id
@@ -138,7 +139,8 @@ impl Builder<Ready> {
 
         let shutdown = Shutdown::new();
 
-        let (net_sender, net_receiver) = network::handle(id, d, shutdown.clone(), c.network)?;
+        let (net_sender, net_receiver) =
+            network::handle::<S, I>(id, d, shutdown.clone(), c.network).await?;
         let partition = partition::Group::new(id, self.segment_fns.as_slice());
         let instance = Instance::new(id, net_sender, partition, self.objects, c, shutdown.clone());
 
@@ -146,7 +148,7 @@ impl Builder<Ready> {
         let (reb_h, h) = partition::rebalance_sched(weak.clone());
         shutdown.register(h);
 
-        let h = net_receiver.start(runtime, weak, reb_h)?;
+        let h = net_receiver.start::<S>(weak, reb_h)?;
         shutdown.register(h);
 
         Ok(instance)
@@ -374,20 +376,21 @@ impl Inner {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
-        self.part_group
-            .with_segment_write(part_id as usize, obj_id, |segment| {
-                (*segment.data).rebuild(raw)
-            })
-            .map_err(|err| err.into())
+
+        let segment = self.part_group.segment(part_id as usize, obj_id)?;
+        segment.with_data_write(|data| {
+            data.rebuild(raw);
+        });
+        Ok(())
     }
 
     pub(crate) fn fetch(&self, obj_id: &str, part_id: u16) -> CorylusResult<Vec<u8>> {
         if !self.objects.contains_key(obj_id) {
             return Err(CorylusError::Object(object::Error::ObjectNotFound));
         }
-        self.part_group
-            .with_segment_read(part_id as usize, obj_id, |segment| (*segment.data).as_raw())
-            .map_err(|err| err.into())
+
+        let segment = self.part_group.segment(part_id as usize, obj_id)?;
+        Ok(segment.with_data_read(|data| data.as_raw()))
     }
 
     pub(crate) async fn forwarded_write<O: operation::Write>(
@@ -413,12 +416,10 @@ impl Inner {
             return Err(partition::Error::Rebalance.into());
         }
 
-        // Implement double check of part group version inside lock.
-        // Implement await of status change if not ready and tryLock.
-        self.part_group
-            .with_segment_write(part_id as usize, obj_id, |segment| {
-                op.execute(&mut *segment.data);
-            })?;
+        let segment = self.part_group.segment(part_id as usize, obj_id)?;
+        segment.with_data_write(|data| {
+            op.execute(data);
+        });
 
         if self.id.eq(&owner) {
             self.replicate(obj_id, part_id as u64, op).await?;
@@ -449,11 +450,9 @@ impl Inner {
 
         // Implement double check of part group version inside lock.
         // Implement await of status change if not ready and tryLock.
-        self.part_group
-            .with_segment_read(part_id as usize, obj_id, |segment| {
-                op.execute(&*segment.data)
-            })
-            .map_err(|err| err.into())
+
+        let segment = self.part_group.segment(part_id as usize, obj_id)?;
+        Ok(segment.with_data_read(|data| op.execute(data)))
     }
 
     pub(crate) async fn write<O: operation::Write>(
@@ -479,10 +478,12 @@ impl Inner {
 
         if self.id.eq(&owner) {
             self.check_repl_requirements(obj_id)?;
-            self.part_group
-                .with_segment_write(part_id as usize, obj_id, |segment| {
-                    op.execute(&mut *segment.data);
-                })?;
+
+            let segment = self.part_group.segment(part_id as usize, obj_id)?;
+            segment.with_data_write(|data| {
+                op.execute(data);
+            });
+
             self.replicate(obj_id, part_id, op).await
         } else {
             let raw_op = op.serialize();
@@ -631,11 +632,8 @@ impl Inner {
                     .part_group
                     .is_replica(self.id, part_id, metadata.repl_factor()));
         if local_exec {
-            self.part_group
-                .with_segment_read(part_id as usize, obj_id, |segment| {
-                    op.execute(&*segment.data)
-                })
-                .map_err(|err| err.into())
+            let segment = self.part_group.segment(part_id as usize, obj_id)?;
+            Ok(segment.with_data_read(|data| op.execute(data)))
         } else {
             let raw_op = op.serialize();
             let response = self.net.request_sync(

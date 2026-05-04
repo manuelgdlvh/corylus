@@ -2,7 +2,7 @@ use std::{
     array,
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    io::{self, Read, Write},
+    io::{self, Read},
     net::{SocketAddr, TcpStream},
     sync::{
         Arc, Mutex, RwLock, RwLockReadGuard,
@@ -15,23 +15,20 @@ use std::{
 
 use uuid::Uuid;
 
-use crate::network::packet::Inbound;
 use crate::{
     instance::Shutdown,
     network::{
         self, Message,
         packet::{self, Event, PACKET_LENGTH, Packet},
     },
+    runtime::{TcpRead, TcpWrite},
 };
+use crate::{network::packet::Inbound, runtime};
 
 const CONN_STRIPES_LEN: usize = 8;
 struct Limiter {
     stripes: [Mutex<()>; CONN_STRIPES_LEN],
 }
-
-// TODO: In input path use async Async<TcpStream> and read path blocking (No need to await just lightweight thread per reader)
-// TODO: Remove writer mutexes and just use packet-sender with one-shot channel.
-// TODO: Local Vec (or map) resulting futures if terminated not blocking and coupling processing with resulting wait.
 
 impl Limiter {
     pub fn new() -> Self {
@@ -40,7 +37,11 @@ impl Limiter {
         }
     }
 
-    pub fn execute<F: Fn() -> io::Result<()>>(&self, addr: &SocketAddr, f: F) -> io::Result<()> {
+    pub async fn execute<F: Future<Output = io::Result<()>>>(
+        &self,
+        addr: &SocketAddr,
+        f: F,
+    ) -> io::Result<()> {
         let mut hasher = DefaultHasher::new();
         addr.hash(&mut hasher);
         let id = (hasher.finish() as usize) & (CONN_STRIPES_LEN - 1);
@@ -48,40 +49,44 @@ impl Limiter {
         let _guard = &self.stripes[id]
             .lock()
             .expect("connection limiter stripe mutex poisoned");
-        f()
+        f.await
     }
 }
 
+// TODO: Make just the conversion from TCPStream and sched threads sync into async with Runtime abstractions. Next step will be reduce the lock's and isolate receiver.
 #[derive(Clone)]
-pub(crate) struct Registry {
-    inner: Arc<Inner>,
+pub(crate) struct Registry<S: runtime::Spawner, I: runtime::Io> {
+    inner: Arc<Inner<S, I>>,
 }
 
-pub(crate) struct Inner {
+pub(crate) struct Inner<S: runtime::Spawner, I: runtime::Io> {
     pub(crate) id: Uuid,
+    pub(crate) spawner: S,
     pub(crate) config: network::Config,
     pub(crate) tx_msg: SyncSender<Message>,
     pub(crate) sigterm: Shutdown,
     addrs: Mutex<HashMap<Uuid, SocketAddr>>,
-    writers: RwLock<HashMap<Uuid, PeerWrite>>,
+    writers: RwLock<HashMap<Uuid, PeerWrite<I>>>,
     limiter: Limiter,
 }
 
-impl AsRef<Inner> for Registry {
-    fn as_ref(&self) -> &Inner {
+impl<S: runtime::Spawner, I: runtime::Io> AsRef<Inner<S, I>> for Registry<S, I> {
+    fn as_ref(&self) -> &Inner<S, I> {
         &self.inner
     }
 }
 
-impl Registry {
+impl<S: runtime::Spawner, I: runtime::Io> Registry<S, I> {
     pub fn new(
         id: Uuid,
+        spawner: S,
         config: network::Config,
         tx_msg: SyncSender<Message>,
         sigterm: Shutdown,
     ) -> Self {
         let inner = Arc::new(Inner {
             id,
+            spawner,
             config,
             tx_msg,
             sigterm,
@@ -93,7 +98,7 @@ impl Registry {
     }
 
     // Listener accepts connection single threaded, so we always have linearizability here.
-    pub fn register(&self, peer_id: Uuid, peer_addr: &SocketAddr, writer: PeerWrite) {
+    pub fn register(&self, peer_id: Uuid, peer_addr: &SocketAddr, writer: PeerWrite<I>) {
         let old_addr = self
             .as_ref()
             .addrs
@@ -161,9 +166,9 @@ impl Registry {
             .map(|w| w.v)
     }
 
-    pub fn connect_with_id(&self, id: Uuid, v: Option<u64>) -> io::Result<()> {
+    pub async fn connect_with_id(&self, id: Uuid, v: Option<u64>) -> io::Result<()> {
         if let Some(addr) = self.addr(id) {
-            self.connect(&addr, v)
+            self.connect(&addr, v).await
         } else {
             Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
@@ -172,59 +177,67 @@ impl Registry {
         }
     }
 
-    pub fn connect(&self, peer_addr: &SocketAddr, v: Option<u64>) -> io::Result<()> {
-        self.as_ref().limiter.execute(peer_addr, || {
-            if let Some(peer_id) = self.peer_id_from_addr(peer_addr)
-                && let Some(current_v) = self.version(peer_id)
-            {
-                match v {
-                    Some(val) => {
-                        if val != current_v {
+    pub async fn connect(&self, peer_addr: &SocketAddr, v: Option<u64>) -> io::Result<()> {
+        self.as_ref()
+            .limiter
+            .execute(peer_addr, async move {
+                if let Some(peer_id) = self.peer_id_from_addr(peer_addr)
+                    && let Some(current_v) = self.version(peer_id)
+                {
+                    match v {
+                        Some(val) => {
+                            if val != current_v {
+                                return Ok(());
+                            }
+                        }
+
+                        None => {
                             return Ok(());
                         }
                     }
-
-                    None => {
-                        return Ok(());
-                    }
                 }
-            }
 
-            let stream =
-                TcpStream::connect_timeout(peer_addr, self.as_ref().config.timeout.connect)?;
-            let mut r = PeerRead::new(stream.try_clone()?);
-            let w = PeerWrite::new(stream);
+                let (r, w) = I::stream(peer_addr).await?;
+                // TcpStream::connect_timeout(peer_addr, self.as_ref().config.timeout.connect)?;
+                let mut r = PeerRead::new(r);
+                let w = PeerWrite::new(w);
 
-            w.write(
-                &Packet::Request(packet::Request::WhoIs {
-                    id: self.as_ref().id,
-                    addr: self.as_ref().config.addr,
-                }),
-                Some(self.as_ref().config.timeout.write),
-            )?;
+                w.write(
+                    &Packet::Request(packet::Request::WhoIs {
+                        id: self.as_ref().id,
+                        addr: self.as_ref().config.addr,
+                    }),
+                    Some(self.as_ref().config.timeout.write),
+                )
+                .await?;
 
-            let packet_raw = r.read(Some(self.as_ref().config.timeout.read))?;
-            match packet::Reply::try_from(&packet_raw)? {
-                packet::Reply::WhoIs { id } => {
-                    let v = w.v;
-                    self.register(id, peer_addr, w);
-                    match r.start(self.clone(), id, v) {
-                        Ok(h) => {
-                            self.as_ref().sigterm.register(h);
-                            Ok(())
-                        }
-                        Err(err) => {
-                            self.unregister(id, v);
-                            Err(err)
-                        }
+                let packet_raw = r.read(Some(self.as_ref().config.timeout.read)).await?;
+                match packet::Reply::try_from(&packet_raw)? {
+                    packet::Reply::WhoIs { id } => {
+                        let v = w.v;
+                        self.register(id, peer_addr, w);
+                        // match r.start(self.clone(), id, v) {
+                        //     Ok(h) => {
+                        //         self.as_ref().sigterm.register(h);
+                        //         Ok(())
+                        //     }
+                        //     Err(err) => {
+                        //         self.unregister(id, v);
+                        //         Err(err)
+                        //     }
+                        // }
+
+                        r.start(self.clone(), id, v);
+                        Ok(())
+
                     }
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "Who Is reply not received",
+                    )),
                 }
-                _ => Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "Who Is reply not received",
-                )),
-            }
-        })
+            })
+            .await
     }
 
     fn peer_id_from_addr(&self, addr: &SocketAddr) -> Option<Uuid> {
@@ -275,27 +288,27 @@ impl Registry {
         self.with_writers_read(|writers| writers.get(&id).map(|writer| writer.hb()))
     }
 
-    pub(crate) fn with_writers_read<F, O>(&self, f: F) -> O
+    pub(crate) async fn with_writers_read<F, O>(&self, f: F) -> O
     where
-        F: Fn(RwLockReadGuard<'_, HashMap<Uuid, PeerWrite>>) -> O,
+        F: Fn(RwLockReadGuard<'_, HashMap<Uuid, PeerWrite<I>>>) -> impl Future<Output = O>,
     {
         let guard = self
             .as_ref()
             .writers
             .read()
             .expect("peer writers RwLock poisoned");
-        f(guard)
+        f(guard).await
     }
 }
 
-pub(crate) struct PeerWrite {
-    stream: Mutex<TcpStream>,
+pub(crate) struct PeerWrite<I: runtime::Io> {
+    stream: Mutex<I::StreamWrite>,
     hb: Mutex<Instant>,
     pub(crate) v: u64,
 }
 
-impl PeerWrite {
-    pub fn new(stream: TcpStream) -> Self {
+impl<I: runtime::Io> PeerWrite<I> {
+    pub fn new(stream: I::StreamWrite) -> Self {
         static VERSION: AtomicU64 = AtomicU64::new(0);
 
         Self {
@@ -305,14 +318,15 @@ impl PeerWrite {
         }
     }
 
-    pub fn write(&self, packet: &Packet, timeout: Option<Duration>) -> io::Result<()> {
+    pub async fn write(&self, packet: &Packet<'_>, timeout: Option<Duration>) -> io::Result<()> {
         let raw: Vec<u8> = packet.into();
         let mut stream = self
             .stream
             .lock()
             .expect("PeerWrite TcpStream mutex poisoned");
-        stream.set_write_timeout(timeout)?;
-        stream.write_all(raw.as_slice())
+        // stream.set_write_timeout(timeout)?;
+        //
+        stream.write_all(raw.as_slice()).await
     }
 
     pub fn update_hb(&self) {
@@ -325,124 +339,128 @@ impl PeerWrite {
     }
 }
 
-pub(crate) struct PeerRead {
-    stream: TcpStream,
+pub(super) struct PeerRead<I: runtime::Io> {
+    stream: I::StreamRead,
 }
 
-impl PeerRead {
-    pub fn new(stream: TcpStream) -> Self {
+impl<I: runtime::Io> PeerRead<I> {
+    pub fn new(stream: I::StreamRead) -> Self {
         Self { stream }
     }
 
-    pub fn read(&mut self, timeout: Option<Duration>) -> io::Result<packet::Raw> {
-        self.stream.set_read_timeout(timeout)?;
+    pub async fn read(&mut self, timeout: Option<Duration>) -> io::Result<packet::Raw> {
+        // self.stream.set_read_timeout(timeout)?;
         let mut len_buffer: [u8; PACKET_LENGTH] = [0; PACKET_LENGTH];
-        self.stream.read_exact(&mut len_buffer)?;
+        self.stream.read_exact(len_buffer.as_mut_slice()).await?;
         let len: u32 = u32::from_le_bytes(len_buffer);
 
         let mut payload_buffer = vec![0u8; len as usize];
-        self.stream.read_exact(&mut payload_buffer)?;
+        self.stream
+            .read_exact(payload_buffer.as_mut_slice())
+            .await?;
         Ok(packet::Raw::new(payload_buffer))
     }
 
-    pub fn start(
+    pub fn start<S: runtime::Spawner>(
         mut self,
-        registry: Registry,
+        registry: Registry<S, I>,
         peer_id: Uuid,
         version: u64,
-    ) -> io::Result<JoinHandle<()>> {
-        thread::Builder::new()
-            .name(format!("tcp-{}-{}", peer_id, version))
-            .stack_size(128 * 1024)
-            .spawn(move || {
-                log::info!(
-                    "TCP connection initialized. Id: {}. Peer id: {}. V: {}.",
-                    registry.as_ref().id,
-                    peer_id,
-                    version
-                );
+    ) {
+        // ) -> io::Result<JoinHandle<()>> {
+        //
 
-                loop {
-                    match registry.version(peer_id) {
-                        Some(current) if current == version => {}
-                        _ => break,
-                    }
+        let spawner = registry.as_ref().spawner.clone();
+        spawner.spawn(async move {
 
-                    if !registry.as_ref().sigterm.checkpoint(None) {
-                        break;
-                    }
+        log::info!(
+            "TCP connection initialized. Id: {}. Peer id: {}. V: {}.",
+            registry.as_ref().id,
+            peer_id,
+            version
+        );
 
-                    match self.read(Some(registry.as_ref().config.timeout.read)) {
-                        Ok(packet) => {
-                            let kind = match packet.try_kind() {
-                                Ok(k) => k,
-                                Err(err) => {
-                                    log::error!(
-                                        "Invalid packet kind. Id: {}. Peer id: {}. V: {}. Err: {}.",
-                                        registry.as_ref().id,
-                                        peer_id,
-                                        version,
-                                        err
-                                    );
-                                    continue;
-                                }
-                            };
-                            if matches!(kind, packet::Kind::HeartBeatRequest) {
-                                log::info!(
-                                    "Heartbeat packet received. Id: {}. Peer id: {}. V: {}.",
-                                    registry.as_ref().id,
-                                    peer_id,
-                                    version
-                                );
-                                registry.update_hb(peer_id);
-                            } else if let Err(err) =
-                                registry.as_ref().tx_msg.send(Message::Packet (Inbound::new(peer_id, packet) ))
-                            {
-                                log::error!(
-                                    "Packet enqueue failed. Id: {}. Peer id: {}. V: {}. Kind: {}. Err: {}.",
-                                    registry.as_ref().id,
-                                    peer_id,
-                                    version,
-                                    kind,
-                                    err
-                                );
-                            }
-                        }
-                        Err(err)
-                        if matches!(
-                                err.kind(),
-                                io::ErrorKind::BrokenPipe
-                                    | io::ErrorKind::ConnectionReset
-                                    | io::ErrorKind::ConnectionAborted
-                                    | io::ErrorKind::NotConnected
-                                    | io::ErrorKind::UnexpectedEof
-                            ) =>
-                            {
-                                break;
-                            }
+        loop {
+            match registry.version(peer_id) {
+                Some(current) if current == version => {}
+                _ => break,
+            }
+
+            if !registry.as_ref().sigterm.checkpoint(None) {
+                break;
+            }
+
+            match self.read(Some(registry.as_ref().config.timeout.read)).await {
+                Ok(packet) => {
+                    let kind = match packet.try_kind() {
+                        Ok(k) => k,
                         Err(err) => {
-                            if !matches!(
-                                err.kind(),
-                                io::ErrorKind::WouldBlock) {
-                                log::error!(
-                                    "Packet read failed. Id: {}. Peer id: {}. V: {}. Kind: {:?}. Err: {}.",
-                                    registry.as_ref().id,
-                                    peer_id,
-                                    version,
-                                    err.kind(),
-                                    err
-                                );
-                            }
+                            log::error!(
+                                "Invalid packet kind. Id: {}. Peer id: {}. V: {}. Err: {}.",
+                                registry.as_ref().id,
+                                peer_id,
+                                version,
+                                err
+                            );
+                            continue;
                         }
+                    };
+                    if matches!(kind, packet::Kind::HeartBeatRequest) {
+                        log::info!(
+                            "Heartbeat packet received. Id: {}. Peer id: {}. V: {}.",
+                            registry.as_ref().id,
+                            peer_id,
+                            version
+                        );
+                        registry.update_hb(peer_id);
+                    } else if let Err(err) = registry
+                        .as_ref()
+                        .tx_msg
+                        .send(Message::Packet(Inbound::new(peer_id, packet)))
+                    {
+                        log::error!(
+                            "Packet enqueue failed. Id: {}. Peer id: {}. V: {}. Kind: {}. Err: {}.",
+                            registry.as_ref().id,
+                            peer_id,
+                            version,
+                            kind,
+                            err
+                        );
                     }
                 }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    break;
+                }
+                Err(err) => {
+                    if !matches!(err.kind(), io::ErrorKind::WouldBlock) {
+                        log::error!(
+                            "Packet read failed. Id: {}. Peer id: {}. V: {}. Kind: {:?}. Err: {}.",
+                            registry.as_ref().id,
+                            peer_id,
+                            version,
+                            err.kind(),
+                            err
+                        );
+                    }
+                }
+            }
+        }
 
-                log::info!(
-                    "TCP connection destroyed. Id: {}. Peer id: {}. V: {}.",
-                    registry.as_ref().id,
-                    peer_id,
-                    version
-                );
-            })
-    }
-}
+        log::info!(
+            "TCP connection destroyed. Id: {}. Peer id: {}. V: {}.",
+            registry.as_ref().id,
+            peer_id,
+            version
+        );
+            
+    });
+} }

@@ -76,6 +76,7 @@ impl<T: Default + Eq + PartialEq + Copy + Copy> AsyncState<T> {
             .expect("sync::AsyncState inner mutex poisoned");
         status.eq(&*state)
     }
+
     pub async fn await_until(&self, status: T, timeout: Option<Duration>) -> bool {
         if self.check(status) {
             return true;

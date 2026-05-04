@@ -1,5 +1,5 @@
 use crate::network::packet::{Inbound, Reply, Request, Status};
-use crate::runtime::{Options, Runtime};
+use crate::runtime::Options;
 use crate::{
     CorylusError,
     instance::{self},
@@ -141,29 +141,24 @@ impl Task {
     }
 }
 
-pub struct Executor<T: Runtime> {
-    read: T,
-    write: T,
+pub struct Executor<S: runtime::Spawner> {
+    read: S,
+    write: S,
 }
 
-impl<T: Runtime> Executor<T> {
-    pub fn new<B>(task: instance::TaskConfig, builder: B) -> Self
-    where
-        B: runtime::Builder<Runtime = T>,
-    {
-        let read = builder
-            .build(Options {
-                name: "read-task-runtime".to_string(),
-                threads: task.read_threads,
-            })
-            .expect("read-ops thread pool: OS refused or thread count invalid");
+impl<S: runtime::Spawner> Executor<S> {
+    pub fn new(task: instance::TaskConfig) -> Self {
+        let read = S::build(Options {
+            name: "read-task-runtime".to_string(),
+            threads: task.read_threads,
+        })
+        .expect("read-ops thread pool: OS refused or thread count invalid");
 
-        let write = builder
-            .build(Options {
-                name: "write-task-runtime".to_string(),
-                threads: task.write_threads,
-            })
-            .expect("write-ops thread pool: OS refused or thread count invalid");
+        let write = S::build(Options {
+            name: "write-task-runtime".to_string(),
+            threads: task.write_threads,
+        })
+        .expect("write-ops thread pool: OS refused or thread count invalid");
 
         Self { read, write }
     }

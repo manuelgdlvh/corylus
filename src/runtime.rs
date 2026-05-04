@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, net::ToSocketAddrs};
 
 #[derive(Clone)]
 pub struct Options {
@@ -6,12 +6,38 @@ pub struct Options {
     pub threads: usize,
 }
 
-pub trait Builder {
-    type Runtime: Runtime;
-    fn build(&self, opts: Options) -> io::Result<Self::Runtime>;
+pub trait Timer {}
+
+pub trait Io: Clone + 'static {
+    type Listener: TcpListener;
+    type StreamRead: TcpRead;
+    type StreamWrite: TcpWrite;
+
+    fn listener<A: ToSocketAddrs>(addr: A) -> impl Future<Output = io::Result<Self::Listener>>;
+    fn stream<A: ToSocketAddrs>(
+        addr: A,
+    ) -> impl Future<Output = io::Result<(Self::StreamRead, Self::StreamWrite)>>;
 }
 
-pub trait Runtime {
+pub trait TcpRead: Send {
+    fn read_exact(&mut self, buffer: &mut [u8]) -> impl Future<Output = io::Result<()>> + Send;
+}
+pub trait TcpWrite: Send {
+    fn write_all(&mut self, buffer: &[u8]) -> impl Future<Output = io::Result<()>>;
+}
+
+pub trait TcpListener {
+    type StreamRead: TcpRead;
+    type StreamWrite: TcpWrite;
+
+    fn accept(&self) -> impl Future<Output = (Self::StreamRead, Self::StreamWrite)>;
+}
+
+pub trait Spawner: Send + Sync + Clone + 'static {
+    fn build(opts: Options) -> io::Result<Self>
+    where
+        Self: Sized;
+
     fn spawn<F>(&self, f: F)
     where
         F: Future<Output = ()> + Send + 'static;

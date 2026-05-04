@@ -39,20 +39,31 @@ pub enum Error {
 
 pub struct Segment {
     id: String,
-    pub(crate) data: Box<dyn object::Raw>,
-    // Useful for entropy process of partitions after membership changes or corruption detection
-    seq: u64,
-    checksum: u64,
+    data: RwLock<Box<dyn object::Raw>>,
 }
 
 impl Segment {
     pub fn new<S: object::Raw + 'static>(id: String, data: S) -> Self {
         Self {
             id,
-            data: Box::new(data),
-            seq: 0,
-            checksum: 0,
+            data: RwLock::new(Box::new(data)),
         }
+    }
+
+    pub fn with_data_read<F, O>(&self, f: F) -> O
+    where
+        F: FnOnce(&dyn object::Raw) -> O,
+    {
+        let guard = self.data.read().expect("failed to acquire data read lock");
+        f(&**guard)
+    }
+
+    pub fn with_data_write<F, O>(&self, f: F) -> O
+    where
+        F: FnOnce(&mut dyn object::Raw) -> O,
+    {
+        let mut guard = self.data.write().expect("failed to acquire data read lock");
+        f(&mut **guard)
     }
 }
 
@@ -183,15 +194,7 @@ impl Group {
         *version = partition::version(member_ids);
     }
 
-    pub fn with_segment_read<F, O>(
-        &self,
-        part_id: usize,
-        obj_id: &str,
-        f: F,
-    ) -> Result<O, partition::Error>
-    where
-        F: FnOnce(&Segment) -> O,
-    {
+    pub fn segment(&self, part_id: usize, obj_id: &str) -> Result<&Segment, partition::Error> {
         if part_id >= RING_CAPACITY {
             return Err(Error::PartitionNotFound);
         }
@@ -200,34 +203,8 @@ impl Group {
         let segment = partition
             .segments
             .get(obj_id)
-            .expect("segment must exist for object id (caller precondition)")
-            .read()
-            .expect("segment RwLock poisoned");
-        Ok(f(&segment))
-    }
-
-    pub fn with_segment_write<F>(
-        &self,
-        part_id: usize,
-        obj_id: &str,
-        f: F,
-    ) -> Result<(), partition::Error>
-    where
-        F: FnOnce(&mut Segment),
-    {
-        if part_id >= RING_CAPACITY {
-            return Err(Error::PartitionNotFound);
-        }
-
-        let partition = &self.partitions[part_id];
-        let mut segment = partition
-            .segments
-            .get(obj_id)
-            .expect("segment must exist for object id (caller precondition)")
-            .write()
-            .expect("segment RwLock poisoned");
-        f(&mut segment);
-        Ok(())
+            .expect("segment must exist for object id (caller precondition)");
+        Ok(segment)
     }
 
     pub fn version(&self) -> u128 {
@@ -248,7 +225,7 @@ impl Group {
 
 pub struct Partition {
     metadata: RwLock<Metadata>,
-    segments: HashMap<object::Id, RwLock<Segment>>,
+    segments: HashMap<object::Id, Segment>,
     state: AsyncState<Lifecycle>,
 }
 
@@ -259,7 +236,7 @@ impl Partition {
         let mut segments = HashMap::with_capacity(segment_fns.len());
         for f in segment_fns {
             let segment = f();
-            segments.insert(segment.id.to_string(), RwLock::new(segment));
+            segments.insert(segment.id.to_string(), segment);
         }
 
         Self {
@@ -270,8 +247,7 @@ impl Partition {
     }
 
     pub fn with_segment(mut self, segment: Segment) -> Self {
-        self.segments
-            .insert(segment.id.to_string(), RwLock::new(segment));
+        self.segments.insert(segment.id.to_string(), segment);
         self
     }
 

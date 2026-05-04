@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use corylus::runtime::{Options, Runtime};
+use corylus::runtime::Options;
 use corylus::{
     CorylusResult, instance,
     network::{self, Discovery},
@@ -26,26 +26,15 @@ mod repl;
 
 pub type Instance = corylus::Instance;
 
-pub struct TokioRuntime {
+pub struct TokioSpawner {
     runtime: tokio::runtime::Runtime,
 }
 
-impl Runtime for TokioRuntime {
-    fn spawn<F>(&self, f: F)
+impl runtime::Spawner for TokioSpawner {
+    fn build(opts: Options) -> io::Result<Self>
     where
-        F: Future<Output = ()> + 'static + Send,
+        Self: Sized,
     {
-        self.runtime.spawn(f);
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct TokioBuilder {}
-
-impl runtime::Builder for TokioBuilder {
-    type Runtime = TokioRuntime;
-
-    fn build(&self, opts: Options) -> io::Result<Self::Runtime> {
         let mut builder;
         if opts.threads > 1 {
             builder = tokio::runtime::Builder::new_multi_thread();
@@ -58,7 +47,13 @@ impl runtime::Builder for TokioBuilder {
             .worker_threads(opts.threads)
             .build()?;
 
-        Ok(TokioRuntime { runtime })
+        Ok(Self { runtime })
+    }
+    fn spawn<F>(&self, f: F)
+    where
+        F: Future<Output = ()> + 'static + Send,
+    {
+        self.runtime.spawn(f);
     }
 }
 
@@ -94,7 +89,7 @@ pub(crate) fn new_instance(
             ],
         })
         .with_map::<String, String>("str-str", repl_config)
-        .build(TokioBuilder::default())
+        .build::<TokioSpawner>()
 }
 
 async fn with_instances<F, Fut>(f: F, repl_config: object::ReplicationConfig) -> CorylusResult<()>

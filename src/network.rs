@@ -175,7 +175,6 @@ impl Sender {
         self.send_internal(id, Packet::Reply(packet))
     }
 
-    // TODO: Make this async
     fn send_internal(&self, id: Uuid, packet: Packet) -> io::Result<()> {
         let timeout = self.write_timeout();
         let (result, v) = self.registry.with_writers_read(|writers| {
@@ -305,21 +304,20 @@ impl Receiver {
         }
     }
 
-    pub fn start<B>(
+    pub fn start<S>(
         self,
-        runtime: B,
         instance: instance::Weak,
         rebalance_sched: RebalanceScheduler,
     ) -> io::Result<JoinHandle<()>>
     where
-        B: runtime::Builder<Runtime: Send + 'static>,
+        S: runtime::Spawner,
     {
         let inner = instance
             .as_ref()
             .upgrade()
             .expect("Instance dropped before packet receiver thread started");
         let id = inner.id;
-        let task_executor = task::Executor::new(inner.config.task, runtime);
+        let task_executor = task::Executor::<S>::new(inner.config.task);
 
         thread::Builder::new()
             .name(format!("pckt-receiver-{}", id))
@@ -441,7 +439,7 @@ impl Default for HeartbeatConfig {
     }
 }
 
-pub fn handle(
+pub async fn handle<S: runtime::Spawner, I: runtime::Io>(
     id: Uuid,
     d: Discovery,
     shutdown: Shutdown,
@@ -450,10 +448,19 @@ pub fn handle(
     let (tx_msg, rx_msg) = mpsc::sync_channel(c.msg_buf_len);
     let ack_holder = AckHolder::new();
 
-    let registry = Registry::new(id, c, tx_msg, shutdown.clone());
+    let spawner = S::build(runtime::Options {
+        name: "tcp-read".to_string(),
+        threads: 1,
+    })?;
 
-    shutdown.register(sched::listener(c, registry.clone())?);
-    shutdown.register(sched::hb(c, d, registry.clone())?);
+    // TODO: Check if shutdown here should be used or just when runtime is dropped all will be dropped
+    let registry = Registry::new(id, spawner, c, tx_msg, shutdown.clone());
+
+    // shutdown.register(sched::listener(c, registry.clone())?);
+    // shutdown.register(sched::hb(c, d, registry.clone())?);
+    //
+    sched::listener(c, registry.clone()).await?;
+    sched::hb(c, d, registry.clone());
 
     let net_tx = Sender {
         registry: registry.clone(),

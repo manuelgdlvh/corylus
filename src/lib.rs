@@ -90,17 +90,11 @@ impl Instance {
             return None;
         }
 
-        let result = self.inner.part_group.with_segment_read(0, &id, |segment| {
-            segment
-                .data
-                .as_any()
-                .downcast_ref::<HashMap<K, V>>()
-                .is_some()
-        });
+        let segment = self.inner.part_group.segment(0, &id).expect("");
+        let result =
+            segment.with_data_read(|data| data.as_any().downcast_ref::<HashMap<K, V>>().is_some());
 
-        if let Ok(val) = result
-            && val
-        {
+        if result {
             let instance = self.downgrade();
             Some(DistributedMap::new(id, instance))
         } else {
