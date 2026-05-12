@@ -9,7 +9,7 @@ pub struct Options {
 pub trait Timer {}
 
 pub trait Io: Clone + 'static {
-    type Listener: TcpListener;
+    type Listener: TcpListener<StreamRead = Self::StreamRead, StreamWrite = Self::StreamWrite>;
     type StreamRead: TcpRead;
     type StreamWrite: TcpWrite;
 
@@ -26,11 +26,13 @@ pub trait TcpWrite: Send {
     fn write_all(&mut self, buffer: &[u8]) -> impl Future<Output = io::Result<()>>;
 }
 
-pub trait TcpListener {
+pub trait TcpListener: Send {
     type StreamRead: TcpRead;
     type StreamWrite: TcpWrite;
 
-    fn accept(&self) -> impl Future<Output = (Self::StreamRead, Self::StreamWrite)>;
+    fn accept(
+        &self,
+    ) -> impl Future<Output = io::Result<(Self::StreamRead, Self::StreamWrite)>> + Send;
 }
 
 pub trait Spawner: Send + Sync + Clone + 'static {
@@ -41,4 +43,8 @@ pub trait Spawner: Send + Sync + Clone + 'static {
     fn spawn<F>(&self, f: F)
     where
         F: Future<Output = ()> + Send + 'static;
+
+    fn scoped_spawn<F>(&self, f: F)
+    where
+        F: Future<Output = ()> + 'static;
 }

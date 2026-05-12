@@ -263,3 +263,15 @@ pub(crate) async fn listener<S: runtime::Spawner, I: runtime::Io>(
     Ok(())
 
 }
+
+
+// Define how many runtimes we will use and if some are needed to be non-Send. (We can use runtime enum flavors to allow non-send futures panicking if called in multithreaded) (We can use runtime enum flavors to allow non-send futures panicking if called in multithreaded). Get mutex and then .await its not allowed for multithreaded. (Implement pckt-sender). If we remove the mutex wrapping tcp stream, the futures can be sent safely to other threads.
+// Define the communication model of commands for pck_sender. (Send request, Connect, Clear, ...etc)
+// TODO: Before continue, define how will looks like the task async shutdowns (and runtime tracking, to avoid drop them if created in local function (for current thread we can just spawn os thread )) and tick intervals for schedulers.
+
+pub(crate) async fn pckt_sender<S: runtime::Spawner, I: runtime::Io>(
+    config: network::Config,
+    registry: Registry<S, I>,
+) {
+}
+

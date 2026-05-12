@@ -141,6 +141,7 @@ impl Drop for Response<'_> {
     }
 }
 
+// TODO: This should not contain registry, just a channel to send requests to single threaded runtime
 #[derive(Clone)]
 pub struct Sender {
     registry: Registry,
